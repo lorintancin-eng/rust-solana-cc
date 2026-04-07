@@ -740,12 +740,28 @@ async fn execute_buy(
                 )
             };
 
+            // 0slot 专用交易（含 tip，复用 Jito tip 账户）
+            let zero_slot_tx = if !config.zero_slot_urls.is_empty() {
+                let zs_tip = dyn_config.zero_slot_tip_lamports();
+                if zs_tip > 0 {
+                    let tip_account = tx_sender.random_jito_tip_account();
+                    TxBuilder::build_jito_bundle_transaction(
+                        &mirror, config, &config.keypair, blockhash,
+                        &tip_account, zs_tip, &[],
+                    ).ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             match tx_result {
                 Ok(transaction) => {
                     // ⚡ fire-and-forget 多通道并发发送
                     // RabbitStream 为 Processed 级别推送（meta 不填充≠预执行），
                     // Backrun Bundle 100% 失败，统一走独立TX发送
-                    let send_result = tx_sender.fire_and_forget(&transaction);
+                    let send_result = tx_sender.fire_and_forget(&transaction, zero_slot_tx.as_ref());
                     match send_result {
                         Ok(sig) => {
                             let elapsed = start.elapsed();
