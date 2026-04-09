@@ -133,12 +133,7 @@ impl TxSender {
 
     /// 🚀 同区块优化: fire-and-forget 发送
     /// 预序列化一次，所有通道 T+0 并发，立即返回不等待
-    /// zero_slot_tx: 0slot 专用交易（含 tip），None 时 0slot 通道复用主交易
-    pub fn fire_and_forget(
-        &self,
-        transaction: &VersionedTransaction,
-        zero_slot_tx: Option<&VersionedTransaction>,
-    ) -> Result<Signature> {
+    pub fn fire_and_forget(&self, transaction: &VersionedTransaction) -> Result<Signature> {
         let start = Instant::now();
 
         // 预序列化交易（只做一次，VersionedTransaction 用 bincode 序列化）
@@ -159,29 +154,17 @@ impl TxSender {
         let mut channel_count = 0u32;
 
         // 通道 0slot: 质押加速（最高优先级，staked connection 直达 leader）
-        // 0slot 要求交易内含 tip 转账，使用独立的 zero_slot_tx
-        if !self.zero_slot_urls.is_empty() {
-            let zs_b64 = if let Some(zs_tx) = zero_slot_tx {
-                let zs_bytes = bincode::serialize(zs_tx)?;
-                base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &zs_bytes,
-                )
-            } else {
-                tx_base64.clone()
-            };
-            for zero_url in &self.zero_slot_urls {
-                let http = self.http_client.clone();
-                let url = zero_url.clone();
-                let b64 = zs_b64.clone();
-                tokio::spawn(async move {
-                    match Self::send_rpc_raw(&http, &url, &b64, true).await {
-                        Ok(sig) => info!("通道结果: 0slot ✅ | {}", sig),
-                        Err(e) => warn!("通道结果: 0slot ❌ | {}", e),
-                    }
-                });
-                channel_count += 1;
-            }
+        for zero_url in &self.zero_slot_urls {
+            let http = self.http_client.clone();
+            let url = zero_url.clone();
+            let b64 = tx_base64.clone();
+            tokio::spawn(async move {
+                match Self::send_rpc_raw(&http, &url, &b64, true).await {
+                    Ok(sig) => info!("通道结果: 0slot ✅ | {}", sig),
+                    Err(e) => warn!("通道结果: 0slot ❌ | {}", e),
+                }
+            });
+            channel_count += 1;
         }
 
         // 通道 RPC1: 主 RPC (Shyft)
@@ -259,7 +242,6 @@ impl TxSender {
         &self,
         target_tx_bytes: &[u8],
         our_transaction: &VersionedTransaction,
-        zero_slot_tx: Option<&VersionedTransaction>,
     ) -> Result<Signature> {
         let start = Instant::now();
 
@@ -269,7 +251,7 @@ impl TxSender {
                 "Backrun: 目标交易字节无效 (len={}), 回退普通发送",
                 target_tx_bytes.len(),
             );
-            return self.fire_and_forget(our_transaction, zero_slot_tx);
+            return self.fire_and_forget(our_transaction);
         }
 
         info!(
@@ -352,18 +334,13 @@ impl TxSender {
     }
 
     /// 原有的等待模式（卖出时使用，需要知道是否成功）
-    pub async fn send_all_channels(
-        &self,
-        transaction: &VersionedTransaction,
-        zero_slot_tx: Option<&VersionedTransaction>,
-    ) -> Result<SendResult> {
-        self.send_all_channels_with_opts(transaction, zero_slot_tx, true).await
+    pub async fn send_all_channels(&self, transaction: &VersionedTransaction) -> Result<SendResult> {
+        self.send_all_channels_with_opts(transaction, true).await
     }
 
     pub async fn send_all_channels_with_opts(
         &self,
         transaction: &VersionedTransaction,
-        zero_slot_tx: Option<&VersionedTransaction>,
         skip_preflight: bool,
     ) -> Result<SendResult> {
         let start = Instant::now();
@@ -379,27 +356,16 @@ impl TxSender {
 
         // T+0: 所有通道并发（全部使用 HTTP JSON-RPC）
 
-        // 0slot 质押加速通道（最高优先级，需要带 tip 的独立交易）
-        if !self.zero_slot_urls.is_empty() {
-            let zs_b64 = if let Some(zs_tx) = zero_slot_tx {
-                let zs_bytes = bincode::serialize(zs_tx)?;
-                base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &zs_bytes,
-                )
-            } else {
-                tx_base64.clone()
-            };
-            for zero_url in &self.zero_slot_urls {
-                let http = self.http_client.clone();
-                let url = zero_url.clone();
-                let b64 = zs_b64.clone();
-                let sp = skip_preflight;
-                handles.push(tokio::spawn(async move {
-                    let result = Self::send_rpc_raw(&http, &url, &b64, sp).await;
-                    ("0slot", result)
-                }));
-            }
+        // 0slot 质押加速通道（最高优先级）
+        for zero_url in &self.zero_slot_urls {
+            let http = self.http_client.clone();
+            let url = zero_url.clone();
+            let b64 = tx_base64.clone();
+            let sp = skip_preflight;
+            handles.push(tokio::spawn(async move {
+                let result = Self::send_rpc_raw(&http, &url, &b64, sp).await;
+                ("0slot", result)
+            }));
         }
 
         {

@@ -53,9 +53,6 @@ pub struct AppConfig {
     /// 0slot endpoint URLs（带 api-key），逗号分隔
     /// 例: http://ny1.0slot.trade/?api-key=xxx,http://la1.0slot.trade/?api-key=xxx
     pub zero_slot_urls: Vec<String>,
-    /// 0slot tip（lamports），0slot 要求交易内含 tip 转账（复用 Jito tip 账户）
-    /// .env: ZERO_SLOT_TIP_LAMPORTS=100000 (默认 100,000 = 0.0001 SOL)
-    pub zero_slot_tip_lamports: u64,
 
     // Confirmation
     pub confirm_timeout_secs: u64,
@@ -137,7 +134,6 @@ impl AppConfig {
                 .ok()
                 .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect::<Vec<_>>())
                 .unwrap_or_default(),
-            zero_slot_tip_lamports: env_parse("ZERO_SLOT_TIP_LAMPORTS", 100_000),
             confirm_timeout_secs: env_parse("CONFIRM_TIMEOUT_SECS", 5),
             auto_sell_enabled: env_parse("AUTO_SELL_ENABLED", true),
             take_profit_percent: env_parse("TAKE_PROFIT_PERCENT", 15.0),
@@ -195,7 +191,6 @@ pub struct DynConfig {
     consensus_min_wallets: AtomicU64,
     jito_buy_tip_lamports: AtomicU64,
     jito_sell_tip_lamports: AtomicU64,
-    zero_slot_tip_lamports: AtomicU64,
     /// 卖出模式: SELL_MODE_TP_SL(0) 或 SELL_MODE_FOLLOW(1)
     sell_mode: AtomicU8,
     /// 目标钱包最小买入 SOL 过滤
@@ -219,7 +214,6 @@ impl DynConfig {
             consensus_min_wallets: AtomicU64::new(config.consensus_min_wallets as u64),
             jito_buy_tip_lamports: AtomicU64::new(config.jito_buy_tip_lamports),
             jito_sell_tip_lamports: AtomicU64::new(config.jito_sell_tip_lamports),
-            zero_slot_tip_lamports: AtomicU64::new(config.zero_slot_tip_lamports),
             sell_mode: AtomicU8::new(SELL_MODE_TP_SL),
             min_target_buy_sol: AtomicU64::new(config.min_target_buy_sol.to_bits()),
             target_wallets: RwLock::new(config.target_wallets.clone()),
@@ -239,7 +233,6 @@ impl DynConfig {
     pub fn consensus_min_wallets(&self) -> usize { self.consensus_min_wallets.load(Ordering::Relaxed) as usize }
     pub fn jito_buy_tip_lamports(&self) -> u64 { self.jito_buy_tip_lamports.load(Ordering::Relaxed) }
     pub fn jito_sell_tip_lamports(&self) -> u64 { self.jito_sell_tip_lamports.load(Ordering::Relaxed) }
-    pub fn zero_slot_tip_lamports(&self) -> u64 { self.zero_slot_tip_lamports.load(Ordering::Relaxed) }
     pub fn sell_mode(&self) -> u8 { self.sell_mode.load(Ordering::Relaxed) }
     pub fn is_follow_sell_mode(&self) -> bool { self.sell_mode() == SELL_MODE_FOLLOW }
     pub fn min_target_buy_sol(&self) -> f64 { load_f64(&self.min_target_buy_sol) }
@@ -256,7 +249,6 @@ impl DynConfig {
     pub fn set_consensus_min_wallets(&self, v: usize) { self.consensus_min_wallets.store(v as u64, Ordering::Relaxed); }
     pub fn set_jito_buy_tip_lamports(&self, v: u64) { self.jito_buy_tip_lamports.store(v, Ordering::Relaxed); }
     pub fn set_jito_sell_tip_lamports(&self, v: u64) { self.jito_sell_tip_lamports.store(v, Ordering::Relaxed); }
-    pub fn set_zero_slot_tip_lamports(&self, v: u64) { self.zero_slot_tip_lamports.store(v, Ordering::Relaxed); }
     pub fn set_sell_mode(&self, v: u8) { self.sell_mode.store(v, Ordering::Relaxed); }
     pub fn set_min_target_buy_sol(&self, v: f64) { store_f64(&self.min_target_buy_sol, v); }
 
