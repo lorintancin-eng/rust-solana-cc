@@ -9,10 +9,16 @@ on:
 permissions:
   contents: read
 
+env:
+  PROJECT_DIR: rust-solana-gemini-main/rust-solana--gemini/solana-copy-trader
+
 jobs:
   build-linux:
     name: Build Linux Artifact
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.PROJECT_DIR }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,6 +33,8 @@ jobs:
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.PROJECT_DIR }}
 
       - name: Build release binary
         run: cargo build --locked --release --bin copy-trader
@@ -35,6 +43,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: copy-trader-linux
-          path: target/release/copy-trader
+          path: ${{ env.PROJECT_DIR }}/target/release/copy-trader
           if-no-files-found: error
           retention-days: 7
