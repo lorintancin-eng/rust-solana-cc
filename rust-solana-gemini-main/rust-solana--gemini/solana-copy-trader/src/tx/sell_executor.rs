@@ -18,6 +18,9 @@ use crate::tx::jupiter::JupiterSeller;
 use crate::tx::sender::TxSender;
 
 const MAX_SELL_RETRIES: u32 = 3;
+const FAST_FIRST_CONFIRM_MS: u64 = 1_500;
+const RETRY_CONFIRM_MS: u64 = 2_500;
+const DEFAULT_CONFIRM_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, Copy)]
 struct SellPathTimings {
@@ -55,6 +58,19 @@ pub struct SellExecutor {
 }
 
 impl SellExecutor {
+    fn confirm_timeout_ms(reason: crate::autosell::SellReason, attempt: u32) -> u64 {
+        match reason {
+            crate::autosell::SellReason::FollowSell => {
+                if attempt == 1 {
+                    FAST_FIRST_CONFIRM_MS
+                } else {
+                    RETRY_CONFIRM_MS
+                }
+            }
+            _ => DEFAULT_CONFIRM_MS,
+        }
+    }
+
     pub fn new(
         config: AppConfig,
         dyn_config: Arc<DynConfig>,
@@ -265,12 +281,14 @@ impl SellExecutor {
         let mut last_sig = String::new();
 
         for attempt in 1..=MAX_SELL_RETRIES {
+            let confirm_timeout_ms = Self::confirm_timeout_ms(signal.reason, attempt);
             info!(
-                "Pump.fun direct sell attempt #{}/{}: {}.. (amount: {})",
+                "Pump.fun direct sell attempt #{}/{}: {}.. (amount: {}, confirm_timeout={}ms)",
                 attempt,
                 MAX_SELL_RETRIES,
                 &mint.to_string()[..12],
                 token_balance,
+                confirm_timeout_ms,
             );
 
             match self.try_pumpfun_sell(&mint, token_balance, sell_start).await {
@@ -287,7 +305,9 @@ impl SellExecutor {
                         format_latency(timings.total),
                     );
 
-                    let confirmed = self.wait_sell_confirm(&mint, &sig, 10).await;
+                    let confirmed = self
+                        .wait_sell_confirm(&mint, &sig, confirm_timeout_ms)
+                        .await;
                     if confirmed {
                         info!(
                             "Pump.fun direct sell confirmed: {} | {}ms",
@@ -316,7 +336,9 @@ impl SellExecutor {
                                 sig,
                                 sell_start.elapsed().as_millis(),
                             );
-                            let confirmed = self.wait_sell_confirm(&mint, &sig, 10).await;
+                            let confirmed = self
+                                .wait_sell_confirm(&mint, &sig, confirm_timeout_ms)
+                                .await;
                             if confirmed {
                                 last_sig = sig;
                                 success = true;
@@ -502,13 +524,13 @@ impl SellExecutor {
     }
 
     /// Wait for on-chain confirmation of a sell transaction.
-    async fn wait_sell_confirm(&self, mint: &Pubkey, sig_str: &str, max_secs: u64) -> bool {
+    async fn wait_sell_confirm(&self, mint: &Pubkey, sig_str: &str, max_wait_ms: u64) -> bool {
         use solana_sdk::signature::Signature;
         let sig = match sig_str.parse::<Signature>() {
             Ok(s) => s,
             Err(_) => return false,
         };
-        let max_wait = Duration::from_secs(max_secs);
+        let max_wait = Duration::from_millis(max_wait_ms);
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(80);
         let user_ata = self
@@ -612,6 +634,7 @@ impl SellExecutor {
         let mut last_sig = String::new();
 
         for attempt in 1..=MAX_SELL_RETRIES {
+            let confirm_timeout_ms = Self::confirm_timeout_ms(crate::autosell::SellReason::Manual, attempt);
             match self.try_pumpfun_sell(mint, sell_amount, std::time::Instant::now()).await {
                 Ok((sig, timings)) => {
                     info!(
@@ -625,7 +648,7 @@ impl SellExecutor {
                         format_latency(timings.send_call),
                         format_latency(timings.total),
                     );
-                    let confirmed = self.wait_sell_confirm(mint, &sig, 10).await;
+                    let confirmed = self.wait_sell_confirm(mint, &sig, confirm_timeout_ms).await;
                     if confirmed {
                         last_sig = sig;
                         success = true;
@@ -639,7 +662,7 @@ impl SellExecutor {
                     );
                     match self.try_jupiter_sell(mint, sell_amount).await {
                         Ok(sig) => {
-                            let confirmed = self.wait_sell_confirm(mint, &sig, 10).await;
+                            let confirmed = self.wait_sell_confirm(mint, &sig, confirm_timeout_ms).await;
                             if confirmed {
                                 last_sig = sig;
                                 success = true;

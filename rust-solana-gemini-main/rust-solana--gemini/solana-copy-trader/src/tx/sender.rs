@@ -20,6 +20,8 @@ pub struct TxSender {
     secondary_rpc_url: Option<String>,
     /// Jito block engine URLs (多端点轮换)
     jito_block_engine_urls: Vec<String>,
+    /// Jito TX URLs（仅用于 sendTransaction，排除 bundles-only relay）
+    jito_tx_urls: Vec<String>,
     jito_enabled: bool,
     /// Jito 认证 UUID（x-jito-auth header）
     jito_auth_uuid: Option<String>,
@@ -45,6 +47,11 @@ impl TxSender {
         if !urls.contains(&relay) {
             urls.push(relay);
         }
+        let tx_urls = urls
+            .iter()
+            .filter(|url| !Self::is_bundles_only_endpoint(url))
+            .cloned()
+            .collect::<Vec<_>>();
 
         if jito_auth_uuid.is_some() {
             info!("Jito 认证已配置 (x-jito-auth UUID)");
@@ -60,6 +67,7 @@ impl TxSender {
             primary_rpc_url,
             secondary_rpc_url,
             jito_block_engine_urls: urls,
+            jito_tx_urls: tx_urls,
             jito_enabled,
             jito_auth_uuid,
             zero_slot_urls,
@@ -86,6 +94,18 @@ impl TxSender {
         let url1 = &self.jito_block_engine_urls[idx % len];
         let url2 = &self.jito_block_engine_urls[(idx + 1) % len];
         (url1, url2)
+    }
+
+    fn next_jito_tx_url(&self) -> Option<&str> {
+        if self.jito_tx_urls.is_empty() {
+            return None;
+        }
+        let idx = self.jito_url_counter.fetch_add(1, Ordering::Relaxed) % self.jito_tx_urls.len();
+        Some(&self.jito_tx_urls[idx])
+    }
+
+    fn is_bundles_only_endpoint(url: &str) -> bool {
+        url.to_ascii_lowercase().contains("bundles.jito.wtf")
     }
 
     /// 通过 HTTP JSON-RPC sendTransaction 发送原始交易（base64 编码）
@@ -224,10 +244,10 @@ impl TxSender {
         if zero_slot_enabled {
             info!("0slot only mode: skipping Jito channels to avoid duplicate execution");
         } else if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
-            let (url1, url2) = self.next_jito_url_pair();
+            let bundle_url = self.next_jito_url();
             let auth = self.jito_auth_uuid.clone();
             let http = self.http_client.clone();
-            let jito_url1 = url1.to_string();
+            let jito_url1 = bundle_url.to_string();
             let auth1 = auth.clone();
             let b58 = tx_b58.clone();
             tokio::spawn(async move {
@@ -238,9 +258,9 @@ impl TxSender {
             });
             channel_count += 1;
 
-            if self.jito_block_engine_urls.len() > 1 {
+            if let Some(tx_url) = self.next_jito_tx_url() {
                 let http = self.http_client.clone();
-                let jito_url2 = url2.to_string();
+                let jito_url2 = tx_url.to_string();
                 let b64 = tx_base64;
                 tokio::spawn(async move {
                     match Self::send_jito_tx_raw(&http, &jito_url2, &b64, &auth).await {
@@ -304,7 +324,7 @@ impl TxSender {
         if !self.zero_slot_urls.is_empty() {
             info!("0slot only mode: skipping Jito channels to avoid duplicate execution");
         } else if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
-            let (url1, url2) = self.next_jito_url_pair();
+            let (url1, _) = self.next_jito_url_pair();
             let auth = self.jito_auth_uuid.clone();
 
             let http = self.http_client.clone();
@@ -322,9 +342,9 @@ impl TxSender {
             });
             channel_count += 1;
 
-            if self.jito_block_engine_urls.len() > 1 {
+            {
                 let http = self.http_client.clone();
-                let jito_url2 = url2.to_string();
+                let jito_url2 = self.next_jito_url().to_string();
                 let target = target_tx_b58;
                 let ours = our_tx_b58.clone();
                 tokio::spawn(async move {
@@ -438,7 +458,7 @@ impl TxSender {
         if zero_slot_only_mode {
             info!("0slot only mode: skipping Jito channels to avoid duplicate execution");
         } else if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
-            let (url1, url2) = self.next_jito_url_pair();
+            let (url1, _) = self.next_jito_url_pair();
             let auth = self.jito_auth_uuid.clone();
 
             let jito_http = self.http_client.clone();
@@ -452,9 +472,9 @@ impl TxSender {
                 }
             }));
 
-            if self.jito_block_engine_urls.len() > 1 {
+            if let Some(tx_url) = self.next_jito_tx_url() {
                 let jito_http = self.http_client.clone();
-                let jito_url2 = url2.to_string();
+                let jito_url2 = tx_url.to_string();
                 let b64 = tx_base64;
                 handles.push(tokio::spawn(async move {
                     match Self::send_jito_tx_raw(&jito_http, &jito_url2, &b64, &auth).await {
