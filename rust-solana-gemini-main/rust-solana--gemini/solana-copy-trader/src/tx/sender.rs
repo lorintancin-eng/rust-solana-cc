@@ -127,44 +127,52 @@ impl TxSender {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("RPC sendTransaction 无签名返回"))?;
 
-        sig_str.parse::<Signature>()
+        sig_str
+            .parse::<Signature>()
             .map_err(|e| anyhow::anyhow!("签名解析失败: {}", e))
     }
 
     /// 🚀 同区块优化: fire-and-forget 发送
     /// 预序列化一次，所有通道 T+0 并发，立即返回不等待
-    pub fn fire_and_forget(&self, transaction: &VersionedTransaction) -> Result<Signature> {
+    /// zero_slot_tx: 0slot 专用交易（含官方 fee），None 时 0slot 通道复用主交易
+    pub fn fire_and_forget(
+        &self,
+        transaction: &VersionedTransaction,
+        zero_slot_tx: Option<&VersionedTransaction>,
+    ) -> Result<Signature> {
         let start = Instant::now();
 
         // 预序列化交易（只做一次，VersionedTransaction 用 bincode 序列化）
         let tx_bytes = bincode::serialize(transaction)?;
         let tx_b58 = bs58::encode(&tx_bytes).into_string();
-        let tx_base64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &tx_bytes,
-        );
+        let tx_base64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
         // 提取签名（本地操作）
-        let signature = transaction
-            .signatures
-            .first()
-            .copied()
-            .unwrap_or_default();
+        let signature = transaction.signatures.first().copied().unwrap_or_default();
 
         let mut channel_count = 0u32;
 
-        // 通道 0slot: 质押加速（最高优先级，staked connection 直达 leader）
-        for zero_url in &self.zero_slot_urls {
-            let http = self.http_client.clone();
-            let url = zero_url.clone();
-            let b64 = tx_base64.clone();
-            tokio::spawn(async move {
-                match Self::send_rpc_raw(&http, &url, &b64, true).await {
-                    Ok(sig) => info!("通道结果: 0slot ✅ | {}", sig),
-                    Err(e) => warn!("通道结果: 0slot ❌ | {}", e),
-                }
-            });
-            channel_count += 1;
+        // 通道 0slot: 质押加速（最高优先级，要求独立 fee 交易）
+        if !self.zero_slot_urls.is_empty() {
+            let zs_b64 = if let Some(zs_tx) = zero_slot_tx {
+                let zs_bytes = bincode::serialize(zs_tx)?;
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &zs_bytes)
+            } else {
+                tx_base64.clone()
+            };
+            for zero_url in &self.zero_slot_urls {
+                let http = self.http_client.clone();
+                let url = zero_url.clone();
+                let b64 = zs_b64.clone();
+                tokio::spawn(async move {
+                    match Self::send_rpc_raw(&http, &url, &b64, true).await {
+                        Ok(sig) => info!("通道结果: 0slot ✅ | {}", sig),
+                        Err(e) => warn!("通道结果: 0slot ❌ | {}", e),
+                    }
+                });
+                channel_count += 1;
+            }
         }
 
         // 通道 RPC1: 主 RPC (Shyft)
@@ -242,6 +250,7 @@ impl TxSender {
         &self,
         target_tx_bytes: &[u8],
         our_transaction: &VersionedTransaction,
+        zero_slot_tx: Option<&VersionedTransaction>,
     ) -> Result<Signature> {
         let start = Instant::now();
 
@@ -251,7 +260,7 @@ impl TxSender {
                 "Backrun: 目标交易字节无效 (len={}), 回退普通发送",
                 target_tx_bytes.len(),
             );
-            return self.fire_and_forget(our_transaction);
+            return self.fire_and_forget(our_transaction, zero_slot_tx);
         }
 
         info!(
@@ -283,7 +292,9 @@ impl TxSender {
             let target = target_tx_b58.clone();
             let ours = our_tx_b58.clone();
             tokio::spawn(async move {
-                match Self::send_jito_backrun_bundle(&http, &jito_url1, &target, &ours, &auth1).await {
+                match Self::send_jito_backrun_bundle(&http, &jito_url1, &target, &ours, &auth1)
+                    .await
+                {
                     Ok(bundle_id) => info!("Jito Backrun Bundle 发送成功 | bundle: {}", bundle_id),
                     Err(e) => warn!("Jito Backrun Bundle 发送失败: {}", e),
                 }
@@ -296,8 +307,13 @@ impl TxSender {
                 let target = target_tx_b58;
                 let ours = our_tx_b58.clone();
                 tokio::spawn(async move {
-                    match Self::send_jito_backrun_bundle(&http, &jito_url2, &target, &ours, &auth).await {
-                        Ok(bundle_id) => debug!("Jito Backrun Bundle (备用) 发送成功 | bundle: {}", bundle_id),
+                    match Self::send_jito_backrun_bundle(&http, &jito_url2, &target, &ours, &auth)
+                        .await
+                    {
+                        Ok(bundle_id) => debug!(
+                            "Jito Backrun Bundle (备用) 发送成功 | bundle: {}",
+                            bundle_id
+                        ),
                         Err(e) => debug!("Jito Backrun Bundle (备用) 发送失败: {}", e),
                     }
                 });
@@ -309,10 +325,8 @@ impl TxSender {
         {
             let http = self.http_client.clone();
             let url = self.primary_rpc_url.clone();
-            let b64 = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                &our_tx_bytes,
-            );
+            let b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &our_tx_bytes);
             tokio::spawn(async move {
                 match Self::send_rpc_raw(&http, &url, &b64, true).await {
                     Ok(sig) => debug!("RPC 直发成功: {}", sig),
@@ -334,13 +348,19 @@ impl TxSender {
     }
 
     /// 原有的等待模式（卖出时使用，需要知道是否成功）
-    pub async fn send_all_channels(&self, transaction: &VersionedTransaction) -> Result<SendResult> {
-        self.send_all_channels_with_opts(transaction, true).await
+    pub async fn send_all_channels(
+        &self,
+        transaction: &VersionedTransaction,
+        zero_slot_tx: Option<&VersionedTransaction>,
+    ) -> Result<SendResult> {
+        self.send_all_channels_with_opts(transaction, zero_slot_tx, true)
+            .await
     }
 
     pub async fn send_all_channels_with_opts(
         &self,
         transaction: &VersionedTransaction,
+        zero_slot_tx: Option<&VersionedTransaction>,
         skip_preflight: bool,
     ) -> Result<SendResult> {
         let start = Instant::now();
@@ -349,23 +369,29 @@ impl TxSender {
         // 预序列化一次，所有通道复用
         let tx_bytes = bincode::serialize(transaction)?;
         let tx_b58 = bs58::encode(&tx_bytes).into_string();
-        let tx_base64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &tx_bytes,
-        );
+        let tx_base64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
         // T+0: 所有通道并发（全部使用 HTTP JSON-RPC）
 
-        // 0slot 质押加速通道（最高优先级）
-        for zero_url in &self.zero_slot_urls {
-            let http = self.http_client.clone();
-            let url = zero_url.clone();
-            let b64 = tx_base64.clone();
-            let sp = skip_preflight;
-            handles.push(tokio::spawn(async move {
-                let result = Self::send_rpc_raw(&http, &url, &b64, sp).await;
-                ("0slot", result)
-            }));
+        // 0slot 质押加速通道（最高优先级，需要带官方 fee 的独立交易）
+        if !self.zero_slot_urls.is_empty() {
+            let zs_b64 = if let Some(zs_tx) = zero_slot_tx {
+                let zs_bytes = bincode::serialize(zs_tx)?;
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &zs_bytes)
+            } else {
+                tx_base64.clone()
+            };
+            for zero_url in &self.zero_slot_urls {
+                let http = self.http_client.clone();
+                let url = zero_url.clone();
+                let b64 = zs_b64.clone();
+                let sp = skip_preflight;
+                handles.push(tokio::spawn(async move {
+                    let result = Self::send_rpc_raw(&http, &url, &b64, sp).await;
+                    ("0slot", result)
+                }));
+            }
         }
 
         {
@@ -523,7 +549,8 @@ impl TxSender {
             anyhow::bail!("Jito rate limited");
         }
         if !status.is_success() {
-            let detail = body.get("error")
+            let detail = body
+                .get("error")
                 .or_else(|| body.get("message"))
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| body.to_string());
@@ -531,17 +558,15 @@ impl TxSender {
         }
 
         if let Some(error) = body.get("error") {
-            let msg = error.get("message")
+            let msg = error
+                .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             anyhow::bail!("Jito Backrun error: {}", msg);
         }
 
         // 提取 bundle_id
-        let bundle_id = body["result"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
+        let bundle_id = body["result"].as_str().unwrap_or("unknown").to_string();
 
         Ok(bundle_id)
     }
@@ -575,7 +600,8 @@ impl TxSender {
 
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         if let Some(error) = body.get("error") {
-            let msg = error.get("message")
+            let msg = error
+                .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             anyhow::bail!("Jito Bundle error: {}", msg);
@@ -620,7 +646,8 @@ impl TxSender {
 
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         if let Some(error) = body.get("error") {
-            let msg = error.get("message")
+            let msg = error
+                .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             anyhow::bail!("Jito TX error: {}", msg);
@@ -641,6 +668,30 @@ impl TxSender {
             "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
             "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
             "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+        ];
+        let idx = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as usize)
+            % tip_accounts.len();
+        solana_sdk::pubkey::Pubkey::from_str(tip_accounts[idx]).unwrap()
+    }
+
+    /// 0slot 官方 fee 账户列表，来源: https://0slot.trade/docs.php
+    pub fn random_0slot_tip_account(&self) -> solana_sdk::pubkey::Pubkey {
+        use std::str::FromStr;
+        let tip_accounts = [
+            "6fQaVhYZA4w3MBSXjJ81Vf6W1EDYeUPXpgVQ6UQyU1Av",
+            "4HiwLEP2Bzqj3hM2ENxJuzhcPCdsafwiet3oGkMkuQY4",
+            "7toBU3inhmrARGngC7z6SjyP85HgGMmCTEwGNRAcYnEK",
+            "8mR3wB1nh4D6J9RUCugxUpc6ya8w38LPxZ3ZjcBhgzws",
+            "6SiVU5WEwqfFapRuYCndomztEwDjvS5xgtEof3PLEGm9",
+            "TpdxgNJBWZRL8UXF5mrEsyWxDWx9HQexA9P1eTWQ42p",
+            "D8f3WkQu6dCF33cZxuAsrKHrGsqGP2yvAHf8mX6RXnwf",
+            "GQPFicsy3P3NXxB5piJohoxACqTvWE9fKpLgdsMduoHE",
+            "Ey2JEr8hDkgN8qKJGrLf2yFjRhW7rab99HVxwi5rcvJE",
+            "4iUgjMT8q2hNZnLuhpqZ1QtiV8deFPy2ajvvjEpKKgsS",
+            "3Rz8uD83QsU8wKvZbgWAPvCNDU6Fy8TSZTMcPm3RB6zt",
         ];
         let idx = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

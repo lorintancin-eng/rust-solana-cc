@@ -20,10 +20,7 @@ pub struct TxBuilder;
 
 impl TxBuilder {
     /// 组装指令列表（ComputeBudget + pre + swap + post）
-    fn assemble_instructions(
-        mirror: &MirrorInstruction,
-        config: &AppConfig,
-    ) -> Vec<Instruction> {
+    fn assemble_instructions(mirror: &MirrorInstruction, config: &AppConfig) -> Vec<Instruction> {
         let mut all_instructions: Vec<Instruction> = Vec::with_capacity(
             2 + mirror.pre_instructions.len()
                 + mirror.swap_instructions.len()
@@ -61,17 +58,10 @@ impl TxBuilder {
         recent_blockhash: Hash,
         alts: &[AddressLookupTableAccount],
     ) -> Result<VersionedTransaction> {
-        let v0_msg = v0::Message::try_compile(
-            &keypair.pubkey(),
-            instructions,
-            alts,
-            recent_blockhash,
-        )?;
+        let v0_msg =
+            v0::Message::try_compile(&keypair.pubkey(), instructions, alts, recent_blockhash)?;
 
-        let tx = VersionedTransaction::try_new(
-            VersionedMessage::V0(v0_msg),
-            &[keypair],
-        )?;
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(v0_msg), &[keypair])?;
 
         Ok(tx)
     }
@@ -91,6 +81,43 @@ impl TxBuilder {
             all_instructions.len(),
             config.compute_units,
             config.priority_fee_micro_lamport,
+            alts.len(),
+        );
+
+        Self::compile_and_sign(&all_instructions, keypair, recent_blockhash, alts)
+    }
+
+    /// 构建 0slot 专用交易：fee 指令放在最前面
+    pub fn build_0slot_transaction(
+        mirror: &MirrorInstruction,
+        config: &AppConfig,
+        keypair: &Keypair,
+        recent_blockhash: Hash,
+        zero_slot_tip_account: &solana_sdk::pubkey::Pubkey,
+        tip_lamports: u64,
+        alts: &[AddressLookupTableAccount],
+    ) -> Result<VersionedTransaction> {
+        let mut all_instructions: Vec<Instruction> = Vec::with_capacity(
+            1 + 2
+                + mirror.pre_instructions.len()
+                + mirror.swap_instructions.len()
+                + mirror.post_instructions.len(),
+        );
+
+        if tip_lamports > 0 {
+            all_instructions.push(solana_sdk::system_instruction::transfer(
+                &keypair.pubkey(),
+                zero_slot_tip_account,
+                tip_lamports,
+            ));
+        }
+
+        all_instructions.extend(Self::assemble_instructions(mirror, config));
+
+        debug!(
+            "Built 0slot V0 transaction with {} instructions (tip={} lamports, ALTs={})",
+            all_instructions.len(),
+            tip_lamports,
             alts.len(),
         );
 

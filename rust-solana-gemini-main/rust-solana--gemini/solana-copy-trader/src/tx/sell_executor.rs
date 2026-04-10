@@ -67,25 +67,27 @@ impl SellExecutor {
         }
     }
 
-    /// Pump.fun 直接卖出（零外部 API，本地构建指令 → TxBuilder → 多通道发送）
+    /// Pump.fun direct sell: local instruction build -> TxBuilder -> multi-channel send.
     async fn try_pumpfun_sell(&self, mint: &Pubkey, token_amount: u64) -> Result<String> {
-        let prefetched = self.prefetch_cache.get(mint)
-            .ok_or_else(|| anyhow::anyhow!("无 prefetch 数据"))?;
+        let prefetched = self
+            .prefetch_cache
+            .get(mint)
+            .ok_or_else(|| anyhow::anyhow!("no prefetch data"))?;
 
         if prefetched.mirror_accounts.is_empty() {
-            anyhow::bail!("无 mirror_accounts");
+            anyhow::bail!("no mirror_accounts");
         }
 
-        // 从 BC 缓存获取报价（优先），回退到 RPC
         let bc_state = if let Some(state) = self.bc_cache.get(mint) {
             state
         } else {
-            // BC 缓存未命中，尝试 RPC 获取
-            self.pumpfun.prefetch_bonding_curve(&prefetched.bonding_curve).await?
+            self.pumpfun
+                .prefetch_bonding_curve(&prefetched.bonding_curve)
+                .await?
         };
 
         if bc_state.complete {
-            anyhow::bail!("bonding curve 已完成（已迁移外盘）");
+            anyhow::bail!("bonding curve completed");
         }
 
         let expected_sol = bc_state.token_to_sol_quote(token_amount);
@@ -93,15 +95,17 @@ impl SellExecutor {
         let min_sol_output = expected_sol.saturating_sub(expected_sol * slippage / 10_000);
 
         info!(
-            "Pump.fun 直卖: {} tokens → ~{:.4} SOL (min: {:.4}, slippage: {}bps)",
-            token_amount, expected_sol as f64 / 1e9, min_sol_output as f64 / 1e9, slippage,
+            "Pump.fun direct sell: {} tokens -> ~{:.4} SOL (min: {:.4}, slippage: {}bps)",
+            token_amount,
+            expected_sol as f64 / 1e9,
+            min_sol_output as f64 / 1e9,
+            slippage,
         );
 
-        // creator 从 BC 状态取（每个代币不同）
-        let creator = bc_state.creator
-            .ok_or_else(|| anyhow::anyhow!("BC 状态无 creator 字段"))?;
+        let creator = bc_state
+            .creator
+            .ok_or_else(|| anyhow::anyhow!("BC state missing creator"))?;
 
-        // 构建 sell 指令（token_program 从 prefetch，creator 从 BC，is_cashback 从 BC）
         let sell_ix = self.pumpfun.build_sell_instruction_from_mirror(
             &self.config.pubkey,
             &prefetched.user_ata,
@@ -121,24 +125,51 @@ impl SellExecutor {
             sol_amount: expected_sol,
         };
 
-        // 构建 VersionedTransaction
         let (blockhash, _) = self.blockhash_cache.get_sync();
         let transaction = if self.config.jito_enabled {
             let tip = self.tx_sender.random_jito_tip_account();
             TxBuilder::build_jito_bundle_transaction(
-                &mirror, &self.config, &self.config.keypair, blockhash,
-                &tip, self.dyn_config.jito_sell_tip_lamports(), &[],
+                &mirror,
+                &self.config,
+                &self.config.keypair,
+                blockhash,
+                &tip,
+                self.dyn_config.jito_sell_tip_lamports(),
+                &[],
             )?
         } else {
-            TxBuilder::build_transaction(&mirror, &self.config, &self.config.keypair, blockhash, &[])?
+            TxBuilder::build_transaction(
+                &mirror,
+                &self.config,
+                &self.config.keypair,
+                blockhash,
+                &[],
+            )?
         };
 
-        // 多通道发送（0slot + RPC + Jito）
-        let sig = self.tx_sender.fire_and_forget(&transaction)?;
+        let zero_slot_tx = if !self.config.zero_slot_urls.is_empty() {
+            let fee_account = self.tx_sender.random_0slot_tip_account();
+            TxBuilder::build_0slot_transaction(
+                &mirror,
+                &self.config,
+                &self.config.keypair,
+                blockhash,
+                &fee_account,
+                self.dyn_config.zero_slot_tip_lamports(),
+                &[],
+            )
+            .ok()
+        } else {
+            None
+        };
+
+        let sig = self
+            .tx_sender
+            .fire_and_forget(&transaction, zero_slot_tx.as_ref())?;
         Ok(sig.to_string())
     }
 
-    /// 处理卖出信号（优先 Pump.fun 直卖，回退 Jupiter）
+    /// Handle sell signal, prefer Pump.fun direct sell, then fallback to Jupiter.
     pub async fn handle_sell_signal(&self, signal: SellSignal) {
         let sell_start = std::time::Instant::now();
         let mint = signal.token_mint;
@@ -150,15 +181,16 @@ impl SellExecutor {
             signal.pnl_percent,
         );
 
-        // 检查是否已超过最大卖出尝试次数
         const MAX_TOTAL_SELL_ATTEMPTS: u32 = 3;
         if let Some(pos) = self.auto_sell.get_position(&mint) {
             if pos.sell_attempts >= MAX_TOTAL_SELL_ATTEMPTS {
                 error!(
                     "卖出已尝试 {} 次全部失败，放弃: {}",
-                    pos.sell_attempts, &mint.to_string()[..12],
+                    pos.sell_attempts,
+                    &mint.to_string()[..12],
                 );
-                self.auto_sell.confirm_failed(&mint, "max sell attempts exceeded");
+                self.auto_sell
+                    .confirm_failed(&mint, "max sell attempts exceeded");
                 self.account_subscriber.untrack_mint(&mint);
                 self.prefetch_cache.remove(&mint);
                 return;
@@ -170,14 +202,16 @@ impl SellExecutor {
             return;
         }
 
-        // 获取 ATA 和余额
-        let user_ata = self.prefetch_cache.get(&mint)
+        let user_ata = self
+            .prefetch_cache
+            .get(&mint)
             .map(|pf| pf.user_ata)
             .unwrap_or_else(|| get_associated_token_address(&self.config.pubkey, &mint));
 
-        let token_balance = self.ata_cache.get(&mint).unwrap_or_else(|| {
-            self.get_token_balance_rpc(&user_ata)
-        });
+        let token_balance = self
+            .ata_cache
+            .get(&mint)
+            .unwrap_or_else(|| self.get_token_balance_rpc(&user_ata));
 
         if token_balance == 0 {
             warn!("跳过卖出: 余额为 0");
@@ -188,42 +222,51 @@ impl SellExecutor {
         let mut success = false;
         let mut last_sig = String::new();
 
-        // === 优先 Pump.fun 直卖（零外部 API，本地构建） ===
         for attempt in 1..=MAX_SELL_RETRIES {
             info!(
-                "Pump.fun 直卖尝试 #{}/{}: {}.. (数量: {})",
-                attempt, MAX_SELL_RETRIES,
-                &mint.to_string()[..12], token_balance,
+                "Pump.fun direct sell attempt #{}/{}: {}.. (amount: {})",
+                attempt,
+                MAX_SELL_RETRIES,
+                &mint.to_string()[..12],
+                token_balance,
             );
 
             match self.try_pumpfun_sell(&mint, token_balance).await {
                 Ok(sig) => {
                     info!(
-                        "Pump.fun 直卖已提交: https://solscan.io/tx/{} | {}ms",
-                        sig, sell_start.elapsed().as_millis(),
+                        "Pump.fun direct sell submitted: https://solscan.io/tx/{} | {}ms",
+                        sig,
+                        sell_start.elapsed().as_millis(),
                     );
 
                     let confirmed = self.wait_sell_confirm(&sig, 10).await;
                     if confirmed {
                         info!(
-                            "Pump.fun 直卖确认成功: {} | {}ms",
-                            &sig[..16], sell_start.elapsed().as_millis(),
+                            "Pump.fun direct sell confirmed: {} | {}ms",
+                            &sig[..16],
+                            sell_start.elapsed().as_millis(),
                         );
                         last_sig = sig;
                         success = true;
                         break;
                     } else {
-                        warn!("Pump.fun 直卖未确认或失败: {} (重试)", &sig[..16]);
+                        warn!(
+                            "Pump.fun direct sell unconfirmed or failed: {} (retry)",
+                            &sig[..16]
+                        );
                     }
                 }
                 Err(e) => {
-                    warn!("Pump.fun 直卖尝试 #{} 失败: {} → 回退 Jupiter", attempt, e);
-                    // Pump.fun 直卖失败（如已迁移外盘），回退 Jupiter
+                    warn!(
+                        "Pump.fun direct sell attempt #{} failed: {} -> fallback Jupiter",
+                        attempt, e
+                    );
                     match self.try_jupiter_sell(&mint, token_balance).await {
                         Ok(sig) => {
                             info!(
-                                "Jupiter 卖出已提交: https://solscan.io/tx/{} | {}ms",
-                                sig, sell_start.elapsed().as_millis(),
+                                "Jupiter sell submitted: https://solscan.io/tx/{} | {}ms",
+                                sig,
+                                sell_start.elapsed().as_millis(),
                             );
                             let confirmed = self.wait_sell_confirm(&sig, 10).await;
                             if confirmed {
@@ -232,7 +275,7 @@ impl SellExecutor {
                                 break;
                             }
                         }
-                        Err(je) => warn!("Jupiter 回退也失败: {}", je),
+                        Err(je) => warn!("Jupiter fallback also failed: {}", je),
                     }
                     if attempt < MAX_SELL_RETRIES {
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -248,7 +291,6 @@ impl SellExecutor {
             self.account_subscriber.untrack_mint(&mint);
             self.prefetch_cache.remove(&mint);
 
-            // TG 推送卖出成功
             let mint_str = mint.to_string();
             self.tg.send(TgEvent::SellSuccess {
                 mint,
@@ -261,45 +303,44 @@ impl SellExecutor {
             let remaining = self.get_token_balance_rpc(&user_ata);
             if remaining > 0 {
                 warn!(
-                    "卖出失败但仍有 {} tokens，回退 Active: {}",
-                    remaining, &mint.to_string()[..12],
+                    "Sell failed but {} tokens remain, revert to Active: {}",
+                    remaining,
+                    &mint.to_string()[..12],
                 );
                 self.auto_sell.revert_to_active(&mint);
             } else {
                 warn!(
-                    "卖出失败且余额为 0，放弃: {}",
+                    "Sell failed and remaining balance is 0, mark failed: {}",
                     &mint.to_string()[..12],
                 );
-                self.auto_sell.confirm_failed(&mint, "sell failed, zero balance");
+                self.auto_sell
+                    .confirm_failed(&mint, "sell failed, zero balance");
                 self.account_subscriber.untrack_mint(&mint);
                 self.prefetch_cache.remove(&mint);
             }
 
-            // TG 推送卖出失败
             self.tg.send(TgEvent::SellFailed {
                 mint,
-                reason: "Pump.fun 直卖 + Jupiter 回退均失败".to_string(),
+                reason: "Pump.fun direct sell + Jupiter fallback both failed".to_string(),
             });
         }
     }
 
-    /// 通过 Jupiter API 构建卖出交易并发送
+    /// Build and send a Jupiter sell transaction.
     async fn try_jupiter_sell(&self, mint: &Pubkey, token_amount: u64) -> Result<String> {
-        // Jupiter 构建签名后的交易（priority fee 由 Jupiter 自动估算）
-        let signed_tx_bytes = self.jupiter.build_sell_transaction(
-            mint,
-            token_amount,
-            self.dyn_config.sell_slippage_bps(),
-            &self.config.keypair,
-        ).await?;
+        let signed_tx_bytes = self
+            .jupiter
+            .build_sell_transaction(
+                mint,
+                token_amount,
+                self.dyn_config.sell_slippage_bps(),
+                &self.config.keypair,
+            )
+            .await?;
 
-        // 发送到多通道（RPC + Jito）
-        let tx_base64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &signed_tx_bytes,
-        );
+        let tx_base64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &signed_tx_bytes);
 
-        // 通过 RPC sendTransaction 发送（base64 编码）
         let rpc_url = self.config.rpc_url.clone();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -328,28 +369,29 @@ impl SellExecutor {
             .await?;
 
         if let Some(error) = resp.get("error") {
-            anyhow::bail!("Jupiter 卖出 RPC 发送失败: {}", error);
+            anyhow::bail!("Jupiter sell RPC send failed: {}", error);
         }
 
         let sig = resp["result"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Jupiter 卖出无签名返回"))?;
+            .ok_or_else(|| anyhow::anyhow!("Jupiter sell returned no signature"))?;
 
         Ok(sig.to_string())
     }
 
     async fn try_close_ata(&self, mint: &Pubkey, ata: &Pubkey) {
-        // 从 gRPC 缓存检查余额
-        let balance = self.ata_cache.get(mint).unwrap_or_else(|| {
-            self.get_token_balance_rpc(ata)
-        });
+        let balance = self
+            .ata_cache
+            .get(mint)
+            .unwrap_or_else(|| self.get_token_balance_rpc(ata));
         if balance > 0 {
             debug!("ATA still has balance {}, skip close", balance);
             return;
         }
 
-        // 使用正确的 token program（兼容 Token-2022）
-        let token_program = self.prefetch_cache.get(mint)
+        let token_program = self
+            .prefetch_cache
+            .get(mint)
             .map(|pf| pf.token_program)
             .unwrap_or_else(spl_token::id);
 
@@ -369,14 +411,14 @@ impl SellExecutor {
             }
         };
 
-        // 获取最新 blockhash
         let rpc_bh = self.rpc_client.clone();
-        let bh_result = tokio::task::spawn_blocking(move || {
-            rpc_bh.get_latest_blockhash()
-        }).await;
+        let bh_result = tokio::task::spawn_blocking(move || rpc_bh.get_latest_blockhash()).await;
         let blockhash = match bh_result {
             Ok(Ok(bh)) => bh,
-            _ => { debug!("获取 blockhash 失败，跳过 close ATA"); return; }
+            _ => {
+                debug!("Failed to get blockhash, skip close ATA");
+                return;
+            }
         };
 
         let tx = match crate::tx::builder::TxBuilder::build_simple(
@@ -385,7 +427,10 @@ impl SellExecutor {
             blockhash,
         ) {
             Ok(tx) => tx,
-            Err(e) => { debug!("构建 close ATA 交易失败: {}", e); return; }
+            Err(e) => {
+                debug!("Failed to build close ATA transaction: {}", e);
+                return;
+            }
         };
 
         let rpc = self.rpc_client.clone();
@@ -401,17 +446,14 @@ impl SellExecutor {
         .await
         {
             Ok(Ok(sig)) => {
-                info!(
-                    "ATA closed: https://solscan.io/tx/{} (~0.002 SOL)",
-                    sig,
-                );
+                info!("ATA closed: https://solscan.io/tx/{} (~0.002 SOL)", sig,);
             }
             Ok(Err(e)) => debug!("Close ATA failed: {}", e),
             Err(e) => debug!("Close ATA task error: {}", e),
         }
     }
 
-    /// 等待卖出交易链上确认
+    /// Wait for on-chain confirmation of a sell transaction.
     async fn wait_sell_confirm(&self, sig_str: &str, max_secs: u64) -> bool {
         use solana_sdk::signature::Signature;
         let sig = match sig_str.parse::<Signature>() {
@@ -424,14 +466,13 @@ impl SellExecutor {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let rpc = self.rpc_client.clone();
             let s = sig;
-            let result = tokio::task::spawn_blocking(move || {
-                rpc.get_signature_statuses(&[s])
-            }).await;
+            let result =
+                tokio::task::spawn_blocking(move || rpc.get_signature_statuses(&[s])).await;
             match result {
                 Ok(Ok(resp)) => {
                     if let Some(Some(status)) = resp.value.first() {
                         if status.err.is_some() {
-                            warn!("卖出链上失败: {:?}", status.err);
+                            warn!("Sell failed on-chain: {:?}", status.err);
                             return false;
                         }
                         return true;
@@ -443,19 +484,25 @@ impl SellExecutor {
         false
     }
 
-    /// 分档卖出（25% / 50% / 75% / 100%）
+    /// Partial sell: 25% / 50% / 75% / 100%.
     pub async fn handle_partial_sell(&self, mint: &Pubkey, percent: u32) {
-        let user_ata = self.prefetch_cache.get(mint)
+        let user_ata = self
+            .prefetch_cache
+            .get(mint)
             .map(|pf| pf.user_ata)
             .unwrap_or_else(|| get_associated_token_address(&self.config.pubkey, mint));
 
-        let total_balance = self.ata_cache.get(mint).unwrap_or_else(|| {
-            self.get_token_balance_rpc(&user_ata)
-        });
+        let total_balance = self
+            .ata_cache
+            .get(mint)
+            .unwrap_or_else(|| self.get_token_balance_rpc(&user_ata));
 
         if total_balance == 0 {
-            warn!("分档卖出: 余额为 0");
-            self.tg.send(TgEvent::SellFailed { mint: *mint, reason: "余额为 0".into() });
+            warn!("Partial sell skipped: zero balance");
+            self.tg.send(TgEvent::SellFailed {
+                mint: *mint,
+                reason: "zero balance".into(),
+            });
             return;
         }
 
@@ -466,11 +513,19 @@ impl SellExecutor {
         };
 
         if sell_amount == 0 {
-            self.tg.send(TgEvent::SellFailed { mint: *mint, reason: "卖出数量为 0".into() });
+            self.tg.send(TgEvent::SellFailed {
+                mint: *mint,
+                reason: "sell amount is zero".into(),
+            });
             return;
         }
 
-        info!("分档卖出: {}% of {} = {} tokens", percent, &mint.to_string()[..12], sell_amount);
+        info!(
+            "Partial sell: {}% of {} = {} tokens",
+            percent,
+            &mint.to_string()[..12],
+            sell_amount
+        );
 
         let mut success = false;
         let mut last_sig = String::new();
@@ -486,7 +541,7 @@ impl SellExecutor {
                     }
                 }
                 Err(e) => {
-                    warn!("分档卖出尝试 #{} 失败: {}", attempt, e);
+                    warn!("Partial sell attempt #{} failed: {}", attempt, e);
                     if attempt < MAX_SELL_RETRIES {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
@@ -498,7 +553,6 @@ impl SellExecutor {
         let short = format!("{}..{}", &mint_str[..6], &mint_str[mint_str.len() - 4..]);
 
         if success {
-            // 100% 卖出时关闭仓位和 ATA
             if percent >= 100 {
                 self.try_close_ata(mint, &user_ata).await;
                 self.auto_sell.mark_closed(mint, last_sig.clone());
@@ -509,19 +563,23 @@ impl SellExecutor {
             self.tg.send(TgEvent::SellSuccess {
                 mint: *mint,
                 token_name: short,
-                reason: format!("手动 {}%", percent),
-                pnl_percent: self.auto_sell.get_position(mint).map(|p| p.pnl_percent()).unwrap_or(0.0),
+                reason: format!("manual {}%", percent),
+                pnl_percent: self
+                    .auto_sell
+                    .get_position(mint)
+                    .map(|p| p.pnl_percent())
+                    .unwrap_or(0.0),
                 tx_sig: last_sig,
             });
         } else {
             self.tg.send(TgEvent::SellFailed {
                 mint: *mint,
-                reason: format!("{}% 卖出重试耗尽", percent),
+                reason: format!("{}% sell retries exhausted", percent),
             });
         }
     }
 
-    /// RPC 回退：仅在 gRPC 缓存未命中时使用
+    /// RPC fallback: only used when gRPC cache misses.
     fn get_token_balance_rpc(&self, ata: &Pubkey) -> u64 {
         self.rpc_client
             .get_token_account_balance(ata)

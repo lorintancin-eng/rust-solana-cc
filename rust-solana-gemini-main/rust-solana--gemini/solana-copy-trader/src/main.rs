@@ -22,15 +22,21 @@ use tracing::{debug, error, info, warn};
 use autosell::{AutoSellManager, Position, SellReason, SellSignal};
 use config::{AppConfig, DynConfig};
 use consensus::{
-    ConsensusEngine,
     engine::{BuySignal, ConsensusTrigger},
+    ConsensusEngine,
 };
 use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache, GrpcSubscriber};
-use processor::DetectedTrade;
-use processor::pumpfun::PumpfunProcessor;
 use processor::prefetch::PrefetchCache;
+use processor::pumpfun::PumpfunProcessor;
+use processor::DetectedTrade;
 use telegram::{TgBot, TgEvent, TgNotifier, TgStats};
-use tx::{blockhash, builder::TxBuilder, confirm::{BuyConfirmer, format_price_gmgn, format_mcap_usd}, sell_executor::SellExecutor, sender::TxSender};
+use tx::{
+    blockhash,
+    builder::TxBuilder,
+    confirm::{format_mcap_usd, format_price_gmgn, BuyConfirmer},
+    sell_executor::SellExecutor,
+    sender::TxSender,
+};
 use utils::sol_price::SolUsdPrice;
 use utils::token_info;
 
@@ -43,7 +49,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.4");
+    info!("   Solana 跟单交易系统 v1.6.7");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -83,9 +89,11 @@ async fn main() -> Result<()> {
     if config.jito_enabled {
         info!(
             "Jito 小费: 买入={} lamports | 卖出={} lamports",
-            config.jito_buy_tip_lamports,
-            config.jito_sell_tip_lamports,
+            config.jito_buy_tip_lamports, config.jito_sell_tip_lamports,
         );
+    }
+    if !config.zero_slot_urls.is_empty() {
+        info!("0slot fee: {} lamports", config.zero_slot_tip_lamports);
     }
     info!(
         "自动卖出: {} | 止盈={}% 止损={}% 追踪止损={}% 超时={}s",
@@ -227,7 +235,10 @@ async fn main() -> Result<()> {
             sol_usd.clone(),
             tg_event_rx,
         );
-        info!("Telegram Bot V2 已配置 | chat_id: {}", config.telegram_chat_id.as_deref().unwrap_or(""));
+        info!(
+            "Telegram Bot V2 已配置 | chat_id: {}",
+            config.telegram_chat_id.as_deref().unwrap_or("")
+        );
         Some(bot)
     } else {
         info!("Telegram Bot 未配置（设置 TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID 启用）");
@@ -247,8 +258,7 @@ async fn main() -> Result<()> {
     if config.auto_sell_enabled {
         let _grpc_monitor =
             auto_sell_manager.start_grpc_monitor(account_update_rx, sell_signal_tx.clone());
-        let _fallback_monitor =
-            auto_sell_manager.start_fallback_monitor(sell_signal_tx.clone());
+        let _fallback_monitor = auto_sell_manager.start_fallback_monitor(sell_signal_tx.clone());
         info!(
             "自动卖出监控已启动 (gRPC 实时价格 + {}s 超时兜底)",
             config.price_check_interval_secs,
@@ -342,7 +352,10 @@ async fn main() -> Result<()> {
         while let Some(trigger) = consensus_rx.recv().await {
             // 共识触发时插入 mint_dedup，防止重复执行
             if exec_mint_dedup.contains_key(&trigger.token_mint) {
-                info!("⏭️ 共识触发但代币已买入: {} (本次运行已买入)", &trigger.token_mint.to_string()[..12]);
+                info!(
+                    "⏭️ 共识触发但代币已买入: {} (本次运行已买入)",
+                    &trigger.token_mint.to_string()[..12]
+                );
                 continue;
             }
             exec_mint_dedup.insert(trigger.token_mint, Instant::now());
@@ -372,7 +385,8 @@ async fn main() -> Result<()> {
                 &exec_dyn_config,
                 &exec_tg,
                 &exec_tg_stats,
-            ).await;
+            )
+            .await;
         }
     });
 
@@ -445,7 +459,8 @@ async fn main() -> Result<()> {
                             let wallet_str = trade.source_wallet.to_string();
                             info!(
                                 "跟卖信号: {}..{} 卖出 {} | 触发跟卖",
-                                &wallet_str[..4], &wallet_str[wallet_str.len()-4..],
+                                &wallet_str[..4],
+                                &wallet_str[wallet_str.len() - 4..],
                                 &token_mint.to_string()[..12],
                             );
                             let signal = SellSignal {
@@ -480,7 +495,10 @@ async fn main() -> Result<()> {
         let (token_mint, token_program) = match extract_token_info(&trade) {
             Some(info) => info,
             None => {
-                info!("⏭️ 无法从 accountKeys 提取 mint，跳过 sig: {}", &trade.signature[..12]);
+                info!(
+                    "⏭️ 无法从 accountKeys 提取 mint，跳过 sig: {}",
+                    &trade.signature[..12]
+                );
                 continue;
             }
         };
@@ -496,7 +514,10 @@ async fn main() -> Result<()> {
         // 共识模式：不拦截（多钱包买同一 token 是共识信号），在共识触发时去重
         if is_instant_mode {
             if mint_dedup.contains_key(&token_mint) {
-                info!("⏭️ 跳过已买代币: {} (本次运行已买入)", &token_mint.to_string()[..12]);
+                info!(
+                    "⏭️ 跳过已买代币: {} (本次运行已买入)",
+                    &token_mint.to_string()[..12]
+                );
                 continue;
             }
             mint_dedup.insert(token_mint, Instant::now());
@@ -553,7 +574,8 @@ async fn main() -> Result<()> {
                 &dyn_config,
                 &tg_notifier,
                 &tg_stats,
-            ).await;
+            )
+            .await;
         } else {
             // 多钱包共识模式：后台预取 BC，提交共识
             if bc_cache.get(&token_mint).is_none() {
@@ -638,51 +660,73 @@ async fn execute_buy(
     // 1. BC cache 命中（零 RPC，AMM 公式精确计算，最可靠）
     // 2. 目标指令推算（零 RPC，需 max_sol_cost 合理性检查）
     // 无 BC RPC fetch — 任何 RPC 调用都会毁掉同区块机会
-    let buy_result: Result<(processor::MirrorInstruction, u64), anyhow::Error> = if let Some(ref pf) = prefetched {
-        if pf.mirror_accounts.is_empty() {
-            Err(anyhow::anyhow!("无 mirror_accounts，无法构建指令"))
-        } else if let Some(bc_state) = bc_cache.get(mint) {
-            // ⚡ 最优: BC cache 命中，AMM 公式精确计算（最可靠）
-            let token_amount = bc_state.sol_to_token_quote(buy_lamports);
-            info!(
-                "指令构建: BC cache 命中 | price: {:.10} SOL | tokens: {}",
-                bc_state.price_sol(), token_amount,
-            );
-            pumpfun.buy_from_cached_state(
-                mint, &pf.user_ata, &pf.token_program, &pf.source_wallet,
-                &pf.mirror_accounts, &bc_state, config,
-            ).map(|mirror| (mirror, token_amount))
-        } else if target_instruction_data.len() >= 24 {
-            // 次选: 目标指令推算（零 RPC，零缓存依赖）
-            // 合理性检查: max_sol_cost 超过 100 SOL 视为"无限滑点"标志，不可用于价格推算
-            let target_max_sol = u64::from_le_bytes(
-                target_instruction_data[16..24].try_into().unwrap_or([0; 8])
-            );
-            let max_sol_f = target_max_sol as f64 / 1e9;
-            if max_sol_f > 100.0 {
-                warn!(
-                    "目标 max_sol_cost={:.2} SOL 不合理（疑似无限滑点），跳过目标指令推算",
-                    max_sol_f,
+    let buy_result: Result<(processor::MirrorInstruction, u64), anyhow::Error> =
+        if let Some(ref pf) = prefetched {
+            if pf.mirror_accounts.is_empty() {
+                Err(anyhow::anyhow!("无 mirror_accounts，无法构建指令"))
+            } else if let Some(bc_state) = bc_cache.get(mint) {
+                // ⚡ 最优: BC cache 命中，AMM 公式精确计算（最可靠）
+                let token_amount = bc_state.sol_to_token_quote(buy_lamports);
+                info!(
+                    "指令构建: BC cache 命中 | price: {:.10} SOL | tokens: {}",
+                    bc_state.price_sol(),
+                    token_amount,
                 );
-                Err(anyhow::anyhow!("BC 缓存未命中 + 目标 max_sol_cost 不合理，跳过"))
+                pumpfun
+                    .buy_from_cached_state(
+                        mint,
+                        &pf.user_ata,
+                        &pf.token_program,
+                        &pf.source_wallet,
+                        &pf.mirror_accounts,
+                        &bc_state,
+                        config,
+                    )
+                    .map(|mirror| (mirror, token_amount))
+            } else if target_instruction_data.len() >= 24 {
+                // 次选: 目标指令推算（零 RPC，零缓存依赖）
+                // 合理性检查: max_sol_cost 超过 100 SOL 视为"无限滑点"标志，不可用于价格推算
+                let target_max_sol = u64::from_le_bytes(
+                    target_instruction_data[16..24].try_into().unwrap_or([0; 8]),
+                );
+                let max_sol_f = target_max_sol as f64 / 1e9;
+                if max_sol_f > 100.0 {
+                    warn!(
+                        "目标 max_sol_cost={:.2} SOL 不合理（疑似无限滑点），跳过目标指令推算",
+                        max_sol_f,
+                    );
+                    Err(anyhow::anyhow!(
+                        "BC 缓存未命中 + 目标 max_sol_cost 不合理，跳过"
+                    ))
+                } else {
+                    pumpfun.buy_from_target_instruction(
+                        mint,
+                        &pf.user_ata,
+                        &pf.token_program,
+                        &pf.source_wallet,
+                        &pf.mirror_accounts,
+                        target_instruction_data,
+                        config,
+                    )
+                }
             } else {
-                pumpfun.buy_from_target_instruction(
-                    mint, &pf.user_ata, &pf.token_program, &pf.source_wallet,
-                    &pf.mirror_accounts, target_instruction_data, config,
-                )
+                Err(anyhow::anyhow!(
+                    "BC 缓存未命中且无目标指令数据，跳过（不做 RPC 兜底）"
+                ))
             }
         } else {
-            Err(anyhow::anyhow!("BC 缓存未命中且无目标指令数据，跳过（不做 RPC 兜底）"))
-        }
-    } else {
-        Err(anyhow::anyhow!("无预取数据，跳过"))
-    };
+            Err(anyhow::anyhow!("无预取数据，跳过"))
+        };
 
     // 阶段一入场价: buyAmountSol / (estimatedTokens / 1e6)
     let (estimated_tokens_raw, entry_price_sol, entry_mcap_sol) = match &buy_result {
         Ok((_, est_tokens)) if *est_tokens > 0 => {
             let display_tokens = *est_tokens as f64 / 1e6;
-            let price = if display_tokens > 0.0 { buy_sol / display_tokens } else { 0.0 };
+            let price = if display_tokens > 0.0 {
+                buy_sol / display_tokens
+            } else {
+                0.0
+            };
             let mcap = if let Some(bc_state) = bc_cache.get(mint) {
                 bc_state.market_cap_sol()
             } else {
@@ -695,7 +739,11 @@ async fn execute_buy(
             if let Some(bc_state) = bc_cache.get(mint) {
                 let out = bc_state.sol_to_token_quote(buy_lamports);
                 let display = out as f64 / 1e6;
-                let price = if display > 0.0 { buy_sol / display } else { 0.0 };
+                let price = if display > 0.0 {
+                    buy_sol / display
+                } else {
+                    0.0
+                };
                 (out, price, bc_state.market_cap_sol())
             } else {
                 (0, 0.0, 0.0)
@@ -706,9 +754,7 @@ async fn execute_buy(
     let entry_price_usd = entry_price_sol * sol_price;
     let entry_mcap_usd = entry_mcap_sol * sol_price;
 
-    let mut position = Position::new(
-        *mint, buy_lamports, entry_price_sol, wallets[0],
-    );
+    let mut position = Position::new(*mint, buy_lamports, entry_price_sol, wallets[0]);
     position.entry_mcap_sol = entry_mcap_sol;
 
     match buy_result {
@@ -740,12 +786,29 @@ async fn execute_buy(
                 )
             };
 
+            let zero_slot_tx = if !config.zero_slot_urls.is_empty() {
+                let fee_account = tx_sender.random_0slot_tip_account();
+                TxBuilder::build_0slot_transaction(
+                    &mirror,
+                    config,
+                    &config.keypair,
+                    blockhash,
+                    &fee_account,
+                    dyn_config.zero_slot_tip_lamports(),
+                    &[],
+                )
+                .ok()
+            } else {
+                None
+            };
+
             match tx_result {
                 Ok(transaction) => {
                     // ⚡ fire-and-forget 多通道并发发送
                     // RabbitStream 为 Processed 级别推送（meta 不填充≠预执行），
                     // Backrun Bundle 100% 失败，统一走独立TX发送
-                    let send_result = tx_sender.fire_and_forget(&transaction);
+                    let send_result =
+                        tx_sender.fire_and_forget(&transaction, zero_slot_tx.as_ref());
                     match send_result {
                         Ok(sig) => {
                             let elapsed = start.elapsed();
@@ -780,10 +843,10 @@ async fn execute_buy(
                                 position.mark_confirming();
                                 auto_sell_manager.add_position(position.clone());
 
-                                let user_ata = prefetched
-                                    .as_ref()
-                                    .map(|pf| pf.user_ata)
-                                    .unwrap_or_else(|| get_associated_token_address(&config.pubkey, mint));
+                                let user_ata =
+                                    prefetched.as_ref().map(|pf| pf.user_ata).unwrap_or_else(
+                                        || get_associated_token_address(&config.pubkey, mint),
+                                    );
 
                                 // 🔍 主动链上确认：轮询签名状态 → 查 ATA 余额 → 修正真实价格
                                 BuyConfirmer::spawn_confirm_task(
@@ -830,9 +893,9 @@ fn extract_token_info(trade: &DetectedTrade) -> Option<(Pubkey, Pubkey)> {
     // CPI 检测已识别 mint（通过 PDA 验证）
     if let Some(mint) = trade.token_mint {
         // CPI 场景下 token_program 默认 TokenLegacy（Pump.fun 内盘绝大多数是 TokenLegacy）
-        let token_program = solana_sdk::pubkey::Pubkey::from_str(
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        ).unwrap();
+        let token_program =
+            solana_sdk::pubkey::Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                .unwrap();
         return Some((mint, token_program));
     }
     // 标准 Pump.fun 直接调用布局
