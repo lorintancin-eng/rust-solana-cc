@@ -126,7 +126,18 @@ impl SellExecutor {
         };
 
         let (blockhash, _) = self.blockhash_cache.get_sync();
-        let transaction = if self.config.jito_enabled {
+        let transaction = if !self.config.zero_slot_urls.is_empty() {
+            let fee_account = self.tx_sender.random_0slot_tip_account();
+            TxBuilder::build_0slot_transaction(
+                &mirror,
+                &self.config,
+                &self.config.keypair,
+                blockhash,
+                &fee_account,
+                self.dyn_config.zero_slot_tip_lamports(),
+                &[],
+            )?
+        } else if self.config.jito_enabled {
             let tip = self.tx_sender.random_jito_tip_account();
             TxBuilder::build_jito_bundle_transaction(
                 &mirror,
@@ -147,25 +158,7 @@ impl SellExecutor {
             )?
         };
 
-        let zero_slot_tx = if !self.config.zero_slot_urls.is_empty() {
-            let fee_account = self.tx_sender.random_0slot_tip_account();
-            TxBuilder::build_0slot_transaction(
-                &mirror,
-                &self.config,
-                &self.config.keypair,
-                blockhash,
-                &fee_account,
-                self.dyn_config.zero_slot_tip_lamports(),
-                &[],
-            )
-            .ok()
-        } else {
-            None
-        };
-
-        let sig = self
-            .tx_sender
-            .fire_and_forget(&transaction, zero_slot_tx.as_ref())?;
+        let sig = self.tx_sender.fire_and_forget(&transaction, None)?;
         Ok(sig.to_string())
     }
 

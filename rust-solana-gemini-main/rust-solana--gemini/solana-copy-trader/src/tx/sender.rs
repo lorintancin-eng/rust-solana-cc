@@ -141,30 +141,26 @@ impl TxSender {
         zero_slot_tx: Option<&VersionedTransaction>,
     ) -> Result<Signature> {
         let start = Instant::now();
+        let zero_slot_only_mode = !self.zero_slot_urls.is_empty();
+        let wire_tx = zero_slot_tx.unwrap_or(transaction);
 
         // 预序列化交易（只做一次，VersionedTransaction 用 bincode 序列化）
-        let tx_bytes = bincode::serialize(transaction)?;
+        let tx_bytes = bincode::serialize(wire_tx)?;
         let tx_b58 = bs58::encode(&tx_bytes).into_string();
         let tx_base64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
         // 提取签名（本地操作）
-        let signature = transaction.signatures.first().copied().unwrap_or_default();
+        let signature = wire_tx.signatures.first().copied().unwrap_or_default();
 
         let mut channel_count = 0u32;
 
         // 通道 0slot: 质押加速（最高优先级，要求独立 fee 交易）
         if !self.zero_slot_urls.is_empty() {
-            let zs_b64 = if let Some(zs_tx) = zero_slot_tx {
-                let zs_bytes = bincode::serialize(zs_tx)?;
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &zs_bytes)
-            } else {
-                tx_base64.clone()
-            };
             for zero_url in &self.zero_slot_urls {
                 let http = self.http_client.clone();
                 let url = zero_url.clone();
-                let b64 = zs_b64.clone();
+                let b64 = tx_base64.clone();
                 tokio::spawn(async move {
                     match Self::send_rpc_raw(&http, &url, &b64, true).await {
                         Ok(sig) => info!("通道结果: 0slot ✅ | {}", sig),
@@ -204,7 +200,9 @@ impl TxSender {
         }
 
         // 通道 3+4: Jito Bundle + Jito TX — 轮换 endpoint，T+0 并发
-        if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
+        if !self.zero_slot_urls.is_empty() {
+            info!("0slot only mode: skipping Jito channels to avoid duplicate execution");
+        } else if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
             let (url1, url2) = self.next_jito_url_pair();
             let auth = self.jito_auth_uuid.clone();
             let http = self.http_client.clone();
@@ -282,7 +280,9 @@ impl TxSender {
         let mut channel_count = 0u32;
 
         // 通道 1+2: Jito Backrun Bundle — 轮换 endpoint，两端点并发
-        if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
+        if !self.zero_slot_urls.is_empty() {
+            info!("0slot only mode: skipping Jito channels to avoid duplicate execution");
+        } else if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
             let (url1, url2) = self.next_jito_url_pair();
             let auth = self.jito_auth_uuid.clone();
 
@@ -365,9 +365,11 @@ impl TxSender {
     ) -> Result<SendResult> {
         let start = Instant::now();
         let mut handles: Vec<tokio::task::JoinHandle<(&str, Result<Signature>)>> = Vec::new();
+        let zero_slot_only_mode = !self.zero_slot_urls.is_empty();
+        let wire_tx = zero_slot_tx.unwrap_or(transaction);
 
         // 预序列化一次，所有通道复用
-        let tx_bytes = bincode::serialize(transaction)?;
+        let tx_bytes = bincode::serialize(wire_tx)?;
         let tx_b58 = bs58::encode(&tx_bytes).into_string();
         let tx_base64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
@@ -376,16 +378,10 @@ impl TxSender {
 
         // 0slot 质押加速通道（最高优先级，需要带官方 fee 的独立交易）
         if !self.zero_slot_urls.is_empty() {
-            let zs_b64 = if let Some(zs_tx) = zero_slot_tx {
-                let zs_bytes = bincode::serialize(zs_tx)?;
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &zs_bytes)
-            } else {
-                tx_base64.clone()
-            };
             for zero_url in &self.zero_slot_urls {
                 let http = self.http_client.clone();
                 let url = zero_url.clone();
-                let b64 = zs_b64.clone();
+                let b64 = tx_base64.clone();
                 let sp = skip_preflight;
                 handles.push(tokio::spawn(async move {
                     let result = Self::send_rpc_raw(&http, &url, &b64, sp).await;
@@ -414,7 +410,9 @@ impl TxSender {
             }));
         }
 
-        if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
+        if zero_slot_only_mode {
+            info!("0slot only mode: skipping Jito channels to avoid duplicate execution");
+        } else if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
             let (url1, url2) = self.next_jito_url_pair();
             let auth = self.jito_auth_uuid.clone();
 
