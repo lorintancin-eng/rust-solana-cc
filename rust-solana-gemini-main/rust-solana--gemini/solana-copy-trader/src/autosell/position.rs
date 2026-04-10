@@ -117,6 +117,12 @@ impl Position {
         self.sell_snapshot = Some(snapshot);
     }
 
+    pub fn set_token_amount_estimate(&mut self, token_amount: u64) {
+        if self.token_amount == 0 && token_amount > 0 {
+            self.token_amount = token_amount;
+        }
+    }
+
     // ============================================
     // 状态转换方法
     // ============================================

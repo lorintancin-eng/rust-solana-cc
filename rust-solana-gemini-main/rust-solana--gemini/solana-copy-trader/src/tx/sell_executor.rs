@@ -6,8 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::autosell::{AutoSellManager, SellAccountSnapshot, SellSignal};
-use crate::config::{AppConfig, DynConfig};
+use crate::autosell::{
+    AutoSellManager, Position, PositionState, SellAccountSnapshot, SellReason, SellSignal,
+};
+use crate::config::{AppConfig, DynConfig, SELL_MODE_FOLLOW};
 use crate::grpc::{AccountSubscriber, AtaBalanceCache, BondingCurveCache};
 use crate::processor::prefetch::PrefetchCache;
 use crate::processor::pumpfun::PumpfunProcessor;
@@ -21,6 +23,9 @@ const MAX_SELL_RETRIES: u32 = 3;
 const FAST_FIRST_CONFIRM_MS: u64 = 1_500;
 const RETRY_CONFIRM_MS: u64 = 2_500;
 const DEFAULT_CONFIRM_MS: u64 = 3_000;
+const BALANCE_RETRY_INTERVAL_MS: u64 = 80;
+const STABLE_BALANCE_RETRIES: u32 = 4;
+const FOLLOW_BALANCE_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct SellPathTimings {
@@ -58,9 +63,9 @@ pub struct SellExecutor {
 }
 
 impl SellExecutor {
-    fn confirm_timeout_ms(reason: crate::autosell::SellReason, attempt: u32) -> u64 {
+    fn confirm_timeout_ms(reason: SellReason, attempt: u32) -> u64 {
         match reason {
-            crate::autosell::SellReason::FollowSell => {
+            SellReason::FollowSell => {
                 if attempt == 1 {
                     FAST_FIRST_CONFIRM_MS
                 } else {
@@ -69,6 +74,76 @@ impl SellExecutor {
             }
             _ => DEFAULT_CONFIRM_MS,
         }
+    }
+
+    fn follow_mode_active(&self) -> bool {
+        self.dyn_config.sell_mode() == SELL_MODE_FOLLOW
+    }
+
+    fn should_use_aggressive_follow_path(&self, signal: &SellSignal) -> bool {
+        self.follow_mode_active() && signal.reason == SellReason::FollowSell
+    }
+
+    async fn resolve_sell_balance(
+        &self,
+        mint: &Pubkey,
+        user_ata: &Pubkey,
+        aggressive_follow: bool,
+    ) -> Option<u64> {
+        if let Some(balance) = self.ata_cache.get(mint) {
+            if balance > 0 {
+                return Some(balance);
+            }
+        }
+
+        let estimated_balance = self
+            .auto_sell
+            .get_position(mint)
+            .map(|pos| pos.token_amount)
+            .filter(|amount| *amount > 0);
+
+        let retries = if aggressive_follow {
+            FOLLOW_BALANCE_RETRIES
+        } else {
+            STABLE_BALANCE_RETRIES
+        };
+
+        for attempt in 1..=retries {
+            let rpc_balance = self.get_token_balance_rpc(user_ata);
+            if rpc_balance > 0 {
+                return Some(rpc_balance);
+            }
+
+            if aggressive_follow {
+                if let Some(amount) = estimated_balance {
+                    info!(
+                        "Follow mode: using estimated token amount before buy confirm: {}.. | amount: {} | attempt={}/{}",
+                        &mint.to_string()[..12],
+                        amount,
+                        attempt,
+                        retries,
+                    );
+                    return Some(amount);
+                }
+            }
+
+            if attempt < retries {
+                tokio::time::sleep(Duration::from_millis(BALANCE_RETRY_INTERVAL_MS)).await;
+                if let Some(balance) = self.ata_cache.get(mint) {
+                    if balance > 0 {
+                        return Some(balance);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn restore_after_skipped_sell(&self, previous_position: &Position) {
+        let mut restored = previous_position.clone();
+        restored.sell_attempts += 1;
+        self.auto_sell.add_position(restored);
     }
 
     pub fn new(
@@ -231,6 +306,12 @@ impl SellExecutor {
     pub async fn handle_sell_signal(&self, signal: SellSignal) {
         let sell_start = std::time::Instant::now();
         let mint = signal.token_mint;
+        let Some(position_before_sell) = self.auto_sell.get_position(&mint) else {
+            warn!("卖出信号对应仓位不存在，跳过: {}", &mint.to_string()[..12]);
+            return;
+        };
+        let previous_state = position_before_sell.state;
+        let aggressive_follow = self.should_use_aggressive_follow_path(&signal);
 
         info!(
             "收到卖出信号: {}.. | 原因: {} | 盈亏: {:.2}%",
@@ -239,20 +320,28 @@ impl SellExecutor {
             signal.pnl_percent,
         );
 
+        info!(
+            "卖出模式路由: {} | previous_state={}",
+            if aggressive_follow {
+                "FOLLOW_AGGRESSIVE"
+            } else {
+                "TP_SL_STABLE"
+            },
+            previous_state,
+        );
+
         const MAX_TOTAL_SELL_ATTEMPTS: u32 = 3;
-        if let Some(pos) = self.auto_sell.get_position(&mint) {
-            if pos.sell_attempts >= MAX_TOTAL_SELL_ATTEMPTS {
-                error!(
+        if position_before_sell.sell_attempts >= MAX_TOTAL_SELL_ATTEMPTS {
+            error!(
                     "卖出已尝试 {} 次全部失败，放弃: {}",
-                    pos.sell_attempts,
-                    &mint.to_string()[..12],
-                );
-                self.auto_sell
-                    .confirm_failed(&mint, "max sell attempts exceeded");
-                self.account_subscriber.untrack_mint(&mint);
-                self.prefetch_cache.remove(&mint);
-                return;
-            }
+                position_before_sell.sell_attempts,
+                &mint.to_string()[..12],
+            );
+            self.auto_sell
+                .confirm_failed(&mint, "max sell attempts exceeded");
+            self.account_subscriber.untrack_mint(&mint);
+            self.prefetch_cache.remove(&mint);
+            return;
         }
 
         if !self.auto_sell.mark_selling(&mint) {
@@ -267,13 +356,13 @@ impl SellExecutor {
             .unwrap_or_else(|| get_associated_token_address(&self.config.pubkey, &mint));
 
         let token_balance = self
-            .ata_cache
-            .get(&mint)
-            .unwrap_or_else(|| self.get_token_balance_rpc(&user_ata));
+            .resolve_sell_balance(&mint, &user_ata, aggressive_follow)
+            .await
+            .unwrap_or(0);
 
         if token_balance == 0 {
             warn!("跳过卖出: 余额为 0");
-            self.auto_sell.confirm_failed(&mint, "zero balance");
+            self.restore_after_skipped_sell(&position_before_sell);
             return;
         }
 
@@ -283,12 +372,17 @@ impl SellExecutor {
         for attempt in 1..=MAX_SELL_RETRIES {
             let confirm_timeout_ms = Self::confirm_timeout_ms(signal.reason, attempt);
             info!(
-                "Pump.fun direct sell attempt #{}/{}: {}.. (amount: {}, confirm_timeout={}ms)",
+                "Pump.fun direct sell attempt #{}/{}: {}.. (amount: {}, confirm_timeout={}ms, mode={})",
                 attempt,
                 MAX_SELL_RETRIES,
                 &mint.to_string()[..12],
                 token_balance,
                 confirm_timeout_ms,
+                if aggressive_follow {
+                    "FOLLOW_AGGRESSIVE"
+                } else {
+                    "TP_SL_STABLE"
+                },
             );
 
             match self.try_pumpfun_sell(&mint, token_balance, sell_start).await {
@@ -373,11 +467,11 @@ impl SellExecutor {
             let remaining = self.get_token_balance_rpc(&user_ata);
             if remaining > 0 {
                 warn!(
-                    "Sell failed but {} tokens remain, revert to Active: {}",
+                    "Sell failed but {} tokens remain, restore previous state: {}",
                     remaining,
                     &mint.to_string()[..12],
                 );
-                self.auto_sell.revert_to_active(&mint);
+                self.restore_after_skipped_sell(&position_before_sell);
             } else {
                 warn!(
                     "Sell failed and remaining balance is 0, mark failed: {}",
@@ -634,7 +728,7 @@ impl SellExecutor {
         let mut last_sig = String::new();
 
         for attempt in 1..=MAX_SELL_RETRIES {
-            let confirm_timeout_ms = Self::confirm_timeout_ms(crate::autosell::SellReason::Manual, attempt);
+            let confirm_timeout_ms = Self::confirm_timeout_ms(SellReason::Manual, attempt);
             match self.try_pumpfun_sell(mint, sell_amount, std::time::Instant::now()).await {
                 Ok((sig, timings)) => {
                     info!(

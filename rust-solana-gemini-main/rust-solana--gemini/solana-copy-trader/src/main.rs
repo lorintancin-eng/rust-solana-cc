@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.13");
+    info!("   Solana 跟单交易系统 v1.6.14");
     info!("   RabbitStream pre-exec + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -846,6 +846,7 @@ async fn execute_buy(
     let entry_mcap_usd = entry_mcap_sol * sol_price;
 
     let mut position = Position::new(*mint, buy_lamports, entry_price_sol, wallets[0]);
+    position.set_token_amount_estimate(estimated_tokens_raw);
     position.entry_mcap_sol = entry_mcap_sol;
     if let Some(ref pf) = prefetched {
         position.set_sell_snapshot(SellAccountSnapshot {
