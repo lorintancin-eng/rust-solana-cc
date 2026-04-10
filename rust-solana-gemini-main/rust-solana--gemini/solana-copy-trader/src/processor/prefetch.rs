@@ -3,7 +3,7 @@ use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::config::AppConfig;
@@ -60,12 +60,15 @@ impl PrefetchCache {
             Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &program_id);
         let associated_bonding_curve =
             spl_associated_token_account::get_associated_token_address_with_program_id(
-                &bonding_curve, mint, token_program,
+                &bonding_curve,
+                mint,
+                token_program,
             );
-        let user_ata =
-            spl_associated_token_account::get_associated_token_address_with_program_id(
-                &config.pubkey, mint, token_program,
-            );
+        let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &config.pubkey,
+            mint,
+            token_program,
+        );
 
         let prefetched = PrefetchedToken {
             mint: *mint,
@@ -94,13 +97,31 @@ impl PrefetchCache {
         self.cache.get(mint).map(|v| v.clone())
     }
 
+    pub async fn get_or_wait(&self, mint: &Pubkey, max_wait: Duration) -> Option<PrefetchedToken> {
+        if let Some(prefetched) = self.get(mint) {
+            return Some(prefetched);
+        }
+
+        let started = Instant::now();
+        while started.elapsed() < max_wait {
+            tokio::task::yield_now().await;
+            if let Some(prefetched) = self.get(mint) {
+                return Some(prefetched);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        None
+    }
+
     pub fn remove(&self, mint: &Pubkey) {
         self.cache.remove(mint);
     }
 
     pub fn cleanup(&self, max_age_secs: u64) {
         let before = self.cache.len();
-        self.cache.retain(|_, v| v.created_at.elapsed().as_secs() < max_age_secs);
+        self.cache
+            .retain(|_, v| v.created_at.elapsed().as_secs() < max_age_secs);
         let removed = before - self.cache.len();
         if removed > 0 {
             debug!("Prefetch cleanup: removed {} expired entries", removed);

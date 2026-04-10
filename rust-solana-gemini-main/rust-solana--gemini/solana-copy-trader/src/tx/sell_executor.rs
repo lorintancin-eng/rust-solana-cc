@@ -524,7 +524,7 @@ impl SellExecutor {
         let mut last_sig = String::new();
 
         for attempt in 1..=MAX_SELL_RETRIES {
-            match self.try_jupiter_sell(mint, sell_amount).await {
+            match self.try_pumpfun_sell(mint, sell_amount).await {
                 Ok(sig) => {
                     let confirmed = self.wait_sell_confirm(&sig, 10).await;
                     if confirmed {
@@ -534,7 +534,21 @@ impl SellExecutor {
                     }
                 }
                 Err(e) => {
-                    warn!("Partial sell attempt #{} failed: {}", attempt, e);
+                    warn!(
+                        "Partial sell Pump.fun attempt #{} failed: {} -> fallback Jupiter",
+                        attempt, e
+                    );
+                    match self.try_jupiter_sell(mint, sell_amount).await {
+                        Ok(sig) => {
+                            let confirmed = self.wait_sell_confirm(&sig, 10).await;
+                            if confirmed {
+                                last_sig = sig;
+                                success = true;
+                                break;
+                            }
+                        }
+                        Err(je) => warn!("Partial sell Jupiter fallback also failed: {}", je),
+                    }
                     if attempt < MAX_SELL_RETRIES {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }

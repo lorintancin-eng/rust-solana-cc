@@ -48,7 +48,7 @@ impl BlockhashCache {
     }
 
     /// 启动后台刷新任务
-    /// 每 400ms 刷新一次（Solana slot time ≈ 400ms）
+    /// 每 120ms 刷新一次，尽量减少 stale blockhash 导致的跨 slot 延迟
     pub fn start_refresh_task(
         &self,
         rpc_client: Arc<RpcClient>,
@@ -63,7 +63,7 @@ impl BlockhashCache {
                 let rpc = rpc_client.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     rpc.get_latest_blockhash_with_commitment(
-                        solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+                        solana_sdk::commitment_config::CommitmentConfig::processed(),
                     )
                 })
                 .await;
@@ -108,10 +108,9 @@ impl BlockhashCache {
 
 /// 初始化 blockhash 缓存
 pub async fn init_blockhash_cache(rpc_client: &RpcClient) -> Result<BlockhashCache> {
-    let (hash, last_valid_block_height) = rpc_client
-        .get_latest_blockhash_with_commitment(
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
-        )?;
+    let (hash, last_valid_block_height) = rpc_client.get_latest_blockhash_with_commitment(
+        solana_sdk::commitment_config::CommitmentConfig::processed(),
+    )?;
 
     let cache = BlockhashCache::new(hash, last_valid_block_height);
     tracing::info!("Blockhash cache initialized: {}", hash);

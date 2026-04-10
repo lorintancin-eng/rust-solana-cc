@@ -171,32 +171,36 @@ impl TxSender {
             }
         }
 
-        // 通道 RPC1: 主 RPC (Shyft)
-        {
-            let http = self.http_client.clone();
-            let url = self.primary_rpc_url.clone();
-            let b64 = tx_base64.clone();
-            tokio::spawn(async move {
-                match Self::send_rpc_raw(&http, &url, &b64, true).await {
-                    Ok(sig) => info!("通道结果: Shyft ✅ | {}", sig),
-                    Err(e) => warn!("通道结果: Shyft ❌ | {}", e),
-                }
-            });
-            channel_count += 1;
-        }
+        if zero_slot_only_mode {
+            info!("0slot only mode: skipping standard RPC channels");
+        } else {
+            // 通道 RPC1: 主 RPC (Shyft)
+            {
+                let http = self.http_client.clone();
+                let url = self.primary_rpc_url.clone();
+                let b64 = tx_base64.clone();
+                tokio::spawn(async move {
+                    match Self::send_rpc_raw(&http, &url, &b64, true).await {
+                        Ok(sig) => info!("通道结果: Shyft ✅ | {}", sig),
+                        Err(e) => warn!("通道结果: Shyft ❌ | {}", e),
+                    }
+                });
+                channel_count += 1;
+            }
 
-        // 通道 2: 备用 RPC (Helius)
-        if let Some(url2) = &self.secondary_rpc_url {
-            let http = self.http_client.clone();
-            let url2 = url2.clone();
-            let b64 = tx_base64.clone();
-            tokio::spawn(async move {
-                match Self::send_rpc_raw(&http, &url2, &b64, true).await {
-                    Ok(sig) => info!("通道结果: Helius ✅ | {}", sig),
-                    Err(e) => warn!("通道结果: Helius ❌ | {}", e),
-                }
-            });
-            channel_count += 1;
+            // 通道 2: 备用 RPC (Helius)
+            if let Some(url2) = &self.secondary_rpc_url {
+                let http = self.http_client.clone();
+                let url2 = url2.clone();
+                let b64 = tx_base64.clone();
+                tokio::spawn(async move {
+                    match Self::send_rpc_raw(&http, &url2, &b64, true).await {
+                        Ok(sig) => info!("通道结果: Helius ✅ | {}", sig),
+                        Err(e) => warn!("通道结果: Helius ❌ | {}", e),
+                    }
+                });
+                channel_count += 1;
+            }
         }
 
         // 通道 3+4: Jito Bundle + Jito TX — 轮换 endpoint，T+0 并发
@@ -390,24 +394,28 @@ impl TxSender {
             }
         }
 
-        {
-            let http = self.http_client.clone();
-            let url = self.primary_rpc_url.clone();
-            let b64 = tx_base64.clone();
-            handles.push(tokio::spawn(async move {
-                let result = Self::send_rpc_raw(&http, &url, &b64, skip_preflight).await;
-                ("Shyft RPC", result)
-            }));
-        }
+        if zero_slot_only_mode {
+            info!("0slot only mode: skipping standard RPC channels");
+        } else {
+            {
+                let http = self.http_client.clone();
+                let url = self.primary_rpc_url.clone();
+                let b64 = tx_base64.clone();
+                handles.push(tokio::spawn(async move {
+                    let result = Self::send_rpc_raw(&http, &url, &b64, skip_preflight).await;
+                    ("Shyft RPC", result)
+                }));
+            }
 
-        if let Some(url2) = &self.secondary_rpc_url {
-            let http = self.http_client.clone();
-            let url2 = url2.clone();
-            let b64 = tx_base64.clone();
-            handles.push(tokio::spawn(async move {
-                let result = Self::send_rpc_raw(&http, &url2, &b64, skip_preflight).await;
-                ("Helius RPC", result)
-            }));
+            if let Some(url2) = &self.secondary_rpc_url {
+                let http = self.http_client.clone();
+                let url2 = url2.clone();
+                let b64 = tx_base64.clone();
+                handles.push(tokio::spawn(async move {
+                    let result = Self::send_rpc_raw(&http, &url2, &b64, skip_preflight).await;
+                    ("Helius RPC", result)
+                }));
+            }
         }
 
         if zero_slot_only_mode {

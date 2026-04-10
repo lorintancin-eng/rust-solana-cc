@@ -16,7 +16,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use autosell::{AutoSellManager, Position, SellReason, SellSignal};
@@ -44,12 +44,16 @@ type SignatureCache = Arc<DashMap<String, Instant>>;
 /// Mint 级别去重：同一代币只买一次（防止目标钱包多次买入同一 mint 触发重复跟单）
 type MintDedup = Arc<DashMap<Pubkey, Instant>>;
 
+const BLOCKHASH_REFRESH_MS: u64 = 120;
+const PREFETCH_WAIT_MS: u64 = 8;
+const BUY_EXECUTOR_PARALLELISM: usize = 4;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.8");
+    info!("   Solana 跟单交易系统 v1.6.9");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -124,8 +128,10 @@ async fn main() -> Result<()> {
 
     // Blockhash 缓存（400ms 刷新，同步读取零延迟）
     let blockhash_cache = blockhash::init_blockhash_cache(&rpc_client).await?;
-    let _bh_task =
-        blockhash_cache.start_refresh_task(rpc_client.clone(), Duration::from_millis(400));
+    let _bh_task = blockhash_cache.start_refresh_task(
+        rpc_client.clone(),
+        Duration::from_millis(BLOCKHASH_REFRESH_MS),
+    );
 
     // SOL/USD 汇率（启动时同步获取 + 后台每 30 秒刷新）
     let sol_usd = SolUsdPrice::new();
@@ -149,6 +155,7 @@ async fn main() -> Result<()> {
         config.jito_auth_uuid.clone(),
         config.zero_slot_urls.clone(),
     ));
+    let buy_exec_limiter = Arc::new(Semaphore::new(BUY_EXECUTOR_PARALLELISM));
 
     // Pump.fun 处理器
     let pumpfun = Arc::new(PumpfunProcessor::new(rpc_client.clone()));
@@ -348,6 +355,7 @@ async fn main() -> Result<()> {
     let exec_tg = tg_notifier.clone();
     let exec_tg_stats = tg_stats.clone();
     let exec_mint_dedup = mint_dedup.clone();
+    let exec_buy_limiter = buy_exec_limiter.clone();
     tokio::spawn(async move {
         while let Some(trigger) = consensus_rx.recv().await {
             // 共识触发时插入 mint_dedup，防止重复执行
@@ -366,27 +374,48 @@ async fn main() -> Result<()> {
                 wallets: trigger.wallets.clone(),
             });
 
-            execute_buy(
-                &trigger.token_mint,
-                &trigger.wallets,
-                trigger.triggered_at,
-                &[], // 共识模式无目标指令数据
-                &exec_config,
-                &exec_rpc,
-                &exec_pumpfun,
-                &exec_blockhash,
-                &exec_tx_sender,
-                &exec_sol_usd,
-                &exec_auto_sell,
-                &exec_prefetch,
-                &exec_bc_cache,
-                &exec_ata_cache,
-                &exec_acct_sub,
-                &exec_dyn_config,
-                &exec_tg,
-                &exec_tg_stats,
-            )
-            .await;
+            let trigger_mint = trigger.token_mint;
+            let trigger_wallets = trigger.wallets.clone();
+            let trigger_detected_at = trigger.triggered_at;
+            let cfg = exec_config.clone();
+            let rpc = exec_rpc.clone();
+            let pf = exec_pumpfun.clone();
+            let bh = exec_blockhash.clone();
+            let sender = exec_tx_sender.clone();
+            let sol = exec_sol_usd.clone();
+            let auto_sell = exec_auto_sell.clone();
+            let prefetch = exec_prefetch.clone();
+            let bc = exec_bc_cache.clone();
+            let ata = exec_ata_cache.clone();
+            let acct_sub = exec_acct_sub.clone();
+            let dyn_cfg = exec_dyn_config.clone();
+            let tg = exec_tg.clone();
+            let stats = exec_tg_stats.clone();
+            let limiter = exec_buy_limiter.clone();
+            tokio::spawn(async move {
+                let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
+                execute_buy(
+                    &trigger_mint,
+                    &trigger_wallets,
+                    trigger_detected_at,
+                    &[],
+                    &cfg,
+                    &rpc,
+                    &pf,
+                    &bh,
+                    &sender,
+                    &sol,
+                    &auto_sell,
+                    &prefetch,
+                    &bc,
+                    &ata,
+                    &acct_sub,
+                    &dyn_cfg,
+                    &tg,
+                    &stats,
+                )
+                .await;
+            });
         }
     });
 
@@ -555,27 +584,46 @@ async fn main() -> Result<()> {
 
             // 内联执行买入（跳过共识 channel 跳转）
             let wallets = vec![trade.source_wallet];
-            execute_buy(
-                &token_mint,
-                &wallets,
-                trade.detected_at,
-                &trade.instruction_data,
-                &config,
-                &rpc_client,
-                &pumpfun,
-                &blockhash_cache,
-                &tx_sender,
-                &sol_usd,
-                &auto_sell_manager,
-                &prefetch_cache,
-                &bc_cache,
-                &ata_cache,
-                &account_subscriber,
-                &dyn_config,
-                &tg_notifier,
-                &tg_stats,
-            )
-            .await;
+            let cfg = config.clone();
+            let rpc = rpc_client.clone();
+            let pf = pumpfun.clone();
+            let bh = blockhash_cache.clone();
+            let sender = tx_sender.clone();
+            let sol = sol_usd.clone();
+            let auto_sell = auto_sell_manager.clone();
+            let prefetch = prefetch_cache.clone();
+            let bc = bc_cache.clone();
+            let ata = ata_cache.clone();
+            let acct_sub = account_subscriber.clone();
+            let dyn_cfg = dyn_config.clone();
+            let tg = tg_notifier.clone();
+            let stats = tg_stats.clone();
+            let limiter = buy_exec_limiter.clone();
+            let instruction_data = trade.instruction_data.clone();
+            tokio::spawn(async move {
+                let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
+                execute_buy(
+                    &token_mint,
+                    &wallets,
+                    trade.detected_at,
+                    &instruction_data,
+                    &cfg,
+                    &rpc,
+                    &pf,
+                    &bh,
+                    &sender,
+                    &sol,
+                    &auto_sell,
+                    &prefetch,
+                    &bc,
+                    &ata,
+                    &acct_sub,
+                    &dyn_cfg,
+                    &tg,
+                    &stats,
+                )
+                .await;
+            });
         } else {
             // 多钱包共识模式：后台预取 BC，提交共识
             if bc_cache.get(&token_mint).is_none() {
@@ -649,7 +697,19 @@ async fn execute_buy(
     );
 
     // 使用预取数据
-    let prefetched = prefetch_cache.get(mint);
+    let prefetched = match prefetch_cache.get(mint) {
+        Some(prefetched) => Some(prefetched),
+        None => {
+            debug!(
+                "Prefetch cache miss: {} | waiting up to {}ms for hot prefetch",
+                &mint.to_string()[..12],
+                PREFETCH_WAIT_MS,
+            );
+            prefetch_cache
+                .get_or_wait(mint, Duration::from_millis(PREFETCH_WAIT_MS))
+                .await
+        }
+    };
 
     // 从 DynConfig 读取动态参数
     let buy_sol = dyn_config.buy_sol_amount();
