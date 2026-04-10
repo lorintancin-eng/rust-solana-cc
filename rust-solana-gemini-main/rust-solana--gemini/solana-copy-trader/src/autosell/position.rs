@@ -44,6 +44,16 @@ impl std::fmt::Display for PositionState {
 
 /// 仓位信息（带状态机）
 #[derive(Debug, Clone)]
+pub struct SellAccountSnapshot {
+    pub bonding_curve: Pubkey,
+    pub associated_bonding_curve: Pubkey,
+    pub user_ata: Pubkey,
+    pub token_program: Pubkey,
+    pub mirror_accounts: Vec<Pubkey>,
+    pub source_wallet: Pubkey,
+}
+
+#[derive(Debug, Clone)]
 pub struct Position {
     pub token_mint: Pubkey,
     pub state: PositionState,
@@ -69,6 +79,7 @@ pub struct Position {
     pub source_wallet: Pubkey,
     pub buy_signature: String,
     pub sell_signature: Option<String>,
+    pub sell_snapshot: Option<SellAccountSnapshot>,
 
     // 重试计数
     pub sell_attempts: u32,
@@ -97,8 +108,13 @@ impl Position {
             source_wallet,
             buy_signature: String::new(),
             sell_signature: None,
+            sell_snapshot: None,
             sell_attempts: 0,
         }
+    }
+
+    pub fn set_sell_snapshot(&mut self, snapshot: SellAccountSnapshot) {
+        self.sell_snapshot = Some(snapshot);
     }
 
     // ============================================

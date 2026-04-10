@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use autosell::{AutoSellManager, Position, SellReason, SellSignal};
+use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellReason, SellSignal};
 use config::{AppConfig, DynConfig};
 use consensus::{
     engine::{BuySignal, ConsensusTrigger},
@@ -57,12 +57,20 @@ struct BuyPathTimings {
     send_call: Duration,
 }
 
+fn format_latency(duration: Duration) -> String {
+    if duration.as_millis() > 0 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{}us", duration.as_micros())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.11");
+    info!("   Solana 跟单交易系统 v1.6.12");
     info!("   RabbitStream pre-exec + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -348,10 +356,7 @@ async fn main() -> Result<()> {
     let sell_exec = sell_executor.clone();
     tokio::spawn(async move {
         while let Some(signal) = sell_signal_rx.recv().await {
-            let exec = sell_exec.clone();
-            tokio::spawn(async move {
-                exec.handle_sell_signal(signal).await;
-            });
+            sell_exec.handle_sell_signal(signal).await;
         }
     });
 
@@ -842,6 +847,16 @@ async fn execute_buy(
 
     let mut position = Position::new(*mint, buy_lamports, entry_price_sol, wallets[0]);
     position.entry_mcap_sol = entry_mcap_sol;
+    if let Some(ref pf) = prefetched {
+        position.set_sell_snapshot(SellAccountSnapshot {
+            bonding_curve: pf.bonding_curve,
+            associated_bonding_curve: pf.associated_bonding_curve,
+            user_ata: pf.user_ata,
+            token_program: pf.token_program,
+            mirror_accounts: pf.mirror_accounts.clone(),
+            source_wallet: pf.source_wallet,
+        });
+    }
 
     match buy_result {
         Ok((mirror, _)) => {
@@ -900,18 +915,18 @@ async fn execute_buy(
 
                             let total_latency = detected_at.elapsed();
                             info!(
-                                "⚡ 买入已发射 | {:.4} SOL (${:.2}) | 预估 {:.0} tokens | 成本价(预估): {} | 市值(预估): {} | queue={}ms | prefetch={}ms | quote_build={}ms | tx_build={}ms | send_call={}ms | total={}ms | sig: {}",
+                                "⚡ 买入已发射 | {:.4} SOL (${:.2}) | 预估 {:.0} tokens | 成本价(预估): {} | 市值(预估): {} | queue={} | prefetch={} | quote_build={} | tx_build={} | send_call={} | total={} | sig: {}",
                                 buy_sol,
                                 buy_usd,
                                 estimated_tokens_raw as f64 / 1e6,
                                 format_price_gmgn(entry_price_usd),
                                 format_mcap_usd(entry_mcap_usd),
-                                timings.queue.as_millis(),
-                                timings.prefetch_wait.as_millis(),
-                                timings.quote_build.as_millis(),
-                                timings.tx_build.as_millis(),
-                                timings.send_call.as_millis(),
-                                total_latency.as_millis(),
+                                format_latency(timings.queue),
+                                format_latency(timings.prefetch_wait),
+                                format_latency(timings.quote_build),
+                                format_latency(timings.tx_build),
+                                format_latency(timings.send_call),
+                                format_latency(total_latency),
                                 if sig_str.len() > 16 { &sig_str[..16] } else { &sig_str },
                             );
 
@@ -957,33 +972,33 @@ async fn execute_buy(
                             }
                         }
                         Err(e) => error!(
-                            "Fire-and-forget 发送错误: {} | queue={}ms | prefetch={}ms | quote_build={}ms | tx_build={}ms | send_call={}ms | total={}ms",
+                            "Fire-and-forget 发送错误: {} | queue={} | prefetch={} | quote_build={} | tx_build={} | send_call={} | total={}",
                             e,
-                            timings.queue.as_millis(),
-                            timings.prefetch_wait.as_millis(),
-                            timings.quote_build.as_millis(),
-                            timings.tx_build.as_millis(),
-                            timings.send_call.as_millis(),
-                            detected_at.elapsed().as_millis(),
+                            format_latency(timings.queue),
+                            format_latency(timings.prefetch_wait),
+                            format_latency(timings.quote_build),
+                            format_latency(timings.tx_build),
+                            format_latency(timings.send_call),
+                            format_latency(detected_at.elapsed()),
                         ),
                     }
                 }
                 Err(e) => error!(
-                    "交易构建失败: {} | queue={}ms | prefetch={}ms | quote_build={}ms | tx_build={}ms",
+                    "交易构建失败: {} | queue={} | prefetch={} | quote_build={} | tx_build={}",
                     e,
-                    timings.queue.as_millis(),
-                    timings.prefetch_wait.as_millis(),
-                    timings.quote_build.as_millis(),
-                    timings.tx_build.as_millis(),
+                    format_latency(timings.queue),
+                    format_latency(timings.prefetch_wait),
+                    format_latency(timings.quote_build),
+                    format_latency(timings.tx_build),
                 ),
             }
         }
         Err(e) => error!(
-            "Pump.fun 内盘不可用: {} | queue={}ms | prefetch={}ms | quote_build={}ms (跳过此交易)",
+            "Pump.fun 内盘不可用: {} | queue={} | prefetch={} | quote_build={} (跳过此交易)",
             e,
-            timings.queue.as_millis(),
-            timings.prefetch_wait.as_millis(),
-            timings.quote_build.as_millis(),
+            format_latency(timings.queue),
+            format_latency(timings.prefetch_wait),
+            format_latency(timings.quote_build),
         ),
     }
 

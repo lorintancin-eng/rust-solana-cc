@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::autosell::{AutoSellManager, SellSignal};
+use crate::autosell::{AutoSellManager, SellAccountSnapshot, SellSignal};
 use crate::config::{AppConfig, DynConfig};
 use crate::grpc::{AccountSubscriber, AtaBalanceCache, BondingCurveCache};
 use crate::processor::prefetch::PrefetchCache;
@@ -21,9 +21,21 @@ const MAX_SELL_RETRIES: u32 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct SellPathTimings {
+    signal_queue: Duration,
+    snapshot_load: Duration,
+    bc_lookup: Duration,
+    quote_build: Duration,
     build: Duration,
     send_call: Duration,
     total: Duration,
+}
+
+fn format_latency(duration: Duration) -> String {
+    if duration.as_millis() > 0 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{}us", duration.as_micros())
+    }
 }
 
 pub struct SellExecutor {
@@ -80,29 +92,56 @@ impl SellExecutor {
         &self,
         mint: &Pubkey,
         token_amount: u64,
+        signal_received_at: std::time::Instant,
     ) -> Result<(String, SellPathTimings)> {
         let sell_start = std::time::Instant::now();
-        let prefetched = self
-            .prefetch_cache
-            .get(mint)
-            .ok_or_else(|| anyhow::anyhow!("no prefetch data"))?;
+        let mut timings = SellPathTimings {
+            signal_queue: sell_start.saturating_duration_since(signal_received_at),
+            snapshot_load: Duration::default(),
+            bc_lookup: Duration::default(),
+            quote_build: Duration::default(),
+            build: Duration::default(),
+            send_call: Duration::default(),
+            total: Duration::default(),
+        };
 
-        if prefetched.mirror_accounts.is_empty() {
+        let snapshot_load_start = std::time::Instant::now();
+        let snapshot = self
+            .auto_sell
+            .get_position(mint)
+            .and_then(|pos| pos.sell_snapshot)
+            .or_else(|| {
+                self.prefetch_cache.get(mint).map(|pf| SellAccountSnapshot {
+                    bonding_curve: pf.bonding_curve,
+                    associated_bonding_curve: pf.associated_bonding_curve,
+                    user_ata: pf.user_ata,
+                    token_program: pf.token_program,
+                    mirror_accounts: pf.mirror_accounts,
+                    source_wallet: pf.source_wallet,
+                })
+            })
+            .ok_or_else(|| anyhow::anyhow!("no sell snapshot"))?;
+        timings.snapshot_load = snapshot_load_start.elapsed();
+
+        if snapshot.mirror_accounts.is_empty() {
             anyhow::bail!("no mirror_accounts");
         }
 
+        let bc_lookup_start = std::time::Instant::now();
         let bc_state = if let Some(state) = self.bc_cache.get(mint) {
             state
         } else {
             self.pumpfun
-                .prefetch_bonding_curve(&prefetched.bonding_curve)
+                .prefetch_bonding_curve(&snapshot.bonding_curve)
                 .await?
         };
+        timings.bc_lookup = bc_lookup_start.elapsed();
 
         if bc_state.complete {
             anyhow::bail!("bonding curve completed");
         }
 
+        let quote_build_start = std::time::Instant::now();
         let expected_sol = bc_state.token_to_sol_quote(token_amount);
         let slippage = self.dyn_config.sell_slippage_bps();
         let min_sol_output = expected_sol.saturating_sub(expected_sol * slippage / 10_000);
@@ -114,6 +153,7 @@ impl SellExecutor {
             min_sol_output as f64 / 1e9,
             slippage,
         );
+        timings.quote_build = quote_build_start.elapsed();
 
         let creator = bc_state
             .creator
@@ -121,11 +161,11 @@ impl SellExecutor {
 
         let sell_ix = self.pumpfun.build_sell_instruction_from_mirror(
             &self.config.pubkey,
-            &prefetched.user_ata,
-            &prefetched.mirror_accounts,
+            &snapshot.user_ata,
+            &snapshot.mirror_accounts,
             token_amount,
             min_sol_output,
-            &prefetched.token_program,
+            &snapshot.token_program,
             &creator,
             bc_state.is_cashback,
         );
@@ -139,6 +179,7 @@ impl SellExecutor {
         };
 
         let (blockhash, _) = self.blockhash_cache.get_sync();
+        let tx_build_start = std::time::Instant::now();
         let transaction = if self.config.jito_enabled {
             let tip = self.tx_sender.random_jito_tip_account();
             TxBuilder::build_jito_bundle_transaction(
@@ -159,18 +200,14 @@ impl SellExecutor {
                 &[],
             )?
         };
-
-        let build_elapsed = sell_start.elapsed();
+        timings.build = tx_build_start.elapsed();
         let send_call_start = std::time::Instant::now();
         let sig = self.tx_sender.fire_and_forget_without_0slot(&transaction)?;
-        let send_call_elapsed = send_call_start.elapsed();
+        timings.send_call = send_call_start.elapsed();
+        timings.total = sell_start.elapsed();
         Ok((
             sig.to_string(),
-            SellPathTimings {
-                build: build_elapsed,
-                send_call: send_call_elapsed,
-                total: sell_start.elapsed(),
-            },
+            timings,
         ))
     }
 
@@ -236,17 +273,21 @@ impl SellExecutor {
                 token_balance,
             );
 
-            match self.try_pumpfun_sell(&mint, token_balance).await {
+            match self.try_pumpfun_sell(&mint, token_balance, sell_start).await {
                 Ok((sig, timings)) => {
                     info!(
-                        "Pump.fun direct sell submitted: https://solscan.io/tx/{} | build={}ms | send_call={}ms | total={}ms",
+                        "Pump.fun direct sell submitted: https://solscan.io/tx/{} | signal_queue={} | snapshot={} | bc_lookup={} | quote_build={} | tx_build={} | send_call={} | total={}",
                         sig,
-                        timings.build.as_millis(),
-                        timings.send_call.as_millis(),
-                        timings.total.as_millis(),
+                        format_latency(timings.signal_queue),
+                        format_latency(timings.snapshot_load),
+                        format_latency(timings.bc_lookup),
+                        format_latency(timings.quote_build),
+                        format_latency(timings.build),
+                        format_latency(timings.send_call),
+                        format_latency(timings.total),
                     );
 
-                    let confirmed = self.wait_sell_confirm(&sig, 10).await;
+                    let confirmed = self.wait_sell_confirm(&mint, &sig, 10).await;
                     if confirmed {
                         info!(
                             "Pump.fun direct sell confirmed: {} | {}ms",
@@ -275,7 +316,7 @@ impl SellExecutor {
                                 sig,
                                 sell_start.elapsed().as_millis(),
                             );
-                            let confirmed = self.wait_sell_confirm(&sig, 10).await;
+                            let confirmed = self.wait_sell_confirm(&mint, &sig, 10).await;
                             if confirmed {
                                 last_sig = sig;
                                 success = true;
@@ -461,7 +502,7 @@ impl SellExecutor {
     }
 
     /// Wait for on-chain confirmation of a sell transaction.
-    async fn wait_sell_confirm(&self, sig_str: &str, max_secs: u64) -> bool {
+    async fn wait_sell_confirm(&self, mint: &Pubkey, sig_str: &str, max_secs: u64) -> bool {
         use solana_sdk::signature::Signature;
         let sig = match sig_str.parse::<Signature>() {
             Ok(s) => s,
@@ -469,8 +510,25 @@ impl SellExecutor {
         };
         let max_wait = Duration::from_secs(max_secs);
         let start = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(80);
+        let user_ata = self
+            .auto_sell
+            .get_position(mint)
+            .and_then(|pos| pos.sell_snapshot.map(|snapshot| snapshot.user_ata))
+            .unwrap_or_else(|| get_associated_token_address(&self.config.pubkey, mint));
         while start.elapsed() < max_wait {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            if let Some(balance) = self.ata_cache.get(mint) {
+                if balance == 0 {
+                    info!(
+                        "Sell confirmed via ATA cache: {} | {}",
+                        &mint.to_string()[..12],
+                        format_latency(start.elapsed()),
+                    );
+                    return true;
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
             let rpc = self.rpc_client.clone();
             let s = sig;
             let result =
@@ -482,7 +540,23 @@ impl SellExecutor {
                             warn!("Sell failed on-chain: {:?}", status.err);
                             return false;
                         }
-                        return true;
+                        let rpc = self.rpc_client.clone();
+                        let ata = user_ata;
+                        let ata_balance = tokio::task::spawn_blocking(move || {
+                            rpc.get_token_account_balance(&ata)
+                                .map(|b| b.amount.parse::<u64>().unwrap_or(0))
+                                .unwrap_or(0)
+                        })
+                        .await
+                        .unwrap_or(0);
+                        if ata_balance == 0 {
+                            info!(
+                                "Sell confirmed via signature+ATA: {} | {}",
+                                &mint.to_string()[..12],
+                                format_latency(start.elapsed()),
+                            );
+                            return true;
+                        }
                     }
                 }
                 _ => {}
@@ -538,16 +612,20 @@ impl SellExecutor {
         let mut last_sig = String::new();
 
         for attempt in 1..=MAX_SELL_RETRIES {
-            match self.try_pumpfun_sell(mint, sell_amount).await {
+            match self.try_pumpfun_sell(mint, sell_amount, std::time::Instant::now()).await {
                 Ok((sig, timings)) => {
                     info!(
-                        "Partial sell Pump.fun submitted: https://solscan.io/tx/{} | build={}ms | send_call={}ms | total={}ms",
+                        "Partial sell Pump.fun submitted: https://solscan.io/tx/{} | signal_queue={} | snapshot={} | bc_lookup={} | quote_build={} | tx_build={} | send_call={} | total={}",
                         sig,
-                        timings.build.as_millis(),
-                        timings.send_call.as_millis(),
-                        timings.total.as_millis(),
+                        format_latency(timings.signal_queue),
+                        format_latency(timings.snapshot_load),
+                        format_latency(timings.bc_lookup),
+                        format_latency(timings.quote_build),
+                        format_latency(timings.build),
+                        format_latency(timings.send_call),
+                        format_latency(timings.total),
                     );
-                    let confirmed = self.wait_sell_confirm(&sig, 10).await;
+                    let confirmed = self.wait_sell_confirm(mint, &sig, 10).await;
                     if confirmed {
                         last_sig = sig;
                         success = true;
@@ -561,7 +639,7 @@ impl SellExecutor {
                     );
                     match self.try_jupiter_sell(mint, sell_amount).await {
                         Ok(sig) => {
-                            let confirmed = self.wait_sell_confirm(&sig, 10).await;
+                            let confirmed = self.wait_sell_confirm(mint, &sig, 10).await;
                             if confirmed {
                                 last_sig = sig;
                                 success = true;
