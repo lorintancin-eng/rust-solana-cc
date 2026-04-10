@@ -5,7 +5,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tonic::transport::ClientTlsConfig;
 use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
@@ -115,6 +115,7 @@ pub struct AccountSubscriber {
     bonding_curve_to_mint: Arc<DashMap<Pubkey, Pubkey>>,
     ata_to_mint: Arc<DashMap<Pubkey, Pubkey>>,
     subscribed_accounts: Arc<DashMap<Pubkey, AccountType>>,
+    subscription_notify: Arc<Notify>,
     bc_cache: BondingCurveCache,
     ata_cache: AtaBalanceCache,
 }
@@ -138,6 +139,7 @@ impl AccountSubscriber {
             bonding_curve_to_mint: Arc::new(DashMap::new()),
             ata_to_mint: Arc::new(DashMap::new()),
             subscribed_accounts: Arc::new(DashMap::new()),
+            subscription_notify: Arc::new(Notify::new()),
             bc_cache,
             ata_cache,
         }
@@ -146,23 +148,27 @@ impl AccountSubscriber {
     /// 添加 bonding curve 账户到订阅列表
     pub fn track_bonding_curve(&self, mint: Pubkey, bonding_curve: Pubkey) {
         self.bonding_curve_to_mint.insert(bonding_curve, mint);
-        self.subscribed_accounts.insert(bonding_curve, AccountType::BondingCurve);
+        self.subscribed_accounts
+            .insert(bonding_curve, AccountType::BondingCurve);
         debug!(
             "Tracking bonding curve: {} for mint: {}",
             &bonding_curve.to_string()[..12],
             &mint.to_string()[..12],
         );
+        self.subscription_notify.notify_one();
     }
 
     /// 添加 ATA 账户到订阅列表（用于确认买入是否成功）
     pub fn track_ata(&self, mint: Pubkey, ata_address: Pubkey) {
         self.ata_to_mint.insert(ata_address, mint);
-        self.subscribed_accounts.insert(ata_address, AccountType::Ata);
+        self.subscribed_accounts
+            .insert(ata_address, AccountType::Ata);
         debug!(
             "Tracking ATA: {} for mint: {}",
             &ata_address.to_string()[..12],
             &mint.to_string()[..12],
         );
+        self.subscription_notify.notify_one();
     }
 
     /// 停止追踪某个代币相关的所有账户
@@ -194,7 +200,10 @@ impl AccountSubscriber {
         // 移除缓存
         self.bc_cache.remove(mint);
 
-        debug!("Untracked all accounts for mint: {}", &mint.to_string()[..12]);
+        debug!(
+            "Untracked all accounts for mint: {}",
+            &mint.to_string()[..12]
+        );
     }
 
     /// 获取当前所有订阅的账户地址
@@ -208,17 +217,10 @@ impl AccountSubscriber {
     /// 启动 gRPC 账户订阅流
     /// 持续接收账户变化推送，更新缓存并发送事件
     /// 每秒检查是否有新账户需要订阅，动态更新 gRPC 订阅
-    pub async fn subscribe(
-        &self,
-        update_tx: mpsc::UnboundedSender<AccountUpdate>,
-    ) -> Result<()> {
-        // 等待直到有账户需要订阅
-        loop {
-            let accounts = self.get_subscribed_addresses();
-            if !accounts.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+    pub async fn subscribe(&self, update_tx: mpsc::UnboundedSender<AccountUpdate>) -> Result<()> {
+        // 等待直到有账户需要订阅；新账户注册后立即唤醒，避免 5s 轮询延迟
+        while self.subscribed_accounts.is_empty() {
+            self.subscription_notify.notified().await;
         }
 
         let accounts = self.get_subscribed_addresses();
@@ -327,9 +329,8 @@ impl AccountSubscriber {
             if pubkey_bytes.len() != 32 {
                 return;
             }
-            let pubkey = Pubkey::new_from_array(
-                <[u8; 32]>::try_from(pubkey_bytes.as_slice()).unwrap(),
-            );
+            let pubkey =
+                Pubkey::new_from_array(<[u8; 32]>::try_from(pubkey_bytes.as_slice()).unwrap());
 
             let slot = account_info.slot;
 
@@ -353,7 +354,11 @@ impl AccountSubscriber {
                                     ));
                                 }
                                 Err(e) => {
-                                    debug!("Failed to parse bonding curve {}: {}", &pubkey.to_string()[..12], e);
+                                    debug!(
+                                        "Failed to parse bonding curve {}: {}",
+                                        &pubkey.to_string()[..12],
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -372,14 +377,12 @@ impl AccountSubscriber {
                             // 更新 ATA 余额缓存
                             self.ata_cache.update(&mint, amount);
 
-                            let _ = update_tx.send(AccountUpdate::AtaBalance(
-                                AtaBalanceUpdate {
-                                    ata_address: pubkey,
-                                    mint: *mint,
-                                    amount,
-                                    slot,
-                                },
-                            ));
+                            let _ = update_tx.send(AccountUpdate::AtaBalance(AtaBalanceUpdate {
+                                ata_address: pubkey,
+                                mint: *mint,
+                                amount,
+                                slot,
+                            }));
                         }
                     }
                 }
