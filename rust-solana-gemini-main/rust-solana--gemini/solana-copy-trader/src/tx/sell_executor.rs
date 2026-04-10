@@ -19,6 +19,13 @@ use crate::tx::sender::TxSender;
 
 const MAX_SELL_RETRIES: u32 = 3;
 
+#[derive(Debug, Clone, Copy)]
+struct SellPathTimings {
+    build: Duration,
+    send_call: Duration,
+    total: Duration,
+}
+
 pub struct SellExecutor {
     config: AppConfig,
     dyn_config: Arc<DynConfig>,
@@ -68,7 +75,13 @@ impl SellExecutor {
     }
 
     /// Pump.fun direct sell: local instruction build -> TxBuilder -> multi-channel send.
-    async fn try_pumpfun_sell(&self, mint: &Pubkey, token_amount: u64) -> Result<String> {
+    /// Sell path never uses 0slot to avoid extra fee broadcasts on exit.
+    async fn try_pumpfun_sell(
+        &self,
+        mint: &Pubkey,
+        token_amount: u64,
+    ) -> Result<(String, SellPathTimings)> {
+        let sell_start = std::time::Instant::now();
         let prefetched = self
             .prefetch_cache
             .get(mint)
@@ -126,18 +139,7 @@ impl SellExecutor {
         };
 
         let (blockhash, _) = self.blockhash_cache.get_sync();
-        let transaction = if !self.config.zero_slot_urls.is_empty() {
-            let fee_account = self.tx_sender.random_0slot_tip_account();
-            TxBuilder::build_0slot_transaction(
-                &mirror,
-                &self.config,
-                &self.config.keypair,
-                blockhash,
-                &fee_account,
-                self.dyn_config.zero_slot_tip_lamports(),
-                &[],
-            )?
-        } else if self.config.jito_enabled {
+        let transaction = if self.config.jito_enabled {
             let tip = self.tx_sender.random_jito_tip_account();
             TxBuilder::build_jito_bundle_transaction(
                 &mirror,
@@ -158,8 +160,18 @@ impl SellExecutor {
             )?
         };
 
-        let sig = self.tx_sender.fire_and_forget(&transaction, None)?;
-        Ok(sig.to_string())
+        let build_elapsed = sell_start.elapsed();
+        let send_call_start = std::time::Instant::now();
+        let sig = self.tx_sender.fire_and_forget_without_0slot(&transaction)?;
+        let send_call_elapsed = send_call_start.elapsed();
+        Ok((
+            sig.to_string(),
+            SellPathTimings {
+                build: build_elapsed,
+                send_call: send_call_elapsed,
+                total: sell_start.elapsed(),
+            },
+        ))
     }
 
     /// Handle sell signal, prefer Pump.fun direct sell, then fallback to Jupiter.
@@ -225,11 +237,13 @@ impl SellExecutor {
             );
 
             match self.try_pumpfun_sell(&mint, token_balance).await {
-                Ok(sig) => {
+                Ok((sig, timings)) => {
                     info!(
-                        "Pump.fun direct sell submitted: https://solscan.io/tx/{} | {}ms",
+                        "Pump.fun direct sell submitted: https://solscan.io/tx/{} | build={}ms | send_call={}ms | total={}ms",
                         sig,
-                        sell_start.elapsed().as_millis(),
+                        timings.build.as_millis(),
+                        timings.send_call.as_millis(),
+                        timings.total.as_millis(),
                     );
 
                     let confirmed = self.wait_sell_confirm(&sig, 10).await;
@@ -525,7 +539,14 @@ impl SellExecutor {
 
         for attempt in 1..=MAX_SELL_RETRIES {
             match self.try_pumpfun_sell(mint, sell_amount).await {
-                Ok(sig) => {
+                Ok((sig, timings)) => {
+                    info!(
+                        "Partial sell Pump.fun submitted: https://solscan.io/tx/{} | build={}ms | send_call={}ms | total={}ms",
+                        sig,
+                        timings.build.as_millis(),
+                        timings.send_call.as_millis(),
+                        timings.total.as_millis(),
+                    );
                     let confirmed = self.wait_sell_confirm(&sig, 10).await;
                     if confirmed {
                         last_sig = sig;

@@ -48,12 +48,21 @@ const BLOCKHASH_REFRESH_MS: u64 = 120;
 const PREFETCH_WAIT_MS: u64 = 8;
 const BUY_EXECUTOR_PARALLELISM: usize = 4;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct BuyPathTimings {
+    queue: Duration,
+    prefetch_wait: Duration,
+    quote_build: Duration,
+    tx_build: Duration,
+    send_call: Duration,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.10");
+    info!("   Solana 跟单交易系统 v1.6.11");
     info!("   RabbitStream pre-exec + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -696,6 +705,10 @@ async fn execute_buy(
 ) {
     let start = Instant::now();
     let detect_to_exec = detected_at.elapsed();
+    let mut timings = BuyPathTimings {
+        queue: detect_to_exec,
+        ..Default::default()
+    };
 
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     info!(
@@ -706,6 +719,7 @@ async fn execute_buy(
     );
 
     // 使用预取数据
+    let prefetch_wait_start = Instant::now();
     let prefetched = match prefetch_cache.get(mint) {
         Some(prefetched) => Some(prefetched),
         None => {
@@ -719,6 +733,7 @@ async fn execute_buy(
                 .await
         }
     };
+    timings.prefetch_wait = prefetch_wait_start.elapsed();
 
     // 从 DynConfig 读取动态参数
     let buy_sol = dyn_config.buy_sol_amount();
@@ -729,6 +744,7 @@ async fn execute_buy(
     // 1. BC cache 命中（零 RPC，AMM 公式精确计算，最可靠）
     // 2. 目标指令推算（零 RPC，需 max_sol_cost 合理性检查）
     // 无 BC RPC fetch — 任何 RPC 调用都会毁掉同区块机会
+    let quote_build_start = Instant::now();
     let buy_result: Result<(processor::MirrorInstruction, u64), anyhow::Error> =
         if let Some(ref pf) = prefetched {
             if pf.mirror_accounts.is_empty() {
@@ -786,6 +802,7 @@ async fn execute_buy(
         } else {
             Err(anyhow::anyhow!("无预取数据，跳过"))
         };
+    timings.quote_build = quote_build_start.elapsed();
 
     // 阶段一入场价: buyAmountSol / (estimatedTokens / 1e6)
     let (estimated_tokens_raw, entry_price_sol, entry_mcap_sol) = match &buy_result {
@@ -828,12 +845,12 @@ async fn execute_buy(
 
     match buy_result {
         Ok((mirror, _)) => {
-            let build_elapsed = start.elapsed();
-            debug!("指令构建: {:?}", build_elapsed);
+            debug!("指令构建: {:?}", timings.quote_build);
 
             // ⚡ 同步读取 blockhash（零 await 开销）
             let (blockhash, _) = blockhash_cache.get_sync();
 
+            let tx_build_start = Instant::now();
             let tx_result = if !config.zero_slot_urls.is_empty() {
                 let fee_account = tx_sender.random_0slot_tip_account();
                 TxBuilder::build_0slot_transaction(
@@ -865,30 +882,36 @@ async fn execute_buy(
                     &[], // ALT: 暂无预部署，后续可接入
                 )
             };
+            timings.tx_build = tx_build_start.elapsed();
 
             match tx_result {
                 Ok(transaction) => {
                     // ⚡ fire-and-forget 多通道并发发送
                     // RabbitStream 目标模式为 pre-exec（meta 为空）。
                     // 这里统一走独立 TX 广播，不依赖 backrun bundle。
+                    let send_call_start = Instant::now();
                     let send_result = tx_sender.fire_and_forget(&transaction, None);
+                    timings.send_call = send_call_start.elapsed();
                     match send_result {
                         Ok(sig) => {
-                            let elapsed = start.elapsed();
                             let sig_str = sig.to_string();
 
                             let buy_usd = sol_usd.sol_to_usd(buy_sol);
 
                             let total_latency = detected_at.elapsed();
                             info!(
-                                "⚡ ���入已发射 | {:.4} SOL (${:.2}) | 预估 {:.0} tokens | 成本价(预估): {} | 市值(预估): {} | 构建: {:?} | 全链路: {:?} | sig: {}",
+                                "⚡ 买入已发射 | {:.4} SOL (${:.2}) | 预估 {:.0} tokens | 成本价(预估): {} | 市值(预估): {} | queue={}ms | prefetch={}ms | quote_build={}ms | tx_build={}ms | send_call={}ms | total={}ms | sig: {}",
                                 buy_sol,
                                 buy_usd,
                                 estimated_tokens_raw as f64 / 1e6,
                                 format_price_gmgn(entry_price_usd),
                                 format_mcap_usd(entry_mcap_usd),
-                                elapsed,
-                                total_latency,
+                                timings.queue.as_millis(),
+                                timings.prefetch_wait.as_millis(),
+                                timings.quote_build.as_millis(),
+                                timings.tx_build.as_millis(),
+                                timings.send_call.as_millis(),
+                                total_latency.as_millis(),
                                 if sig_str.len() > 16 { &sig_str[..16] } else { &sig_str },
                             );
 
@@ -933,13 +956,35 @@ async fn execute_buy(
                                 );
                             }
                         }
-                        Err(e) => error!("Fire-and-forget 发送错误: {}", e),
+                        Err(e) => error!(
+                            "Fire-and-forget 发送错误: {} | queue={}ms | prefetch={}ms | quote_build={}ms | tx_build={}ms | send_call={}ms | total={}ms",
+                            e,
+                            timings.queue.as_millis(),
+                            timings.prefetch_wait.as_millis(),
+                            timings.quote_build.as_millis(),
+                            timings.tx_build.as_millis(),
+                            timings.send_call.as_millis(),
+                            detected_at.elapsed().as_millis(),
+                        ),
                     }
                 }
-                Err(e) => error!("交易构建失败: {}", e),
+                Err(e) => error!(
+                    "交易构建失败: {} | queue={}ms | prefetch={}ms | quote_build={}ms | tx_build={}ms",
+                    e,
+                    timings.queue.as_millis(),
+                    timings.prefetch_wait.as_millis(),
+                    timings.quote_build.as_millis(),
+                    timings.tx_build.as_millis(),
+                ),
             }
         }
-        Err(e) => error!("Pump.fun 内盘不可用: {} (跳过此交易)", e),
+        Err(e) => error!(
+            "Pump.fun 内盘不可用: {} | queue={}ms | prefetch={}ms | quote_build={}ms (跳过此交易)",
+            e,
+            timings.queue.as_millis(),
+            timings.prefetch_wait.as_millis(),
+            timings.quote_build.as_millis(),
+        ),
     }
 
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");

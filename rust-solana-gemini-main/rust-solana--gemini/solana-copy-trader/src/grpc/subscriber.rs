@@ -170,21 +170,22 @@ impl GrpcSubscriber {
                                             let parse_latency = recv_time.elapsed();
 
                                             info!(
-                                            "DETECTED: {} {} | wallet: {}..{} | mint: {} | sol: {:.4} | sig: {}..{}",
-                                            trade.trade_type,
-                                            if trade.is_buy { "BUY" } else { "SELL" },
-                                            &trade.source_wallet.to_string()[..4],
-                                            &trade.source_wallet.to_string()
-                                                [trade.source_wallet.to_string().len() - 4..],
-                                            if trade.instruction_accounts.len() > 2 {
-                                                trade.instruction_accounts[2].to_string()
-                                            } else {
-                                                format!("{}..{}", &trade.signature[..6], &trade.signature[trade.signature.len()-4..])
-                                            },
-                                            trade.sol_amount_lamports as f64 / 1e9,
-                                            &trade.signature[..8],
-                                            &trade.signature[trade.signature.len()-4..],
-                                        );
+                                                "DETECTED: {} {} | wallet: {}..{} | mint: {} | sol: {:.4} | parse={}us | sig: {}..{}",
+                                                trade.trade_type,
+                                                if trade.is_buy { "BUY" } else { "SELL" },
+                                                &trade.source_wallet.to_string()[..4],
+                                                &trade.source_wallet.to_string()
+                                                    [trade.source_wallet.to_string().len() - 4..],
+                                                if trade.instruction_accounts.len() > 2 {
+                                                    trade.instruction_accounts[2].to_string()
+                                                } else {
+                                                    format!("{}..{}", &trade.signature[..6], &trade.signature[trade.signature.len()-4..])
+                                                },
+                                                trade.sol_amount_lamports as f64 / 1e9,
+                                                parse_latency.as_micros(),
+                                                &trade.signature[..8],
+                                                &trade.signature[trade.signature.len()-4..],
+                                            );
 
                                             if tx_sender.send(trade).is_err() {
                                                 error!("Trade channel closed, exiting subscriber");
@@ -351,7 +352,7 @@ impl GrpcSubscriber {
         tx_data: &yellowstone_grpc_proto::prelude::Transaction,
         message: Option<&yellowstone_grpc_proto::prelude::Message>,
         meta: Option<&yellowstone_grpc_proto::prelude::TransactionStatusMeta>,
-        _recv_time: Instant,
+        recv_time: Instant,
     ) -> Result<Option<DetectedTrade>> {
         let message = message.context("Missing transaction message")?;
 
@@ -432,6 +433,7 @@ impl GrpcSubscriber {
                 &account_keys,
                 &signature,
                 source_wallet,
+                recv_time,
             )? {
                 // 延迟序列化：仅在匹配成功后才序列化目标交易（省 ~400µs/非匹配交易）
                 trade.raw_transaction_bytes =
@@ -453,7 +455,14 @@ impl GrpcSubscriber {
             // account_keys 中有 Pump.fun 程序 → CPI 调用
             // 提取 mint：扫描 account_keys 中的非系统地址，验证 bonding curve PDA
             if let Some(cpi_trade) =
-                self.try_detect_cpi_pumpfun(&account_keys, &signature, source_wallet, meta, tx_data)
+                self.try_detect_cpi_pumpfun(
+                    &account_keys,
+                    &signature,
+                    source_wallet,
+                    meta,
+                    tx_data,
+                    recv_time,
+                )
             {
                 return Ok(Some(cpi_trade));
             }
@@ -479,6 +488,7 @@ impl GrpcSubscriber {
                         &account_keys,
                         &signature,
                         source_wallet,
+                        recv_time,
                     )? {
                         trade.raw_transaction_bytes =
                             Self::serialize_transaction_from_proto(tx_data).unwrap_or_default();
@@ -507,6 +517,7 @@ impl GrpcSubscriber {
         all_account_keys: &[Pubkey],
         signature: &str,
         source_wallet: Pubkey,
+        recv_time: Instant,
     ) -> Result<Option<DetectedTrade>> {
         let program_str = program_id.to_string();
 
@@ -547,7 +558,7 @@ impl GrpcSubscriber {
             instruction_data: data.to_vec(),
             instruction_accounts,
             all_account_keys: all_account_keys.to_vec(),
-            detected_at: Instant::now(),
+            detected_at: recv_time,
             sol_amount_lamports,
             raw_transaction_bytes: Vec::new(), // 由 parse_transaction 填充
             is_pre_execution: false,           // 由 parse_transaction 根据 meta 设置
@@ -569,6 +580,7 @@ impl GrpcSubscriber {
         source_wallet: Pubkey,
         meta: Option<&yellowstone_grpc_proto::prelude::TransactionStatusMeta>,
         tx_data: &yellowstone_grpc_proto::prelude::Transaction,
+        recv_time: Instant,
     ) -> Option<DetectedTrade> {
         let pumpfun_pubkey = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
         let wsol_mint = Pubkey::from_str(WSOL_MINT).ok()?;
@@ -644,7 +656,7 @@ impl GrpcSubscriber {
             instruction_data: Vec::new(), // CPI 场景无法提取 Pump.fun 指令数据
             instruction_accounts,
             all_account_keys: account_keys.to_vec(),
-            detected_at: Instant::now(),
+            detected_at: recv_time,
             sol_amount_lamports: 0, // CPI 场景无法提取 SOL 金额
             raw_transaction_bytes: Self::serialize_transaction_from_proto(tx_data)
                 .unwrap_or_default(),

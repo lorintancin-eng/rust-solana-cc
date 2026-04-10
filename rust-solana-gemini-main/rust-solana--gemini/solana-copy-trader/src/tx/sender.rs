@@ -140,8 +140,25 @@ impl TxSender {
         transaction: &VersionedTransaction,
         zero_slot_tx: Option<&VersionedTransaction>,
     ) -> Result<Signature> {
+        self.fire_and_forget_with_mode(transaction, zero_slot_tx, true)
+    }
+
+    pub fn fire_and_forget_without_0slot(
+        &self,
+        transaction: &VersionedTransaction,
+    ) -> Result<Signature> {
+        self.fire_and_forget_with_mode(transaction, None, false)
+    }
+
+    fn fire_and_forget_with_mode(
+        &self,
+        transaction: &VersionedTransaction,
+        zero_slot_tx: Option<&VersionedTransaction>,
+        allow_zero_slot: bool,
+    ) -> Result<Signature> {
         let start = Instant::now();
-        let zero_slot_only_mode = !self.zero_slot_urls.is_empty();
+        let zero_slot_enabled = allow_zero_slot && !self.zero_slot_urls.is_empty();
+        let zero_slot_only_mode = zero_slot_enabled;
         let wire_tx = zero_slot_tx.unwrap_or(transaction);
 
         // 预序列化交易（只做一次，VersionedTransaction 用 bincode 序列化）
@@ -156,7 +173,7 @@ impl TxSender {
         let mut channel_count = 0u32;
 
         // 通道 0slot: 质押加速（最高优先级，要求独立 fee 交易）
-        if !self.zero_slot_urls.is_empty() {
+        if zero_slot_enabled {
             for zero_url in &self.zero_slot_urls {
                 let http = self.http_client.clone();
                 let url = zero_url.clone();
@@ -204,7 +221,7 @@ impl TxSender {
         }
 
         // 通道 3+4: Jito Bundle + Jito TX — 轮换 endpoint，T+0 并发
-        if !self.zero_slot_urls.is_empty() {
+        if zero_slot_enabled {
             info!("0slot only mode: skipping Jito channels to avoid duplicate execution");
         } else if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
             let (url1, url2) = self.next_jito_url_pair();
