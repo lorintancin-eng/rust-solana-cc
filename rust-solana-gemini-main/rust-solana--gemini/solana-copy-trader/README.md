@@ -125,9 +125,23 @@ cargo run --release
 
 ### gRPC Endpoint 选择
 
+交易监听默认建议直接使用 Shyft RabbitStream pre-exec。
+账户订阅不要复用 RabbitStream，继续使用普通 Yellowstone gRPC。
+
+推荐环境变量：
+
+```bash
+RABBITSTREAM_URL=...
+RABBITSTREAM_TOKEN=...
+SHYFT_GRPC_URL=...
+SHYFT_GRPC_TOKEN=...
+```
+
 | 提供商 | URL | 特点 |
 |--------|-----|------|
-| Triton (付费) | `https://grpc.triton.one` | 最稳定，需要 x-token |
+| Shyft RabbitStream (pre-exec) | `RABBITSTREAM_URL` | 交易监听首选，目标是更早拿到 pre-exec 事件 |
+| Shyft Yellowstone gRPC | `SHYFT_GRPC_URL` | 账户订阅使用，不要和 RabbitStream 混用 |
+| Triton (付费) | `https://grpc.triton.one` | 兼容旧配置，需要 x-token |
 | Helius (付费) | `https://atlas-mainnet.helius-rpc.com` | 你已有 Helius key |
 | 自建 Validator | `http://localhost:10000` | 最低延迟，成本最高 |
 

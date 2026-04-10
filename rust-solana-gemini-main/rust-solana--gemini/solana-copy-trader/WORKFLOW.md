@@ -63,9 +63,10 @@
 
 ### 连接
 
-- 使用 Shyft Yellowstone gRPC 端点
+- 交易监听默认走 Shyft RabbitStream pre-exec
+- 账户订阅单独走普通 Yellowstone gRPC
 - TLS 加密 + `x-token` 认证头
-- 过滤条件：`account_include` = 目标钱包列表, `vote=false`, `failed=false`, `commitment=Processed`
+- 过滤条件：`account_include` = 目标钱包列表, `vote=None`, `failed=None`, `commitment=None`
 
 ### 交易解析 (两阶段扫描)
 

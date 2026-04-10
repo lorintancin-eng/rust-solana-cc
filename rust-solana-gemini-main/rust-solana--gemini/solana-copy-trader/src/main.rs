@@ -53,8 +53,8 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.9");
-    info!("   gRPC + Pump.fun 直连 | fire-and-forget");
+    info!("   Solana 跟单交易系统 v1.6.10");
+    info!("   RabbitStream pre-exec + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
     let config = AppConfig::from_env()?;
@@ -99,6 +99,10 @@ async fn main() -> Result<()> {
     if !config.zero_slot_urls.is_empty() {
         info!("0slot fee: {} lamports", config.zero_slot_tip_lamports);
     }
+    info!(
+        "交易监听源: Shyft RabbitStream pre-exec | {}",
+        config.grpc_url
+    );
     info!(
         "自动卖出: {} | 止盈={}% 止损={}% 追踪止损={}% 超时={}s",
         if config.auto_sell_enabled {
@@ -190,6 +194,11 @@ async fn main() -> Result<()> {
     ));
     if config.grpc_account_url != config.grpc_url {
         info!("账户监控 gRPC: {} (独立于交易流)", config.grpc_account_url);
+    } else {
+        info!(
+            "账户监控 gRPC: {} (与交易流共用配置)",
+            config.grpc_account_url
+        );
     }
 
     // 签名去重
@@ -860,8 +869,8 @@ async fn execute_buy(
             match tx_result {
                 Ok(transaction) => {
                     // ⚡ fire-and-forget 多通道并发发送
-                    // RabbitStream 为 Processed 级别推送（meta 不填充≠预执行），
-                    // Backrun Bundle 100% 失败，统一走独立TX发送
+                    // RabbitStream 目标模式为 pre-exec（meta 为空）。
+                    // 这里统一走独立 TX 广播，不依赖 backrun bundle。
                     let send_result = tx_sender.fire_and_forget(&transaction, None);
                     match send_result {
                         Ok(sig) => {

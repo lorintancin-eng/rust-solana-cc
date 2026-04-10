@@ -67,7 +67,7 @@ impl GrpcSubscriber {
     /// 连接断开后返回 Err，由调用方 (main.rs) 负责重连
     pub async fn subscribe(&self, tx_sender: mpsc::UnboundedSender<DetectedTrade>) -> Result<()> {
         info!(
-            "Connecting to Shyft gRPC at {} for {} target wallets",
+            "Connecting to Shyft RabbitStream pre-exec at {} for {} target wallets",
             self.grpc_url,
             self.target_wallets.len()
         );
@@ -87,7 +87,7 @@ impl GrpcSubscriber {
             .await
             .context("Failed to connect to gRPC")?;
 
-        info!("Shyft gRPC connected successfully");
+        info!("Shyft RabbitStream connected successfully");
 
         // 构建订阅请求
         let subscribe_request = self.build_subscribe_request();
@@ -98,7 +98,7 @@ impl GrpcSubscriber {
             .await
             .context("Failed to create gRPC subscription")?;
 
-        info!("gRPC subscription active, listening for target wallet transactions...");
+        info!("RabbitStream subscription active, listening for target wallet transactions...");
 
         // 发送 ping 保持连接活跃
         let ping_task = tokio::spawn(async move {
@@ -162,12 +162,14 @@ impl GrpcSubscriber {
                                 if let Some(ref tx_data) = tx_info.transaction {
                                     let message = tx_data.message.as_ref();
 
-                                    match self.parse_transaction(tx_info, tx_data, message, meta, recv_time) {
+                                    match self.parse_transaction(
+                                        tx_info, tx_data, message, meta, recv_time,
+                                    ) {
                                         Ok(Some(trade)) => {
                                             total_matched += 1;
                                             let parse_latency = recv_time.elapsed();
 
-                                        info!(
+                                            info!(
                                             "DETECTED: {} {} | wallet: {}..{} | mint: {} | sol: {:.4} | sig: {}..{}",
                                             trade.trade_type,
                                             if trade.is_buy { "BUY" } else { "SELL" },
@@ -184,14 +186,14 @@ impl GrpcSubscriber {
                                             &trade.signature[trade.signature.len()-4..],
                                         );
 
-                                        if tx_sender.send(trade).is_err() {
-                                            error!("Trade channel closed, exiting subscriber");
-                                            return Ok(());
+                                            if tx_sender.send(trade).is_err() {
+                                                error!("Trade channel closed, exiting subscriber");
+                                                return Ok(());
+                                            }
                                         }
-                                    }
-                                    Ok(None) => {
-                                        // 不是 DEX swap 交易，跳过
-                                    }
+                                        Ok(None) => {
+                                            // 不是 DEX swap 交易，跳过
+                                        }
                                         Err(e) => {
                                             debug!("Parse error (non-fatal): {}", e);
                                         }
@@ -206,7 +208,10 @@ impl GrpcSubscriber {
                             debug!("gRPC pong");
                         }
                         Some(other) => {
-                            debug!("gRPC other update type: {:?}", std::mem::discriminant(&other));
+                            debug!(
+                                "gRPC other update type: {:?}",
+                                std::mem::discriminant(&other)
+                            );
                         }
                         None => {
                             debug!("gRPC empty update");
@@ -227,7 +232,9 @@ impl GrpcSubscriber {
         let elapsed = start_time.elapsed();
         warn!(
             "gRPC stream ended after {} messages ({} matched) | 持续: {:.1}s",
-            total_received, total_matched, elapsed.as_secs_f64()
+            total_received,
+            total_matched,
+            elapsed.as_secs_f64()
         );
         Ok(())
     }
@@ -244,11 +251,7 @@ impl GrpcSubscriber {
     ///   - failed = None (不过滤，兼容 RabbitStream 预执行推送)
     ///   - commitment = None (RabbitStream 不支持 commitment 过滤)
     fn build_subscribe_request(&self) -> SubscribeRequest {
-        let account_keys: Vec<String> = self
-            .target_wallets
-            .iter()
-            .map(|w| w.to_string())
-            .collect();
+        let account_keys: Vec<String> = self.target_wallets.iter().map(|w| w.to_string()).collect();
 
         info!(
             "Subscribing to {} wallets: [{}]",
@@ -278,8 +281,13 @@ impl GrpcSubscriber {
             },
         );
 
-        debug!("订阅参数: vote=None, failed=None, commitment=None, accounts={}",
-              transactions.get("target_wallets").map(|t| t.account_include.len()).unwrap_or(0));
+        debug!(
+            "订阅参数: vote=None, failed=None, commitment=None, accounts={}",
+            transactions
+                .get("target_wallets")
+                .map(|t| t.account_include.len())
+                .unwrap_or(0)
+        );
 
         SubscribeRequest {
             transactions,
@@ -309,15 +317,14 @@ impl GrpcSubscriber {
         tx_data: &yellowstone_grpc_proto::prelude::Transaction,
     ) -> Option<Vec<u8>> {
         // 使用 yellowstone 官方的 proto → VersionedTransaction 转换
-        let versioned_tx = match yellowstone_grpc_proto::convert_from::create_tx_versioned(
-            tx_data.clone(),
-        ) {
-            Ok(tx) => tx,
-            Err(e) => {
-                warn!("Backrun: proto→VersionedTransaction 转换失败: {}", e);
-                return None;
-            }
-        };
+        let versioned_tx =
+            match yellowstone_grpc_proto::convert_from::create_tx_versioned(tx_data.clone()) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    warn!("Backrun: proto→VersionedTransaction 转换失败: {}", e);
+                    return None;
+                }
+            };
 
         // 序列化为 wire format（去掉冗余的反序列化验证，省 ~100µs）
         match bincode::serialize(&versioned_tx) {
@@ -427,8 +434,8 @@ impl GrpcSubscriber {
                 source_wallet,
             )? {
                 // 延迟序列化：仅在匹配成功后才序列化目标交易（省 ~400µs/非匹配交易）
-                trade.raw_transaction_bytes = Self::serialize_transaction_from_proto(tx_data)
-                    .unwrap_or_default();
+                trade.raw_transaction_bytes =
+                    Self::serialize_transaction_from_proto(tx_data).unwrap_or_default();
                 // meta 为空 = 预执行（交易尚未被 leader 执行，可 Backrun）
                 trade.is_pre_execution = meta.is_none();
                 return Ok(Some(trade));
@@ -445,13 +452,9 @@ impl GrpcSubscriber {
         if account_keys.contains(&pumpfun_pubkey) {
             // account_keys 中有 Pump.fun 程序 → CPI 调用
             // 提取 mint：扫描 account_keys 中的非系统地址，验证 bonding curve PDA
-            if let Some(cpi_trade) = self.try_detect_cpi_pumpfun(
-                &account_keys,
-                &signature,
-                source_wallet,
-                meta,
-                tx_data,
-            ) {
+            if let Some(cpi_trade) =
+                self.try_detect_cpi_pumpfun(&account_keys, &signature, source_wallet, meta, tx_data)
+            {
                 return Ok(Some(cpi_trade));
             }
         }
@@ -477,8 +480,8 @@ impl GrpcSubscriber {
                         &signature,
                         source_wallet,
                     )? {
-                        trade.raw_transaction_bytes = Self::serialize_transaction_from_proto(tx_data)
-                            .unwrap_or_default();
+                        trade.raw_transaction_bytes =
+                            Self::serialize_transaction_from_proto(tx_data).unwrap_or_default();
                         // inner instructions 来自 meta，所以交易已执行，不可 Backrun
                         trade.is_pre_execution = false;
                         return Ok(Some(trade));
@@ -519,8 +522,7 @@ impl GrpcSubscriber {
         };
 
         // 解析 buy/sell 方向
-        let is_buy =
-            self.detect_buy_or_sell(data, &trade_type, account_indices, all_account_keys);
+        let is_buy = self.detect_buy_or_sell(data, &trade_type, account_indices, all_account_keys);
 
         // 提取指令涉及的 account keys（用于后续 processor 重建指令）
         let instruction_accounts: Vec<Pubkey> = account_indices
@@ -548,8 +550,8 @@ impl GrpcSubscriber {
             detected_at: Instant::now(),
             sol_amount_lamports,
             raw_transaction_bytes: Vec::new(), // 由 parse_transaction 填充
-            is_pre_execution: false, // 由 parse_transaction 根据 meta 设置
-            token_mint: None, // 直接调用场景由 main.rs extract_token_info 提取
+            is_pre_execution: false,           // 由 parse_transaction 根据 meta 设置
+            token_mint: None,                  // 直接调用场景由 main.rs extract_token_info 提取
         }))
     }
 
@@ -614,10 +616,8 @@ impl GrpcSubscriber {
         let mint = found_mint?;
 
         // 判断 buy/sell：检查目标钱包的 WSOL ATA 是否在 account_keys 中
-        let wsol_ata = spl_associated_token_account::get_associated_token_address(
-            &source_wallet,
-            &wsol_mint,
-        );
+        let wsol_ata =
+            spl_associated_token_account::get_associated_token_address(&source_wallet, &wsol_mint);
         let is_buy = account_keys.contains(&wsol_ata);
 
         // 构建 instruction_accounts（从 account_keys 中提取 Pump.fun 相关账户）
@@ -629,10 +629,10 @@ impl GrpcSubscriber {
             "CPI DETECTED: Pump.fun {} via wrapper | wallet: {}..{} | mint: {} | sig: {}..{}",
             if is_buy { "BUY" } else { "SELL" },
             &source_wallet.to_string()[..4],
-            &source_wallet.to_string()[source_wallet.to_string().len()-4..],
+            &source_wallet.to_string()[source_wallet.to_string().len() - 4..],
             mint,
             &signature[..8],
-            &signature[signature.len()-4..],
+            &signature[signature.len() - 4..],
         );
 
         Some(DetectedTrade {
@@ -703,10 +703,8 @@ impl GrpcSubscriber {
             // ========================================
             TradeType::PumpSwap => {
                 if data.len() >= 24 {
-                    let base_in =
-                        u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
-                    let quote_in =
-                        u64::from_le_bytes(data[16..24].try_into().unwrap_or([0; 8]));
+                    let base_in = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
+                    let quote_in = u64::from_le_bytes(data[16..24].try_into().unwrap_or([0; 8]));
 
                     if quote_in > 0 && base_in == 0 {
                         true // SOL → Token = BUY

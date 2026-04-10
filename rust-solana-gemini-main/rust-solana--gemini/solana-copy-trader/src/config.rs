@@ -11,10 +11,14 @@ pub struct AppConfig {
     // RPC & gRPC
     pub rpc_url: String,
     pub secondary_rpc_url: Option<String>,
+    /// 交易监听流默认走 Shyft RabbitStream pre-exec。
+    /// 兼容旧变量：优先读取 RABBITSTREAM_URL，其次 GRPC_URL。
     pub grpc_url: String,
+    /// 交易监听流 token。
+    /// 兼容旧变量：优先读取 RABBITSTREAM_TOKEN，其次 GRPC_TOKEN。
     pub grpc_token: Option<String>,
     /// 账户监控用的 gRPC URL（RabbitStream 不支持账户订阅，需要普通 gRPC）
-    /// 不设置时回退到 grpc_url
+    /// 不设置时回退到 SHYFT_GRPC_URL / GRPC_ACCOUNT_URL；再退到旧的 GRPC_URL
     pub grpc_account_url: String,
     pub grpc_account_token: Option<String>,
 
@@ -94,14 +98,15 @@ impl AppConfig {
         Ok(Self {
             rpc_url: env_or("RPC_URL", "https://api.mainnet-beta.solana.com"),
             secondary_rpc_url: std::env::var("SECONDARY_RPC_URL").ok(),
-            grpc_url: env_or("GRPC_URL", "https://grpc.triton.one"),
-            grpc_token: std::env::var("GRPC_TOKEN").ok(),
-            // 账户监控 gRPC：不设置时回退到普通 gRPC URL（不能用 RabbitStream）
-            grpc_account_url: std::env::var("GRPC_ACCOUNT_URL")
-                .unwrap_or_else(|_| env_or("GRPC_URL", "https://grpc.triton.one")),
-            grpc_account_token: std::env::var("GRPC_ACCOUNT_TOKEN")
-                .ok()
-                .or_else(|| std::env::var("GRPC_TOKEN").ok()),
+            grpc_url: first_env(&["RABBITSTREAM_URL", "GRPC_URL"])
+                .unwrap_or_else(|| "https://grpc.triton.one".to_string()),
+            grpc_token: first_env(&["RABBITSTREAM_TOKEN", "GRPC_TOKEN"]),
+            // 账户监控 gRPC：显式使用普通 Yellowstone gRPC，避免误接 RabbitStream。
+            grpc_account_url: first_env(&["GRPC_ACCOUNT_URL", "SHYFT_GRPC_URL"])
+                .or_else(|| first_env(&["GRPC_URL"]).filter(|url| !is_rabbitstream_url(url)))
+                .unwrap_or_else(|| "https://grpc.triton.one".to_string()),
+            grpc_account_token: first_env(&["GRPC_ACCOUNT_TOKEN", "SHYFT_GRPC_TOKEN"])
+                .or_else(|| first_env(&["GRPC_TOKEN", "RABBITSTREAM_TOKEN"])),
             keypair: std::sync::Arc::new(keypair),
             pubkey,
             target_wallets,
@@ -176,6 +181,19 @@ impl AppConfig {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn first_env(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn is_rabbitstream_url(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("rabbitstream")
 }
 
 fn env_parse<T: FromStr>(key: &str, default: T) -> T {
