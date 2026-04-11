@@ -8,17 +8,15 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{AppConfig, DynConfig};
+use super::persistence;
+use super::position::{Position, PositionKey, PositionState, SellReason, SellSignal};
+use crate::config::AppConfig;
 use crate::grpc::{AccountUpdate, BondingCurveCache};
 use crate::utils::sol_price::SolUsdPrice;
-use super::persistence;
-use super::position::{Position, PositionState, SellReason, SellSignal};
-
 
 pub struct AutoSellManager {
-    positions: Arc<DashMap<Pubkey, Position>>,
+    positions: Arc<DashMap<PositionKey, Position>>,
     config: AppConfig,
-    dyn_config: Arc<DynConfig>,
     bc_cache: BondingCurveCache,
     rpc_client: Arc<RpcClient>,
     sol_usd: SolUsdPrice,
@@ -27,7 +25,6 @@ pub struct AutoSellManager {
 impl AutoSellManager {
     pub fn new(
         config: AppConfig,
-        dyn_config: Arc<DynConfig>,
         bc_cache: BondingCurveCache,
         rpc_client: Arc<RpcClient>,
         sol_usd: SolUsdPrice,
@@ -35,210 +32,263 @@ impl AutoSellManager {
         Self {
             positions: Arc::new(DashMap::new()),
             config,
-            dyn_config,
             bc_cache,
             rpc_client,
             sol_usd,
         }
     }
 
-    // ============================================
-    // 仓位管理
-    // ============================================
-
-    /// 保存仓位到磁盘
     fn save(&self) {
         persistence::save_positions(&self.positions);
     }
 
-    /// 立即添加仓位（Pending 状态，止损立即生效）
     pub fn add_position(&self, position: Position) {
+        let key = position.key();
         info!(
-            "Position opened: {} | state: {} | entry: {:.6} SOL",
+            "Position opened: [{}] {} | state: {} | entry: {:.6} SOL",
+            position.group.name,
             &position.token_mint.to_string()[..12],
             position.state,
             position.entry_price_sol,
         );
-        self.positions.insert(position.token_mint, position);
+        self.positions.insert(key, position);
         self.save();
     }
 
-    /// 更新仓位状态为 Submitted
-    pub fn mark_submitted(&self, mint: &Pubkey, signature: String) {
-        if let Some(mut pos) = self.positions.get_mut(mint) {
+    pub fn mark_submitted(&self, key: &PositionKey, signature: String) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
             pos.mark_submitted(signature);
         }
     }
 
-    /// 更新仓位状态为 Confirming
-    pub fn mark_confirming(&self, mint: &Pubkey) {
-        if let Some(mut pos) = self.positions.get_mut(mint) {
+    pub fn mark_confirming(&self, key: &PositionKey) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
             pos.mark_confirming();
         }
     }
 
-    /// 链上确认成功 → Active，修正真实价格和代币数量
-    /// bc_price_sol: bonding curve 现货价格，用作入场成本价
-    pub fn confirm_success(&self, mint: &Pubkey, actual_token_amount: u64, bc_price_sol: Option<f64>) {
-        if let Some(mut pos) = self.positions.get_mut(mint) {
+    pub fn confirm_success(
+        &self,
+        key: &PositionKey,
+        actual_token_amount: u64,
+        bc_price_sol: Option<f64>,
+    ) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
             pos.mark_active(actual_token_amount, bc_price_sol);
         }
     }
 
-    /// 后台修正入场价（从链上 getTransaction 获取真实花费后调用）
-    pub fn update_entry_price(&self, mint: &Pubkey, real_price: f64) {
-        if let Some(mut pos) = self.positions.get_mut(mint) {
+    pub fn update_entry_price(&self, key: &PositionKey, real_price: f64) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
             pos.entry_price_sol = real_price;
             pos.highest_price = pos.highest_price.max(real_price);
         }
     }
 
-    /// 标记卖出中
-    pub fn mark_selling(&self, mint: &Pubkey) -> bool {
-        if let Some(mut pos) = self.positions.get_mut(mint) {
+    pub fn mark_selling(&self, key: &PositionKey) -> bool {
+        if let Some(mut pos) = self.positions.get_mut(key) {
             pos.mark_selling()
         } else {
             false
         }
     }
 
-    /// 卖出成功 → Closed
-    pub fn mark_closed(&self, mint: &Pubkey, sell_signature: String) {
-        if let Some(mut pos) = self.positions.get_mut(mint) {
+    pub fn mark_closed(&self, key: &PositionKey, sell_signature: String) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
             pos.mark_closed(sell_signature);
         }
         self.save();
     }
 
-    /// 卖出失败 → 回退 Active（可重试）
-    pub fn revert_to_active(&self, mint: &Pubkey) {
-        if let Some(mut pos) = self.positions.get_mut(mint) {
+    pub fn revert_to_active(&self, key: &PositionKey) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
             pos.revert_to_active();
         }
         self.save();
     }
 
-    /// 确认失败
-    pub fn confirm_failed(&self, mint: &Pubkey, reason: &str) {
-        if let Some(mut pos) = self.positions.get_mut(mint) {
+    pub fn restore_after_sell_attempt(&self, key: &PositionKey, previous_state: PositionState) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
+            pos.restore_after_sell_attempt(previous_state);
+        }
+        self.save();
+    }
+
+    pub fn apply_partial_sell(&self, key: &PositionKey, sold_amount: u64) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
+            pos.apply_partial_sell(sold_amount);
+        }
+        self.save();
+    }
+
+    pub fn confirm_failed(&self, key: &PositionKey, reason: &str) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
             pos.mark_failed(reason);
         }
         self.save();
     }
 
-    /// 获取仓位
-    pub fn get_position(&self, mint: &Pubkey) -> Option<Position> {
-        self.positions.get(mint).map(|v| v.clone())
+    pub fn get_position(&self, key: &PositionKey) -> Option<Position> {
+        self.positions.get(key).map(|entry| entry.value().clone())
     }
 
-    /// 移除仓位
-    pub fn remove_position(&self, mint: &Pubkey) -> Option<Position> {
-        self.positions.remove(mint).map(|(_, p)| p)
+    pub fn get_position_by_group_mint(&self, group_id: &str, mint: &Pubkey) -> Option<Position> {
+        self.get_position(&PositionKey {
+            group_id: group_id.to_string(),
+            token_mint: *mint,
+        })
     }
 
-    /// 获取当前持仓数量
+    pub fn get_positions_for_mint(&self, mint: &Pubkey) -> Vec<Position> {
+        self.positions
+            .iter()
+            .filter(|entry| entry.key().token_mint == *mint)
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    pub fn open_position_count_for_mint(&self, mint: &Pubkey) -> usize {
+        self.positions
+            .iter()
+            .filter(|entry| {
+                entry.key().token_mint == *mint
+                    && !matches!(
+                        entry.state,
+                        PositionState::Closed | PositionState::Failed
+                    )
+            })
+            .count()
+    }
+
     pub fn position_count(&self) -> usize {
         self.positions.len()
     }
 
-    /// 获取所有活跃仓位（排除 Closed/Failed/Selling）
     pub fn get_active_positions(&self) -> Vec<Position> {
         self.positions
             .iter()
-            .filter(|p| !matches!(p.state, crate::autosell::PositionState::Closed | crate::autosell::PositionState::Failed | crate::autosell::PositionState::Selling))
-            .map(|p| p.value().clone())
+            .filter(|entry| {
+                !matches!(
+                    entry.state,
+                    PositionState::Closed | PositionState::Failed | PositionState::Selling
+                )
+            })
+            .map(|entry| entry.value().clone())
             .collect()
     }
 
-    /// 获取可卖出的仓位列表
-    pub fn get_sellable_positions(&self) -> Vec<Pubkey> {
+    pub fn get_group_positions(&self, group_id: &str) -> Vec<Position> {
         self.positions
             .iter()
-            .filter(|p| p.can_sell())
-            .map(|p| *p.key())
+            .filter(|entry| {
+                entry.key().group_id == group_id
+                    && !matches!(
+                        entry.state,
+                        PositionState::Closed | PositionState::Failed | PositionState::Selling
+                    )
+            })
+            .map(|entry| entry.value().clone())
             .collect()
     }
 
-    // ============================================
-    // gRPC 驱动的价格监控（替代 Jupiter 轮询）
-    // ============================================
+    pub fn get_sellable_positions(&self) -> Vec<PositionKey> {
+        self.positions
+            .iter()
+            .filter(|entry| entry.can_sell())
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
 
-    /// 启动 gRPC 驱动的价格监控
-    /// 通过 AccountUpdate 事件实时更新仓位价格
+    pub fn update_token_info(&self, key: &PositionKey, token_name: String, entry_mcap_sol: f64) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
+            pos.token_name = token_name;
+            pos.entry_mcap_sol = entry_mcap_sol;
+        }
+    }
+
     pub fn start_grpc_monitor(
         &self,
         mut account_update_rx: mpsc::UnboundedReceiver<AccountUpdate>,
         sell_signal_tx: mpsc::UnboundedSender<SellSignal>,
     ) -> tokio::task::JoinHandle<()> {
         let positions = self.positions.clone();
-        let dyn_config = self.dyn_config.clone();
         let sol_usd = self.sol_usd.clone();
         let bc_cache = self.bc_cache.clone();
 
         tokio::spawn(async move {
-            info!("Auto-sell monitor started (gRPC real-time pricing)");
+            info!("Auto-sell monitor started (group-aware)");
 
             while let Some(update) = account_update_rx.recv().await {
                 match update {
                     AccountUpdate::BondingCurve(bc_update) => {
                         let mint = bc_update.mint;
+                        let keys: Vec<PositionKey> = positions
+                            .iter()
+                            .filter(|entry| entry.key().token_mint == mint)
+                            .map(|entry| entry.key().clone())
+                            .collect();
 
-                        let signal = {
-                            let mut pos = match positions.get_mut(&mint) {
-                                Some(p) => p,
-                                None => continue,
+                        for key in keys {
+                            let signal = {
+                                let mut pos = match positions.get_mut(&key) {
+                                    Some(entry) => entry,
+                                    None => continue,
+                                };
+
+                                let current_price = bc_update.state.price_sol();
+                                if current_price <= 0.0 {
+                                    continue;
+                                }
+
+                                pos.update_price(current_price);
+                                Self::check_exit_conditions(&pos)
                             };
 
-                            let current_price = bc_update.state.price_sol();
-                            if current_price <= 0.0 {
-                                continue;
-                            }
-
-                            pos.update_price(current_price);
-
-                            Self::check_exit_conditions_dyn(&pos, &dyn_config)
-                        };
-
-                        if let Some(signal) = signal {
-                            let sol_price = sol_usd.get();
-                            let entry_sol = {
-                                let pos = positions.get(&signal.token_mint).unwrap();
-                                pos.entry_sol_amount as f64 / 1e9
-                            };
-                            let value_usd = entry_sol * (1.0 + signal.pnl_percent / 100.0) * sol_price;
-                            info!(
-                                "SELL SIGNAL: {} | reason: {} | PnL: {:.2}% | 价值: ${:.2}",
-                                &signal.token_mint.to_string()[..12],
-                                signal.reason,
-                                signal.pnl_percent,
-                                value_usd,
-                            );
-                            if sell_signal_tx.send(signal).is_err() {
-                                error!("Sell signal channel closed");
-                                return;
+                            if let Some(signal) = signal {
+                                let sol_price = sol_usd.get();
+                                let entry_sol = {
+                                    let pos = positions.get(&signal.position_key).unwrap();
+                                    pos.entry_sol_amount as f64 / 1e9
+                                };
+                                let value_usd =
+                                    entry_sol * (1.0 + signal.pnl_percent / 100.0) * sol_price;
+                                info!(
+                                    "SELL SIGNAL: [{}] {} | reason: {} | PnL: {:.2}% | value=${:.2}",
+                                    signal.group_name,
+                                    &signal.position_key.token_mint.to_string()[..12],
+                                    signal.reason,
+                                    signal.pnl_percent,
+                                    value_usd,
+                                );
+                                if sell_signal_tx.send(signal).is_err() {
+                                    error!("Sell signal channel closed");
+                                    return;
+                                }
                             }
                         }
                     }
                     AccountUpdate::AtaBalance(ata_update) => {
-                        let mint = ata_update.mint;
+                        let keys: Vec<PositionKey> = positions
+                            .iter()
+                            .filter(|entry| entry.key().token_mint == ata_update.mint)
+                            .map(|entry| entry.key().clone())
+                            .collect();
 
-                        // ATA 余额变化 = 交易确认信号
-                        if let Some(mut pos) = positions.get_mut(&mint) {
-                            if ata_update.amount > 0
-                                && (pos.state == PositionState::Submitted
-                                    || pos.state == PositionState::Confirming)
-                            {
-                                // 买入确认成功，用 bonding curve 现货价格作为入场价
-                                let bc_price = bc_cache.get(&mint).map(|s| s.price_sol());
-                                pos.mark_active(ata_update.amount, bc_price);
-                            } else if ata_update.amount == 0
-                                && pos.state == PositionState::Selling
-                            {
-                                // 卖出确认成功（余额归零）
-                                debug!(
-                                    "ATA balance zero for {} - sell confirmed",
-                                    &mint.to_string()[..12],
-                                );
+                        for key in keys {
+                            if let Some(pos) = positions.get(&key) {
+                                if matches!(
+                                    pos.state,
+                                    PositionState::Submitted
+                                        | PositionState::Confirming
+                                        | PositionState::Selling
+                                ) {
+                                    debug!(
+                                        "ATA update observed: [{}] {} | amount={}",
+                                        pos.group.name,
+                                        &ata_update.mint.to_string()[..12],
+                                        ata_update.amount,
+                                    );
+                                }
                             }
                         }
                     }
@@ -249,17 +299,12 @@ impl AutoSellManager {
         })
     }
 
-    /// 启动定时兜底检查
-    /// 1. 买入确认超时兜底：CONFIRMING 超过 5 秒 → RPC 查余额 → 有币确认/无币删除
-    /// 2. 价格监控兜底：用 bc_cache 更新价格 + 检查退出条件
-    /// 3. 清理已关闭/失败仓位
     pub fn start_fallback_monitor(
         &self,
         sell_signal_tx: mpsc::UnboundedSender<SellSignal>,
     ) -> tokio::task::JoinHandle<()> {
         let positions = self.positions.clone();
         let config = self.config.clone();
-        let dyn_config = self.dyn_config.clone();
         let bc_cache = self.bc_cache.clone();
         let rpc = self.rpc_client.clone();
         let user_pubkey = config.pubkey;
@@ -275,110 +320,104 @@ impl AutoSellManager {
                     continue;
                 }
 
-                let mints: Vec<Pubkey> = positions.iter().map(|r| *r.key()).collect();
+                let keys: Vec<PositionKey> = positions.iter().map(|entry| entry.key().clone()).collect();
 
-                for mint in mints {
-                    // ===== 买入确认超时兜底 =====
-                    let needs_confirm_check = {
-                        let pos = match positions.get(&mint) {
-                            Some(p) => p,
-                            None => continue,
-                        };
-                        (pos.state == PositionState::Submitted
-                            || pos.state == PositionState::Confirming)
-                            && pos.held_seconds() >= config.confirm_timeout_secs
+                for key in keys {
+                    let Some(snapshot) = positions.get(&key).map(|entry| entry.value().clone()) else {
+                        continue;
                     };
 
+                    let needs_confirm_check = matches!(
+                        snapshot.state,
+                        PositionState::Submitted | PositionState::Confirming
+                    ) && snapshot.held_seconds() >= config.confirm_timeout_secs;
+
                     if needs_confirm_check {
-                        let user_ata = get_associated_token_address(&user_pubkey, &mint);
+                        let user_ata = snapshot
+                            .sell_snapshot
+                            .as_ref()
+                            .map(|sell_snapshot| sell_snapshot.user_ata)
+                            .unwrap_or_else(|| {
+                                get_associated_token_address(&user_pubkey, &snapshot.token_mint)
+                            });
                         let rpc_clone = rpc.clone();
                         let ata = user_ata;
                         let balance = tokio::task::spawn_blocking(move || {
                             rpc_clone
                                 .get_token_account_balance(&ata)
-                                .map(|b| b.amount.parse::<u64>().unwrap_or(0))
+                                .map(|value| value.amount.parse::<u64>().unwrap_or(0))
                                 .unwrap_or(0)
                         })
                         .await
                         .unwrap_or(0);
 
-                        if let Some(mut pos) = positions.get_mut(&mint) {
-                            if balance > 0 {
-                                // 有代币 → 买入实际成功，确认并修正价格
-                                let bc_price = bc_cache.get(&mint).map(|s| s.price_sol());
+                        if let Some(mut pos) = positions.get_mut(&key) {
+                            if balance > pos.pre_buy_ata_balance {
+                                let actual_delta = balance.saturating_sub(pos.pre_buy_ata_balance);
+                                let assigned_amount = if actual_delta > 0
+                                    && positions
+                                        .iter()
+                                        .filter(|entry| {
+                                            entry.key().token_mint == pos.token_mint
+                                                && !matches!(
+                                                    entry.state,
+                                                    PositionState::Closed | PositionState::Failed
+                                                )
+                                        })
+                                        .count()
+                                        <= 1
+                                {
+                                    actual_delta
+                                } else if pos.token_amount > 0 {
+                                    pos.token_amount
+                                } else {
+                                    actual_delta
+                                };
+
+                                let bc_price = bc_cache.get(&pos.token_mint).map(|state| state.price_sol());
                                 info!(
-                                    "确认兜底: {} 有 {} tokens → 确认 ACTIVE",
-                                    &mint.to_string()[..12],
+                                    "Confirm fallback: [{}] {} | balance={} | assigned={}",
+                                    pos.group.name,
+                                    &pos.token_mint.to_string()[..12],
                                     balance,
+                                    assigned_amount,
                                 );
-                                pos.mark_active(balance, bc_price);
+                                pos.mark_active(assigned_amount, bc_price);
                             } else {
-                                // 无代币 → 买入实际失败，删除仓位
                                 warn!(
-                                    "确认兜底: {} 余额为 0 → 删除仓位 (买入实际失败)",
-                                    &mint.to_string()[..12],
+                                    "Confirm fallback failed: [{}] {} | balance={} <= before={}",
+                                    pos.group.name,
+                                    &pos.token_mint.to_string()[..12],
+                                    balance,
+                                    pos.pre_buy_ata_balance,
                                 );
-                                pos.mark_failed("buy not confirmed: zero balance");
+                                pos.mark_failed("buy not confirmed: balance unchanged");
                             }
                         }
                         continue;
                     }
 
-                    // ===== 正常价格监控 + 退出条件检查 =====
                     let signal = {
-                        let mut pos = match positions.get_mut(&mint) {
-                            Some(p) => p,
+                        let mut pos = match positions.get_mut(&key) {
+                            Some(entry) => entry,
                             None => continue,
                         };
 
-                        // 超时退出（读取动态配置）
-                        let max_hold = dyn_config.max_hold_seconds();
-                        if max_hold > 0
-                            && pos.held_seconds() >= max_hold
-                            && pos.can_sell()
-                        {
+                        let max_hold = pos.group.max_hold_seconds;
+                        if max_hold > 0 && pos.held_seconds() >= max_hold && pos.can_sell() {
                             Some(SellSignal {
-                                token_mint: mint,
+                                position_key: pos.key(),
+                                group_name: pos.group.name.clone(),
                                 reason: SellReason::MaxLifetime,
                                 current_price: pos.current_price,
                                 pnl_percent: pos.pnl_percent(),
                             })
-                        } else if let Some(bc_state) = bc_cache.get(&mint) {
+                        } else if let Some(bc_state) = bc_cache.get(&pos.token_mint) {
                             let price = bc_state.price_sol();
                             if price > 0.0 {
                                 pos.update_price(price);
                             }
-                            Self::check_exit_conditions_dyn(&pos, &dyn_config)
-                        } else if pos.can_sell() {
-                            // BC 缓存未命中 → RPC 兜底获取 bonding curve 价格
-                            let program_id = solana_sdk::pubkey::Pubkey::from_str(
-                                "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
-                            ).unwrap();
-                            let (bc_addr, _) = solana_sdk::pubkey::Pubkey::find_program_address(
-                                &[b"bonding-curve", mint.as_ref()], &program_id,
-                            );
-                            let rpc_clone = rpc.clone();
-                            let bc_data = tokio::task::spawn_blocking(move || {
-                                rpc_clone.get_account_data(&bc_addr)
-                            }).await;
-                            if let Ok(Ok(data)) = bc_data {
-                                if let Ok(state) = crate::processor::pumpfun::BondingCurveState::from_account_data(&data) {
-                                    let price = state.price_sol();
-                                    if price > 0.0 {
-                                        bc_cache.update(&mint, state);
-                                        pos.update_price(price);
-                                        debug!(
-                                            "兜底价格更新(RPC): {} | price: {:.10} SOL",
-                                            &mint.to_string()[..12], price,
-                                        );
-                                    }
-                                    Self::check_exit_conditions_dyn(&pos, &dyn_config)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
+                            Self::check_exit_conditions(&pos)
                         } else {
                             None
                         }
@@ -386,8 +425,9 @@ impl AutoSellManager {
 
                     if let Some(signal) = signal {
                         info!(
-                            "SELL SIGNAL: {} | reason: {} | PnL: {:.2}%",
-                            &signal.token_mint.to_string()[..12],
+                            "SELL SIGNAL: [{}] {} | reason: {} | PnL: {:.2}%",
+                            signal.group_name,
+                            &signal.position_key.token_mint.to_string()[..12],
                             signal.reason,
                             signal.pnl_percent,
                         );
@@ -398,7 +438,6 @@ impl AutoSellManager {
                     }
                 }
 
-                // 清理已关闭/失败的仓位
                 positions.retain(|_, pos| {
                     if pos.state == PositionState::Closed || pos.state == PositionState::Failed {
                         pos.created_at.elapsed().as_secs() < 60
@@ -410,101 +449,60 @@ impl AutoSellManager {
         })
     }
 
-    // ============================================
-    // 退出条件检查
-    // ============================================
-
-    /// 更新仓位的代币信息（确认后填充）
-    pub fn update_token_info(&self, mint: &Pubkey, token_name: String, entry_mcap_sol: f64) {
-        if let Some(mut pos) = self.positions.get_mut(mint) {
-            pos.token_name = token_name;
-            pos.entry_mcap_sol = entry_mcap_sol;
-        }
-    }
-
-    /// 使用 DynConfig（运行时可修改参数）检查退出条件
-    /// 跟卖模式(sell_mode=1)时跳过 TP/SL/Trailing，仅保留 MaxLifetime 安全兜底
-    fn check_exit_conditions_dyn(pos: &Position, dc: &DynConfig) -> Option<SellSignal> {
+    fn check_exit_conditions(pos: &Position) -> Option<SellSignal> {
         let pnl = pos.pnl_percent();
-        let mint = pos.token_mint;
+        let key = pos.key();
 
-        // MaxLifetime 始终生效（安全兜底）
-        let max_hold = dc.max_hold_seconds();
-        if max_hold > 0 && pos.held_seconds() >= max_hold && pos.can_sell() {
-            return Some(SellSignal { token_mint: mint, reason: SellReason::MaxLifetime, current_price: pos.current_price, pnl_percent: pnl });
-        }
-
-        // 跟卖模式: 不检查 TP/SL/Trailing（由聪明钱卖出信号触发）
-        if dc.is_follow_sell_mode() {
-            return None;
-        }
-
-        if pos.can_check_stop_loss() && pnl <= -dc.stop_loss_percent() {
-            return Some(SellSignal { token_mint: mint, reason: SellReason::StopLoss, current_price: pos.current_price, pnl_percent: pnl });
-        }
-        if pos.can_check_take_profit() && pnl >= dc.take_profit_percent() {
-            return Some(SellSignal { token_mint: mint, reason: SellReason::TakeProfit, current_price: pos.current_price, pnl_percent: pnl });
-        }
-        if pos.can_check_take_profit() && dc.trailing_stop_percent() > 0.0 && pos.highest_price > 0.0 && pnl > 0.0 {
-            if pos.drawdown_percent() >= dc.trailing_stop_percent() {
-                return Some(SellSignal { token_mint: mint, reason: SellReason::TrailingStop, current_price: pos.current_price, pnl_percent: pnl });
-            }
-        }
-        None
-    }
-
-    fn check_exit_conditions(pos: &Position, config: &AppConfig) -> Option<SellSignal> {
-        let pnl = pos.pnl_percent();
-        let mint = pos.token_mint;
-
-        // 1. 超时退出
-        if config.max_hold_seconds > 0
-            && pos.held_seconds() >= config.max_hold_seconds
+        if pos.group.max_hold_seconds > 0
+            && pos.held_seconds() >= pos.group.max_hold_seconds
             && pos.can_sell()
         {
             return Some(SellSignal {
-                token_mint: mint,
+                position_key: key,
+                group_name: pos.group.name.clone(),
                 reason: SellReason::MaxLifetime,
                 current_price: pos.current_price,
                 pnl_percent: pnl,
             });
         }
 
-        // 2. 止损（Confirming + Active 都检查）
-        if pos.can_check_stop_loss() && pnl <= -config.stop_loss_percent {
+        if pos.group.follow_sell_mode() {
+            return None;
+        }
+
+        if pos.can_check_stop_loss() && pnl <= -pos.group.stop_loss_percent {
             return Some(SellSignal {
-                token_mint: mint,
+                position_key: key,
+                group_name: pos.group.name.clone(),
                 reason: SellReason::StopLoss,
                 current_price: pos.current_price,
                 pnl_percent: pnl,
             });
         }
 
-        // 3. 止盈（仅 Active）
-        if pos.can_check_take_profit() && pnl >= config.take_profit_percent {
+        if pos.can_check_take_profit() && pnl >= pos.group.take_profit_percent {
             return Some(SellSignal {
-                token_mint: mint,
+                position_key: key,
+                group_name: pos.group.name.clone(),
                 reason: SellReason::TakeProfit,
                 current_price: pos.current_price,
                 pnl_percent: pnl,
             });
         }
 
-        // 4. 追踪止损（仅 Active 且盈利时）
         if pos.can_check_take_profit()
-            && config.trailing_stop_percent > 0.0
+            && pos.group.trailing_stop_percent > 0.0
             && pos.highest_price > 0.0
             && pnl > 0.0
+            && pos.drawdown_percent() >= pos.group.trailing_stop_percent
         {
-            let drawdown = pos.drawdown_percent();
-            if drawdown >= config.trailing_stop_percent {
-                return Some(SellSignal {
-                    token_mint: mint,
-                    reason: SellReason::TrailingStop,
-                    current_price: pos.current_price,
-                    pnl_percent: pnl,
-                });
-            }
+            return Some(SellSignal {
+                position_key: key,
+                group_name: pos.group.name.clone(),
+                reason: SellReason::TrailingStop,
+                current_price: pos.current_price,
+                pnl_percent: pnl,
+            });
         }
 
         None

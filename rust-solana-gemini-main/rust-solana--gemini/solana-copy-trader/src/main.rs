@@ -2,6 +2,7 @@ mod autosell;
 mod config;
 mod consensus;
 mod grpc;
+mod groups;
 mod processor;
 mod telegram;
 mod tx;
@@ -20,12 +21,11 @@ use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellReason, SellSignal};
-use config::{AppConfig, DynConfig};
-use consensus::{
-    engine::{BuySignal, ConsensusTrigger},
-    ConsensusEngine,
-};
+use config::AppConfig;
+use consensus::engine::{BuySignal, ConsensusTrigger};
+use consensus::ConsensusEngine;
 use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache, GrpcSubscriber};
+use groups::{CopyGroup, GroupManager};
 use processor::prefetch::PrefetchCache;
 use processor::pumpfun::PumpfunProcessor;
 use processor::DetectedTrade;
@@ -38,11 +38,9 @@ use tx::{
     sender::TxSender,
 };
 use utils::sol_price::SolUsdPrice;
-use utils::token_info;
 
 type SignatureCache = Arc<DashMap<String, Instant>>;
-/// Mint 级别去重：同一代币只买一次（防止目标钱包多次买入同一 mint 触发重复跟单）
-type MintDedup = Arc<DashMap<Pubkey, Instant>>;
+type GroupMintDedup = Arc<DashMap<String, Instant>>;
 
 const BLOCKHASH_REFRESH_MS: u64 = 120;
 const PREFETCH_WAIT_MS: u64 = 8;
@@ -70,104 +68,43 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.16");
-    info!("   RabbitStream pre-exec + Pump.fun 直连 | fire-and-forget");
+    info!("   Solana 跟单交易系统 v1.6.17");
+    info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
     let config = AppConfig::from_env()?;
-    let dyn_config = DynConfig::from_config(&config);
-    info!("钱包地址: {}", config.pubkey);
-    info!("跟单目标: {} 个钱包", config.target_wallets.len());
+    let group_manager = GroupManager::load_or_default(&config);
+    let target_wallets = group_manager.all_target_wallets();
+
+    info!("交易钱包: {}", config.pubkey);
     info!(
-        "买入金额: {} SOL | 买入滑点: {} bps | 卖出滑点: {} bps",
-        config.buy_sol_amount, config.slippage_bps, config.sell_slippage_bps
-    );
-    info!(
-        "共识条件: {} 个钱包在 {}s 内买入同一 token",
-        config.consensus_min_wallets, config.consensus_timeout_secs
-    );
-    info!(
-        "发送通道: {} + Shyft RPC + {} + {} (T+0 全并发)",
-        if config.zero_slot_urls.is_empty() {
-            "无0slot"
-        } else {
-            "0slot质押加速"
-        },
-        if config.secondary_rpc_url.is_some() {
-            "Helius RPC"
-        } else {
-            "无备用RPC"
-        },
-        if config.jito_enabled {
-            "Jito Bundle + Jito TX"
-        } else {
-            "无Jito"
-        },
-    );
-    if config.consensus_min_wallets <= 1 {
-        info!("⚡ 同区块模式: min_wallets=1, 内联执行 (跳过 channel 跳转)");
-    }
-    if config.jito_enabled {
-        info!(
-            "Jito 小费: 买入={} lamports | 卖出={} lamports",
-            config.jito_buy_tip_lamports, config.jito_sell_tip_lamports,
-        );
-    }
-    if !config.zero_slot_urls.is_empty() {
-        info!("0slot fee: {} lamports", config.zero_slot_tip_lamports);
-    }
-    info!(
-        "交易监听源: Shyft RabbitStream pre-exec | {}",
-        config.grpc_url
-    );
-    info!(
-        "自动卖出: {} | 止盈={}% 止损={}% 追踪止损={}% 超时={}s",
-        if config.auto_sell_enabled {
-            "开启 (gRPC实时价格)"
-        } else {
-            "关闭"
-        },
-        config.take_profit_percent,
-        config.stop_loss_percent,
-        config.trailing_stop_percent,
-        config.max_hold_seconds,
+        "组合数: {} | 目标钱包数: {}",
+        group_manager.all_groups().len(),
+        target_wallets.len(),
     );
 
-    // ============================================
-    // 初始化核心组件
-    // ============================================
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
         config.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::confirmed(),
     ));
 
     let balance = rpc_client.get_balance(&config.pubkey)?;
-    info!("SOL 余额: {:.4} SOL", balance as f64 / 1e9);
-    if balance < config.buy_lamports() * 2 {
-        warn!("余额不足: 低于买入金额的 2 倍");
-    }
+    info!("SOL balance: {:.4}", balance as f64 / 1e9);
 
-    // Blockhash 缓存（400ms 刷新，同步读取零延迟）
     let blockhash_cache = blockhash::init_blockhash_cache(&rpc_client).await?;
     let _bh_task = blockhash_cache.start_refresh_task(
         rpc_client.clone(),
         Duration::from_millis(BLOCKHASH_REFRESH_MS),
     );
 
-    // SOL/USD 汇率（启动时同步获取 + 后台每 30 秒刷新）
     let sol_usd = SolUsdPrice::new();
     sol_usd.init(config.default_sol_usd_price).await;
     let _sol_usd_task = sol_usd.start_refresh_task();
 
-    // gRPC 驱动的实时缓存
     let bc_cache = BondingCurveCache::new();
     let ata_cache = AtaBalanceCache::new();
-
-    // 预取缓存（检测信号时预计算 PDA）
     let prefetch_cache = Arc::new(PrefetchCache::new(bc_cache.clone()));
 
-    // 多通道发送器（T+0 全并发 fire-and-forget, VersionedTransaction V0）
-    // 通道: 0slot(质押加速) + Shyft RPC + Helius RPC + Jito Bundle + Jito TX
     let tx_sender = Arc::new(TxSender::new(
         config.rpc_url.clone(),
         config.secondary_rpc_url.clone(),
@@ -177,62 +114,35 @@ async fn main() -> Result<()> {
         config.zero_slot_urls.clone(),
     ));
     let buy_exec_limiter = Arc::new(Semaphore::new(BUY_EXECUTOR_PARALLELISM));
-
-    // Pump.fun 处理器
     let pumpfun = Arc::new(PumpfunProcessor::new(rpc_client.clone()));
-
-    // 共识引擎
-    let consensus_engine = Arc::new(ConsensusEngine::new(
-        config.consensus_min_wallets,
-        config.consensus_timeout_secs,
-    ));
+    let consensus_engine = Arc::new(ConsensusEngine::new());
     let _cleanup_task = consensus_engine.start_cleanup_task();
 
-    // 自动卖出管理器（gRPC 实时价格驱动 + 确认超时兜底）
     let auto_sell_manager = Arc::new(AutoSellManager::new(
         config.clone(),
-        dyn_config.clone(),
         bc_cache.clone(),
         rpc_client.clone(),
         sol_usd.clone(),
     ));
 
-    // 运行控制（TG /start /stop）— 默认停止，需要 TG /start 启动监听
     let is_running = Arc::new(AtomicBool::new(false));
     let tg_stats = Arc::new(TgStats::new());
 
-    // gRPC 账户订阅器（bonding curve + ATA 实时推送）
-    // 使用独立的 gRPC URL（RabbitStream 不支持账户订阅）
     let account_subscriber = Arc::new(AccountSubscriber::new(
         config.grpc_account_url.clone(),
         config.grpc_account_token.clone(),
         bc_cache.clone(),
         ata_cache.clone(),
     ));
-    if config.grpc_account_url != config.grpc_url {
-        info!("账户监控 gRPC: {} (独立于交易流)", config.grpc_account_url);
-    } else {
-        info!(
-            "账户监控 gRPC: {} (与交易流共用配置)",
-            config.grpc_account_url
-        );
-    }
 
-    // 签名去重
     let sig_cache: SignatureCache = Arc::new(DashMap::new());
-    // Mint 去重（同一代币只买一次，60s 内不重复）
-    let mint_dedup: MintDedup = Arc::new(DashMap::new());
+    let mint_dedup: GroupMintDedup = Arc::new(DashMap::new());
 
-    // ============================================
-    // Channels
-    // ============================================
     let (trade_tx, mut trade_rx) = mpsc::unbounded_channel::<DetectedTrade>();
     let (consensus_tx, mut consensus_rx) = mpsc::unbounded_channel::<ConsensusTrigger>();
     let (sell_signal_tx, mut sell_signal_rx) = mpsc::unbounded_channel::<SellSignal>();
     let (account_update_tx, account_update_rx) = mpsc::unbounded_channel::<AccountUpdate>();
 
-    // 卖出执行器 + Telegram Bot（互相依赖，先创建 notifier 再创建 executor）
-    // 先创建 notifier channel（轻量），executor 需要 notifier，bot 需要 executor
     let (tg_event_tx, tg_event_rx) = mpsc::unbounded_channel::<telegram::TgEvent>();
     let tg_notifier = if config.telegram_bot_token.is_some() && config.telegram_chat_id.is_some() {
         TgNotifier::from_sender(tg_event_tx)
@@ -242,7 +152,6 @@ async fn main() -> Result<()> {
 
     let sell_executor = Arc::new(SellExecutor::new(
         config.clone(),
-        dyn_config.clone(),
         rpc_client.clone(),
         pumpfun.clone(),
         tx_sender.clone(),
@@ -255,61 +164,42 @@ async fn main() -> Result<()> {
         tg_notifier.clone(),
     ));
 
-    let tg_bot = if config.telegram_bot_token.is_some() && config.telegram_chat_id.is_some() {
-        let bot = TgBot::from_parts(
-            config.clone(),
-            dyn_config.clone(),
-            auto_sell_manager.clone(),
-            consensus_engine.clone(),
-            sell_signal_tx.clone(),
-            sell_executor.clone(),
-            is_running.clone(),
-            tg_stats.clone(),
-            sol_usd.clone(),
-            tg_event_rx,
-        );
-        info!(
-            "Telegram Bot V2 已配置 | chat_id: {}",
-            config.telegram_chat_id.as_deref().unwrap_or("")
-        );
-        Some(bot)
-    } else {
-        info!("Telegram Bot 未配置（设置 TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID 启用）");
-        None
-    };
-
-    // ============================================
-    // 后台任务
-    // ============================================
-
-    // 0. Telegram Bot
-    if let Some(bot) = tg_bot {
-        tokio::spawn(async move { bot.run().await });
+    if let Some(bot_token) = config.telegram_bot_token.clone() {
+        if let Some(chat_id) = config.telegram_chat_id.clone() {
+            let tg_bot = TgBot::from_parts(
+                config.clone(),
+                group_manager.clone(),
+                auto_sell_manager.clone(),
+                consensus_engine.clone(),
+                sell_signal_tx.clone(),
+                sell_executor.clone(),
+                is_running.clone(),
+                tg_stats.clone(),
+                sol_usd.clone(),
+                tg_event_rx,
+            );
+            info!("Telegram bot enabled for chat {}", chat_id);
+            tokio::spawn(async move {
+                let _ = bot_token;
+                tg_bot.run().await;
+            });
+        }
     }
 
-    // 1. gRPC 驱动的自动卖出监控（实时价格 + 超时兜底）
     if config.auto_sell_enabled {
         let _grpc_monitor =
             auto_sell_manager.start_grpc_monitor(account_update_rx, sell_signal_tx.clone());
         let _fallback_monitor = auto_sell_manager.start_fallback_monitor(sell_signal_tx.clone());
-        info!(
-            "自动卖出监控已启动 (gRPC 实时价格 + {}s 超时兜底)",
-            config.price_check_interval_secs,
-        );
     }
 
-    // 2. 签名缓存 + Mint 去重清理
     let sig_cache_clone = sig_cache.clone();
-    let mint_dedup_clone = mint_dedup.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            sig_cache_clone.retain(|_, t: &mut Instant| t.elapsed() < Duration::from_secs(10));
-            // mint_dedup 不清理：同一代币永久只买一次，重启才重置
+            sig_cache_clone.retain(|_, value| value.elapsed() < Duration::from_secs(10));
         }
     });
 
-    // 3. 预取缓存清理
     let prefetch_clone = prefetch_cache.clone();
     tokio::spawn(async move {
         loop {
@@ -318,41 +208,34 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 4. gRPC 交易订阅（自动重连）
     let grpc_sub = GrpcSubscriber::new(
         config.grpc_url.clone(),
         config.grpc_token.clone(),
-        config.target_wallets.clone(),
+        target_wallets.clone(),
     );
     let trade_tx_clone = trade_tx.clone();
     tokio::spawn(async move {
         loop {
-            debug!("正在连接 gRPC 交易流...");
             match grpc_sub.subscribe(trade_tx_clone.clone()).await {
-                Ok(()) => warn!("gRPC 交易流断开，2s 后重连..."),
-                Err(e) => error!("gRPC 交易流错误: {}，2s 后重连...", e),
+                Ok(()) => warn!("gRPC trade stream closed, reconnecting"),
+                Err(err) => error!("gRPC trade stream error: {}", err),
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 
-    // 5. gRPC 账户订阅（自动重连）
     let acct_sub_clone = account_subscriber.clone();
     let acct_update_tx_clone = account_update_tx.clone();
     tokio::spawn(async move {
         loop {
-            debug!("正在连接 gRPC 账户流...");
             match acct_sub_clone.subscribe(acct_update_tx_clone.clone()).await {
-                Ok(()) => warn!("gRPC 账户流断开，2s 后重连..."),
-                Err(e) => error!("gRPC 账户流错误: {}，2s 后重连...", e),
+                Ok(()) => warn!("gRPC account stream closed, reconnecting"),
+                Err(err) => error!("gRPC account stream error: {}", err),
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 
-    // ============================================
-    // 卖出信号处理（Pump.fun 直接卖出 + 3 次重试）
-    // ============================================
     let sell_exec = sell_executor.clone();
     tokio::spawn(async move {
         while let Some(signal) = sell_signal_rx.recv().await {
@@ -360,9 +243,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ============================================
-    // 共识触发 → Pump.fun 直接买入（仅 min_wallets > 1 时使用）
-    // ============================================
     let exec_config = config.clone();
     let exec_rpc = rpc_client.clone();
     let exec_pumpfun = pumpfun.clone();
@@ -374,32 +254,30 @@ async fn main() -> Result<()> {
     let exec_bc_cache = bc_cache.clone();
     let exec_ata_cache = ata_cache.clone();
     let exec_acct_sub = account_subscriber.clone();
-    let exec_dyn_config = dyn_config.clone();
     let exec_tg = tg_notifier.clone();
     let exec_tg_stats = tg_stats.clone();
     let exec_mint_dedup = mint_dedup.clone();
     let exec_buy_limiter = buy_exec_limiter.clone();
+    let exec_group_manager = group_manager.clone();
     tokio::spawn(async move {
         while let Some(trigger) = consensus_rx.recv().await {
-            // 共识触发时插入 mint_dedup，防止重复执行
-            if exec_mint_dedup.contains_key(&trigger.token_mint) {
-                info!(
-                    "⏭️ 共识触发但代币已买入: {} (本次运行已买入)",
-                    &trigger.token_mint.to_string()[..12]
-                );
+            let dedup_key = group_mint_key(&trigger.group_id, &trigger.token_mint);
+            if exec_mint_dedup.contains_key(&dedup_key) {
                 continue;
             }
-            exec_mint_dedup.insert(trigger.token_mint, Instant::now());
+            exec_mint_dedup.insert(dedup_key, Instant::now());
 
-            // TG 推送共识达成
             exec_tg.send(TgEvent::ConsensusReached {
+                group_name: trigger.group_name.clone(),
                 mint: trigger.token_mint,
                 wallets: trigger.wallets.clone(),
             });
 
-            let trigger_mint = trigger.token_mint;
-            let trigger_wallets = trigger.wallets.clone();
-            let trigger_detected_at = trigger.triggered_at;
+            let Some(group) = exec_group_manager.get_group(&trigger.group_id) else {
+                warn!("Missing group for consensus trigger: {}", trigger.group_id);
+                continue;
+            };
+
             let cfg = exec_config.clone();
             let rpc = exec_rpc.clone();
             let pf = exec_pumpfun.clone();
@@ -411,13 +289,16 @@ async fn main() -> Result<()> {
             let bc = exec_bc_cache.clone();
             let ata = exec_ata_cache.clone();
             let acct_sub = exec_acct_sub.clone();
-            let dyn_cfg = exec_dyn_config.clone();
             let tg = exec_tg.clone();
             let stats = exec_tg_stats.clone();
             let limiter = exec_buy_limiter.clone();
+            let trigger_mint = trigger.token_mint;
+            let trigger_wallets = trigger.wallets.clone();
+            let trigger_detected_at = trigger.triggered_at;
             tokio::spawn(async move {
                 let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
                 execute_buy(
+                    &group,
                     &trigger_mint,
                     &trigger_wallets,
                     trigger_detected_at,
@@ -433,7 +314,6 @@ async fn main() -> Result<()> {
                     &bc,
                     &ata,
                     &acct_sub,
-                    &dyn_cfg,
                     &tg,
                     &stats,
                 )
@@ -442,25 +322,15 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ============================================
-    // 主循环：检测 → 过滤 → 预取 → 执行/共识
-    // ============================================
-    info!(
-        "买入量过滤: 忽略目标钱包 < {} SOL 的买入信号 (可通过 /set min_buy 修改)",
-        config.min_target_buy_sol,
-    );
-    let is_instant_mode = config.consensus_min_wallets <= 1;
     if is_running.load(Ordering::Relaxed) {
-        info!("主循环已启动，等待 Pump.fun 内盘信号...\n");
+        info!("Main loop active");
     } else {
-        info!("主循环已启动（监听暂停，等待 TG /start 命令）...\n");
+        info!("Main loop idle, waiting for TG /start");
     }
 
-    // 优雅关闭：Ctrl+C / kill 时发送 TG 下线通知
     let shutdown_token = config.telegram_bot_token.clone();
     let shutdown_chat = config.telegram_chat_id.clone();
     tokio::spawn(async move {
-        // 等待 Ctrl+C (SIGINT) 或 SIGTERM
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -473,111 +343,64 @@ async fn main() -> Result<()> {
         #[cfg(not(unix))]
         ctrl_c.await.ok();
 
-        warn!("收到关闭信号，发送 TG 下线通知...");
         if let (Some(token), Some(chat)) = (&shutdown_token, &shutdown_chat) {
             telegram::send_shutdown_notification(token, chat).await;
         }
-        info!("下线通知已发送，退出进程");
         std::process::exit(0);
     });
 
     while let Some(trade) = trade_rx.recv().await {
-        // TG /stop 控制：停止处理新交易
         if !is_running.load(Ordering::Relaxed) {
             continue;
         }
 
-        // gRPC 事件计数
         tg_stats.grpc_events.fetch_add(1, Ordering::Relaxed);
 
-        // 去重
         if sig_cache.contains_key(&trade.signature) {
             continue;
         }
         sig_cache.insert(trade.signature.clone(), Instant::now());
 
-        // ===== 卖出信号处理 =====
+        let matching_groups = group_manager.groups_for_wallet(&trade.source_wallet);
+        if matching_groups.is_empty() {
+            continue;
+        }
+
+        let token_info = extract_token_info(&trade);
+        if token_info.is_none() {
+            continue;
+        }
+        let (token_mint, token_program) = token_info.unwrap();
+
+        if group_manager.is_blocked(&token_mint) {
+            info!("Blocked mint skipped: {}", &token_mint.to_string()[..12]);
+            continue;
+        }
+
         if !trade.is_buy {
-            if let Some((token_mint, _)) = extract_token_info(&trade) {
-                // 共识撤回：无论什么模式，钱包卖出时都撤回其共识信号（防止假共识）
-                if !is_instant_mode {
-                    consensus_engine.revoke_signal(&token_mint, &trade.source_wallet);
+            for group in matching_groups {
+                consensus_engine.revoke_signal(&group.id, &token_mint, &trade.source_wallet);
+                if !group.follow_sell_mode() {
+                    continue;
                 }
 
-                // 跟卖模式：聪明钱卖出 → 触发跟卖
-                if dyn_config.is_follow_sell_mode() {
-                    if let Some(pos) = auto_sell_manager.get_position(&token_mint) {
-                        if pos.can_sell() {
-                            let wallet_str = trade.source_wallet.to_string();
-                            info!(
-                                "跟卖信号: {}..{} 卖出 {} | 触发跟卖",
-                                &wallet_str[..4],
-                                &wallet_str[wallet_str.len() - 4..],
-                                &token_mint.to_string()[..12],
-                            );
-                            let signal = SellSignal {
-                                token_mint,
-                                reason: SellReason::FollowSell,
-                                current_price: pos.current_price,
-                                pnl_percent: pos.pnl_percent(),
-                            };
-                            let _ = sell_signal_tx.send(signal);
-                        }
+                if let Some(position) =
+                    auto_sell_manager.get_position_by_group_mint(&group.id, &token_mint)
+                {
+                    if position.can_sell() {
+                        let _ = sell_signal_tx.send(SellSignal {
+                            position_key: position.key(),
+                            group_name: group.name.clone(),
+                            reason: SellReason::FollowSell,
+                            current_price: position.current_price,
+                            pnl_percent: position.pnl_percent(),
+                        });
                     }
                 }
             }
             continue;
         }
 
-        // ===== 买入量过滤（运行时可调，从 DynConfig 读取）=====
-        let min_buy_lamports = dyn_config.min_target_buy_lamports();
-        if min_buy_lamports > 0 && trade.sol_amount_lamports > 0 {
-            if trade.sol_amount_lamports < min_buy_lamports {
-                info!(
-                    "⏭️ 跳过小额买入: {}.. 买入 {:.4} SOL < 阈值 {:.2} SOL",
-                    &trade.source_wallet.to_string()[..8],
-                    trade.sol_amount_lamports as f64 / 1e9,
-                    dyn_config.min_target_buy_sol(),
-                );
-                continue;
-            }
-        }
-
-        // 纯本地提取 mint + token_program
-        let (token_mint, token_program) = match extract_token_info(&trade) {
-            Some(info) => info,
-            None => {
-                info!(
-                    "⏭️ 无法从 accountKeys 提取 mint，跳过 sig: {}",
-                    &trade.signature[..12]
-                );
-                continue;
-            }
-        };
-
-        // 黑名单检查
-        if dyn_config.is_blocked(&token_mint) {
-            info!("⏭️ 跳过黑名单代币: {}", &token_mint.to_string()[..12]);
-            continue;
-        }
-
-        // Mint 去重：同一代币永久只买一次（重启才重置）
-        // 即时模式：在执行前拦截
-        // 共识模式：不拦截（多钱包买同一 token 是共识信号），在共识触发时去重
-        if is_instant_mode {
-            if mint_dedup.contains_key(&token_mint) {
-                info!(
-                    "⏭️ 跳过已买代币: {} (本次运行已买入)",
-                    &token_mint.to_string()[..12]
-                );
-                continue;
-            }
-            mint_dedup.insert(token_mint, Instant::now());
-        }
-
-        // 预取 PDA + 注册 gRPC bonding curve + ATA 监控
-        // ATA 提前注册，让 gRPC AccountSubscriber 尽早订阅，
-        // 这样 BuyConfirmer 能通过 gRPC 缓存快速确认（而非 RPC 轮询）
         let prefetched = prefetch_cache.prefetch_token(
             &token_mint,
             &token_program,
@@ -588,112 +411,103 @@ async fn main() -> Result<()> {
         account_subscriber.track_bonding_curve(token_mint, prefetched.bonding_curve);
         account_subscriber.track_ata(token_mint, prefetched.user_ata);
 
-        // ⚡ 同区块模式: min_wallets=1 时直接内联执行，跳过 channel 跳转
-        if is_instant_mode {
-            // 不再等待 BC RPC 预取！
-            // 优先用目标指令数据推算价格（零 RPC），BC cache 作为补充
-            if bc_cache.get(&token_mint).is_none() {
-                // 后台异步预取 BC（不阻塞，给后续持仓监控用）
-                let pf = pumpfun.clone();
-                let bc = prefetched.bonding_curve;
-                let mint_copy = token_mint;
-                let bc_cache_copy = bc_cache.clone();
-                tokio::spawn(async move {
-                    if let Ok(state) = pf.prefetch_bonding_curve(&bc).await {
-                        bc_cache_copy.update(&mint_copy, state);
-                    }
-                });
-            }
-
-            // 内联执行买入（跳过共识 channel 跳转）
-            let wallets = vec![trade.source_wallet];
-            let cfg = config.clone();
-            let rpc = rpc_client.clone();
+        if bc_cache.get(&token_mint).is_none() {
             let pf = pumpfun.clone();
-            let bh = blockhash_cache.clone();
-            let sender = tx_sender.clone();
-            let sol = sol_usd.clone();
-            let auto_sell = auto_sell_manager.clone();
-            let prefetch = prefetch_cache.clone();
-            let bc = bc_cache.clone();
-            let ata = ata_cache.clone();
-            let acct_sub = account_subscriber.clone();
-            let dyn_cfg = dyn_config.clone();
-            let tg = tg_notifier.clone();
-            let stats = tg_stats.clone();
-            let limiter = buy_exec_limiter.clone();
-            let instruction_data = trade.instruction_data.clone();
+            let bc = prefetched.bonding_curve;
+            let mint_copy = token_mint;
+            let bc_cache_copy = bc_cache.clone();
             tokio::spawn(async move {
-                let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
-                execute_buy(
-                    &token_mint,
-                    &wallets,
-                    trade.detected_at,
-                    &instruction_data,
-                    &cfg,
-                    &rpc,
-                    &pf,
-                    &bh,
-                    &sender,
-                    &sol,
-                    &auto_sell,
-                    &prefetch,
-                    &bc,
-                    &ata,
-                    &acct_sub,
-                    &dyn_cfg,
-                    &tg,
-                    &stats,
-                )
-                .await;
+                if let Ok(state) = pf.prefetch_bonding_curve(&bc).await {
+                    bc_cache_copy.update(&mint_copy, state);
+                }
             });
-        } else {
-            // 多钱包共识模式：后台预取 BC，提交共识
-            if bc_cache.get(&token_mint).is_none() {
-                let pf = pumpfun.clone();
-                let bc = prefetched.bonding_curve;
-                let mint_copy = token_mint;
-                let bc_cache_copy = bc_cache.clone();
-                tokio::spawn(async move {
-                    if let Ok(state) = pf.prefetch_bonding_curve(&bc).await {
-                        bc_cache_copy.update(&mint_copy, state);
-                        debug!(
-                            "并行预取 bonding curve 完成: {}",
-                            &mint_copy.to_string()[..12],
-                        );
-                    }
-                });
+        }
+
+        for group in matching_groups {
+            if group.min_target_buy_lamports() > 0
+                && trade.sol_amount_lamports > 0
+                && trade.sol_amount_lamports < group.min_target_buy_lamports()
+            {
+                continue;
             }
 
-            consensus_engine.submit_signal(
-                BuySignal {
-                    token_mint,
-                    wallet: trade.source_wallet,
-                    detected_at: Instant::now(),
-                    signature: trade.signature.clone(),
-                },
-                &consensus_tx,
-            );
+            if group.consensus_min_wallets <= 1 {
+                let dedup_key = group_mint_key(&group.id, &token_mint);
+                if mint_dedup.contains_key(&dedup_key) {
+                    continue;
+                }
+                mint_dedup.insert(dedup_key, Instant::now());
+
+                let cfg = config.clone();
+                let rpc = rpc_client.clone();
+                let pf = pumpfun.clone();
+                let bh = blockhash_cache.clone();
+                let sender = tx_sender.clone();
+                let sol = sol_usd.clone();
+                let auto_sell = auto_sell_manager.clone();
+                let prefetch = prefetch_cache.clone();
+                let bc = bc_cache.clone();
+                let ata = ata_cache.clone();
+                let acct_sub = account_subscriber.clone();
+                let tg = tg_notifier.clone();
+                let stats = tg_stats.clone();
+                let limiter = buy_exec_limiter.clone();
+                let trade_wallet = trade.source_wallet;
+                let target_instruction_data = trade.instruction_data.clone();
+                let group_clone = group.clone();
+                tokio::spawn(async move {
+                    let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
+                    execute_buy(
+                        &group_clone,
+                        &token_mint,
+                        &[trade_wallet],
+                        trade.detected_at,
+                        &target_instruction_data,
+                        &cfg,
+                        &rpc,
+                        &pf,
+                        &bh,
+                        &sender,
+                        &sol,
+                        &auto_sell,
+                        &prefetch,
+                        &bc,
+                        &ata,
+                        &acct_sub,
+                        &tg,
+                        &stats,
+                    )
+                    .await;
+                });
+            } else {
+                consensus_engine.submit_signal(
+                    BuySignal {
+                        group_id: group.id.clone(),
+                        group_name: group.name.clone(),
+                        token_mint,
+                        wallet: trade.source_wallet,
+                        detected_at: Instant::now(),
+                        signature: trade.signature.clone(),
+                        consensus_min_wallets: group.consensus_min_wallets,
+                        consensus_timeout_secs: group.consensus_timeout_secs,
+                    },
+                    &consensus_tx,
+                );
+            }
         }
     }
 
-    warn!("交易通道关闭，系统退出");
     Ok(())
 }
 
-// ============================================
-// 买入执行（内联 + 共识通用）
-// ============================================
-
-/// 核心买入执行逻辑
-/// 构建优先级: 目标指令推算(零RPC) → BC cache(零RPC) → BC RPC(兜底)
 #[allow(clippy::too_many_arguments)]
 async fn execute_buy(
+    group: &CopyGroup,
     mint: &Pubkey,
     wallets: &[Pubkey],
     detected_at: Instant,
     target_instruction_data: &[u8],
-    config: &AppConfig,
+    base_config: &AppConfig,
     rpc_client: &Arc<RpcClient>,
     pumpfun: &Arc<PumpfunProcessor>,
     blockhash_cache: &blockhash::BlockhashCache,
@@ -703,8 +517,7 @@ async fn execute_buy(
     prefetch_cache: &Arc<PrefetchCache>,
     bc_cache: &BondingCurveCache,
     ata_cache: &AtaBalanceCache,
-    account_subscriber: &Arc<AccountSubscriber>,
-    dyn_config: &Arc<DynConfig>,
+    _account_subscriber: &Arc<AccountSubscriber>,
     tg: &TgNotifier,
     tg_stats: &Arc<TgStats>,
 ) {
@@ -714,54 +527,28 @@ async fn execute_buy(
         queue: detect_to_exec,
         ..Default::default()
     };
+    let config = group.to_app_config(base_config);
 
-    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!(
-        "执行跟单: {} | {} 个钱包 | 检测→执行: {:?}",
-        &mint.to_string()[..12],
-        wallets.len(),
-        detect_to_exec,
-    );
-
-    // 使用预取数据
     let prefetch_wait_start = Instant::now();
     let prefetched = match prefetch_cache.get(mint) {
         Some(prefetched) => Some(prefetched),
-        None => {
-            debug!(
-                "Prefetch cache miss: {} | waiting up to {}ms for hot prefetch",
-                &mint.to_string()[..12],
-                PREFETCH_WAIT_MS,
-            );
-            prefetch_cache
-                .get_or_wait(mint, Duration::from_millis(PREFETCH_WAIT_MS))
-                .await
-        }
+        None => prefetch_cache
+            .get_or_wait(mint, Duration::from_millis(PREFETCH_WAIT_MS))
+            .await,
     };
     timings.prefetch_wait = prefetch_wait_start.elapsed();
 
-    // 从 DynConfig 读取动态参数
-    let buy_sol = dyn_config.buy_sol_amount();
-    let buy_lamports = dyn_config.buy_lamports();
+    let buy_sol = group.buy_sol_amount;
+    let buy_lamports = group.buy_lamports();
     let sol_price = sol_usd.get();
 
-    // ===== 2 层优先级构建买入指令（零 RPC，无兜底）=====
-    // 1. BC cache 命中（零 RPC，AMM 公式精确计算，最可靠）
-    // 2. 目标指令推算（零 RPC，需 max_sol_cost 合理性检查）
-    // 无 BC RPC fetch — 任何 RPC 调用都会毁掉同区块机会
     let quote_build_start = Instant::now();
     let buy_result: Result<(processor::MirrorInstruction, u64), anyhow::Error> =
         if let Some(ref pf) = prefetched {
             if pf.mirror_accounts.is_empty() {
-                Err(anyhow::anyhow!("无 mirror_accounts，无法构建指令"))
+                Err(anyhow::anyhow!("missing mirror accounts"))
             } else if let Some(bc_state) = bc_cache.get(mint) {
-                // ⚡ 最优: BC cache 命中，AMM 公式精确计算（最可靠）
                 let token_amount = bc_state.sol_to_token_quote(buy_lamports);
-                info!(
-                    "指令构建: BC cache 命中 | price: {:.10} SOL | tokens: {}",
-                    bc_state.price_sol(),
-                    token_amount,
-                );
                 pumpfun
                     .buy_from_cached_state(
                         mint,
@@ -770,49 +557,30 @@ async fn execute_buy(
                         &pf.source_wallet,
                         &pf.mirror_accounts,
                         &bc_state,
-                        config,
+                        &config,
                     )
                     .map(|mirror| (mirror, token_amount))
             } else if target_instruction_data.len() >= 24 {
-                // 次选: 目标指令推算（零 RPC，零缓存依赖）
-                // 合理性检查: max_sol_cost 超过 100 SOL 视为"无限滑点"标志，不可用于价格推算
-                let target_max_sol = u64::from_le_bytes(
-                    target_instruction_data[16..24].try_into().unwrap_or([0; 8]),
-                );
-                let max_sol_f = target_max_sol as f64 / 1e9;
-                if max_sol_f > 100.0 {
-                    warn!(
-                        "目标 max_sol_cost={:.2} SOL 不合理（疑似无限滑点），跳过目标指令推算",
-                        max_sol_f,
-                    );
-                    Err(anyhow::anyhow!(
-                        "BC 缓存未命中 + 目标 max_sol_cost 不合理，跳过"
-                    ))
-                } else {
-                    pumpfun.buy_from_target_instruction(
-                        mint,
-                        &pf.user_ata,
-                        &pf.token_program,
-                        &pf.source_wallet,
-                        &pf.mirror_accounts,
-                        target_instruction_data,
-                        config,
-                    )
-                }
+                pumpfun.buy_from_target_instruction(
+                    mint,
+                    &pf.user_ata,
+                    &pf.token_program,
+                    &pf.source_wallet,
+                    &pf.mirror_accounts,
+                    target_instruction_data,
+                    &config,
+                )
             } else {
-                Err(anyhow::anyhow!(
-                    "BC 缓存未命中且无目标指令数据，跳过（不做 RPC 兜底）"
-                ))
+                Err(anyhow::anyhow!("missing bc cache and target instruction"))
             }
         } else {
-            Err(anyhow::anyhow!("无预取数据，跳过"))
+            Err(anyhow::anyhow!("prefetch not ready"))
         };
     timings.quote_build = quote_build_start.elapsed();
 
-    // 阶段一入场价: buyAmountSol / (estimatedTokens / 1e6)
     let (estimated_tokens_raw, entry_price_sol, entry_mcap_sol) = match &buy_result {
-        Ok((_, est_tokens)) if *est_tokens > 0 => {
-            let display_tokens = *est_tokens as f64 / 1e6;
+        Ok((_, estimated_tokens)) if *estimated_tokens > 0 => {
+            let display_tokens = *estimated_tokens as f64 / 1e6;
             let price = if display_tokens > 0.0 {
                 buy_sol / display_tokens
             } else {
@@ -821,31 +589,25 @@ async fn execute_buy(
             let mcap = if let Some(bc_state) = bc_cache.get(mint) {
                 bc_state.market_cap_sol()
             } else {
-                // 从目标指令推算市值: price × 10 亿
                 price * processor::pumpfun::PUMP_TOTAL_SUPPLY
             };
-            (*est_tokens, price, mcap)
+            (*estimated_tokens, price, mcap)
         }
-        _ => {
-            if let Some(bc_state) = bc_cache.get(mint) {
-                let out = bc_state.sol_to_token_quote(buy_lamports);
-                let display = out as f64 / 1e6;
-                let price = if display > 0.0 {
-                    buy_sol / display
-                } else {
-                    0.0
-                };
-                (out, price, bc_state.market_cap_sol())
-            } else {
-                (0, 0.0, 0.0)
-            }
-        }
+        _ => (0, 0.0, 0.0),
     };
 
     let entry_price_usd = entry_price_sol * sol_price;
     let entry_mcap_usd = entry_mcap_sol * sol_price;
+    let pre_buy_ata_balance = ata_cache.get(mint).unwrap_or(0);
 
-    let mut position = Position::new(*mint, buy_lamports, entry_price_sol, wallets[0]);
+    let mut position = Position::new(
+        group.clone(),
+        *mint,
+        buy_lamports,
+        entry_price_sol,
+        wallets[0],
+        pre_buy_ata_balance,
+    );
     position.set_token_amount_estimate(estimated_tokens_raw);
     position.entry_mcap_sol = entry_mcap_sol;
     if let Some(ref pf) = prefetched {
@@ -858,65 +620,53 @@ async fn execute_buy(
             source_wallet: pf.source_wallet,
         });
     }
+    let position_key = position.key();
 
     match buy_result {
         Ok((mirror, _)) => {
-            debug!("指令构建: {:?}", timings.quote_build);
-
-            // ⚡ 同步读取 blockhash（零 await 开销）
             let (blockhash, _) = blockhash_cache.get_sync();
-
             let tx_build_start = Instant::now();
             let tx_result = if !config.zero_slot_urls.is_empty() {
                 let fee_account = tx_sender.random_0slot_tip_account();
                 TxBuilder::build_0slot_transaction(
                     &mirror,
-                    config,
+                    &config,
                     &config.keypair,
                     blockhash,
                     &fee_account,
-                    dyn_config.zero_slot_tip_lamports(),
+                    group.tip_buy_lamports,
                     &[],
                 )
             } else if config.jito_enabled {
                 let tip = tx_sender.random_jito_tip_account();
                 TxBuilder::build_jito_bundle_transaction(
                     &mirror,
-                    config,
+                    &config,
                     &config.keypair,
                     blockhash,
                     &tip,
-                    dyn_config.jito_buy_tip_lamports(),
-                    &[], // ALT: 暂无预部署，后续可接入
+                    group.tip_buy_lamports,
+                    &[],
                 )
             } else {
-                TxBuilder::build_transaction(
-                    &mirror,
-                    config,
-                    &config.keypair,
-                    blockhash,
-                    &[], // ALT: 暂无预部署，后续可接入
-                )
+                TxBuilder::build_transaction(&mirror, &config, &config.keypair, blockhash, &[])
             };
             timings.tx_build = tx_build_start.elapsed();
 
             match tx_result {
                 Ok(transaction) => {
-                    // ⚡ fire-and-forget 多通道并发发送
-                    // RabbitStream 目标模式为 pre-exec（meta 为空）。
-                    // 这里统一走独立 TX 广播，不依赖 backrun bundle。
                     let send_call_start = Instant::now();
-                    let send_result = tx_sender.fire_and_forget(&transaction, None);
-                    timings.send_call = send_call_start.elapsed();
-                    match send_result {
+                    match tx_sender.fire_and_forget(&transaction, None) {
                         Ok(sig) => {
+                            timings.send_call = send_call_start.elapsed();
+                            let total_latency = start.elapsed();
                             let sig_str = sig.to_string();
-
                             let buy_usd = sol_usd.sol_to_usd(buy_sol);
 
-                            let total_latency = detected_at.elapsed();
                             info!(
-                                "⚡ 买入已发射 | {:.4} SOL (${:.2}) | 预估 {:.0} tokens | 成本价(预估): {} | 市值(预估): {} | queue={} | prefetch={} | quote_build={} | tx_build={} | send_call={} | total={} | sig: {}",
+                                "Buy submitted: [{}] {} | {:.4} SOL (${:.2}) | est {:.0} tokens | price={} | mcap={} | queue={} | prefetch={} | quote_build={} | tx_build={} | send_call={} | total={} | sig={}",
+                                group.name,
+                                &mint.to_string()[..12],
                                 buy_sol,
                                 buy_usd,
                                 estimated_tokens_raw as f64 / 1e6,
@@ -928,101 +678,80 @@ async fn execute_buy(
                                 format_latency(timings.tx_build),
                                 format_latency(timings.send_call),
                                 format_latency(total_latency),
-                                if sig_str.len() > 16 { &sig_str[..16] } else { &sig_str },
+                                &sig_str[..16.min(sig_str.len())],
                             );
 
-                            // TG 推送买入提交 + 统计
                             tg_stats.buy_attempts.fetch_add(1, Ordering::Relaxed);
                             tg.send(TgEvent::BuySubmitted {
+                                group_name: group.name.clone(),
                                 mint: *mint,
                                 sol_amount: buy_sol,
                                 latency_ms: total_latency.as_millis() as u64,
                             });
 
-                            // 立即建仓（gRPC ATA 监控已在 prefetch 阶段提前注册）
                             if config.auto_sell_enabled {
-                                position.mark_submitted(sig_str);
+                                position.mark_submitted(sig_str.clone());
                                 position.mark_confirming();
                                 auto_sell_manager.add_position(position.clone());
 
-                                let user_ata =
-                                    prefetched.as_ref().map(|pf| pf.user_ata).unwrap_or_else(
-                                        || get_associated_token_address(&config.pubkey, mint),
-                                    );
+                                let user_ata = prefetched
+                                    .as_ref()
+                                    .map(|pf| pf.user_ata)
+                                    .unwrap_or_else(|| get_associated_token_address(&config.pubkey, mint));
 
-                                // 🔍 主动链上确认：轮询签名状态 → 查 ATA 余额 → 修正真实价格
                                 BuyConfirmer::spawn_confirm_task(
                                     rpc_client.clone(),
                                     auto_sell_manager.clone(),
                                     bc_cache.clone(),
                                     ata_cache.clone(),
                                     sol_usd.clone(),
+                                    position_key,
+                                    group.name.clone(),
                                     *mint,
                                     sig,
                                     config.pubkey,
                                     buy_lamports,
                                     user_ata,
                                     estimated_tokens_raw,
+                                    pre_buy_ata_balance,
                                     tg.clone(),
-                                );
-
-                                info!(
-                                    "持仓已记录 (CONFIRMING) | 链上确认已启动 | 当前: {}",
-                                    auto_sell_manager.position_count(),
                                 );
                             }
                         }
-                        Err(e) => error!(
-                            "Fire-and-forget 发送错误: {} | queue={} | prefetch={} | quote_build={} | tx_build={} | send_call={} | total={}",
-                            e,
-                            format_latency(timings.queue),
-                            format_latency(timings.prefetch_wait),
-                            format_latency(timings.quote_build),
-                            format_latency(timings.tx_build),
-                            format_latency(timings.send_call),
-                            format_latency(detected_at.elapsed()),
-                        ),
+                        Err(err) => {
+                            error!("Buy send failed [{}] {}: {}", group.name, &mint.to_string()[..12], err);
+                            tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
+                            tg.send(TgEvent::BuyFailed {
+                                group_name: group.name.clone(),
+                                mint: *mint,
+                                reason: err.to_string(),
+                            });
+                        }
                     }
                 }
-                Err(e) => error!(
-                    "交易构建失败: {} | queue={} | prefetch={} | quote_build={} | tx_build={}",
-                    e,
-                    format_latency(timings.queue),
-                    format_latency(timings.prefetch_wait),
-                    format_latency(timings.quote_build),
-                    format_latency(timings.tx_build),
-                ),
+                Err(err) => {
+                    error!("Buy tx build failed [{}] {}: {}", group.name, &mint.to_string()[..12], err);
+                    tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
-        Err(e) => error!(
-            "Pump.fun 内盘不可用: {} | queue={} | prefetch={} | quote_build={} (跳过此交易)",
-            e,
-            format_latency(timings.queue),
-            format_latency(timings.prefetch_wait),
-            format_latency(timings.quote_build),
-        ),
+        Err(err) => {
+            warn!("Buy skipped [{}] {}: {}", group.name, &mint.to_string()[..12], err);
+        }
     }
-
-    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 }
 
-// ============================================
-// Token Mint 提取（纯本地，零 RPC）
-// ============================================
+fn group_mint_key(group_id: &str, mint: &Pubkey) -> String {
+    format!("{}:{}", group_id, mint)
+}
 
-/// 从交易中提取 mint 和 token_program
-/// 优先使用 CPI 检测已识别的 token_mint（Sandwich Bot 路由场景）
-/// 回退到 Pump.fun 标准指令布局 accountKeys[2] + accountKeys[8]
 fn extract_token_info(trade: &DetectedTrade) -> Option<(Pubkey, Pubkey)> {
-    // CPI 检测已识别 mint（通过 PDA 验证）
     if let Some(mint) = trade.token_mint {
-        // CPI 场景下 token_program 默认 TokenLegacy（Pump.fun 内盘绝大多数是 TokenLegacy）
         let token_program =
-            solana_sdk::pubkey::Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-                .unwrap();
+            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok()?;
         return Some((mint, token_program));
     }
-    // 标准 Pump.fun 直接调用布局
+
     if trade.instruction_accounts.len() >= 9 {
         let mint = trade.instruction_accounts[2];
         let token_program = trade.instruction_accounts[8];
@@ -1030,6 +759,7 @@ fn extract_token_info(trade: &DetectedTrade) -> Option<(Pubkey, Pubkey)> {
             return Some((mint, token_program));
         }
     }
+
     None
 }
 

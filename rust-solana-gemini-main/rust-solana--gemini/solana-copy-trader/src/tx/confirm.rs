@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use crate::autosell::AutoSellManager;
+use crate::autosell::{AutoSellManager, PositionKey};
 use crate::grpc::{AtaBalanceCache, BondingCurveCache};
 use crate::telegram::{TgEvent, TgNotifier};
 use crate::utils::sol_price::SolUsdPrice;
@@ -24,19 +24,11 @@ pub fn format_price_gmgn(usd: f64) -> String {
     if usd >= 0.01 {
         return format!("${:.4}", usd);
     }
-
-    let s = format!("{:.15}", usd);
-    if let Some(dot_pos) = s.find('.') {
-        let decimals = &s[dot_pos + 1..];
-        let leading_zeros = decimals.chars().take_while(|&c| c == '0').count();
-        if leading_zeros > 0 {
-            let significant = &decimals[leading_zeros..];
-            let sig_digits: String = significant.chars().take(4).collect();
-            return format!("$0.0{}{}", to_subscript(leading_zeros), sig_digits);
-        }
+    if usd >= 0.000001 {
+        return trim_trailing_zeros(format!("${:.8}", usd));
     }
 
-    format!("${:.6}", usd)
+    trim_trailing_zeros(format!("${:.12}", usd))
 }
 
 pub fn format_mcap_usd(usd: f64) -> String {
@@ -49,16 +41,13 @@ pub fn format_mcap_usd(usd: f64) -> String {
     }
 }
 
-fn to_subscript(n: usize) -> String {
-    let subscripts = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
-    if n < 10 {
-        subscripts[n].to_string()
-    } else {
-        n.to_string()
-            .chars()
-            .map(|c| subscripts[c.to_digit(10).unwrap_or(0) as usize])
-            .collect()
+fn trim_trailing_zeros(value: String) -> String {
+    if !value.contains('.') {
+        return value;
     }
+
+    let trimmed = value.trim_end_matches('0').trim_end_matches('.');
+    trimmed.to_string()
 }
 
 impl BuyConfirmer {
@@ -70,18 +59,22 @@ impl BuyConfirmer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_confirm_task(
         rpc_client: Arc<RpcClient>,
         auto_sell: Arc<AutoSellManager>,
         bc_cache: BondingCurveCache,
         ata_cache: AtaBalanceCache,
         sol_usd: SolUsdPrice,
+        position_key: PositionKey,
+        group_name: String,
         mint: Pubkey,
         signature: Signature,
         user_pubkey: Pubkey,
         entry_sol_amount: u64,
         user_ata: Pubkey,
         estimated_tokens_raw: u64,
+        pre_buy_ata_balance: u64,
         tg: TgNotifier,
     ) {
         tokio::spawn(async move {
@@ -90,22 +83,24 @@ impl BuyConfirmer {
             let buy_sol = entry_sol_amount as f64 / 1e9;
 
             info!(
-                "链上确认启动: {} | sig: {}",
+                "Buy confirm started: [{}] {} | sig: {}",
+                group_name,
                 mint_short,
                 &signature.to_string()[..16],
             );
 
-            let mut confirmed = false;
+            let mut signature_confirmed = false;
             let mut token_balance = 0u64;
             let max_wait = Duration::from_secs(10);
 
             while start.elapsed() < max_wait {
                 if token_balance == 0 {
                     if let Some(cached_balance) = ata_cache.get(&mint) {
-                        if cached_balance > 0 {
+                        if cached_balance > pre_buy_ata_balance {
                             token_balance = cached_balance;
                             info!(
-                                "链上确认: {} gRPC 缓存命中 ATA 余额: {} | {:.0}ms",
+                                "Buy confirm cache hit: [{}] {} | ata_balance={} | {}ms",
+                                group_name,
                                 mint_short,
                                 cached_balance,
                                 start.elapsed().as_millis(),
@@ -114,7 +109,7 @@ impl BuyConfirmer {
                     }
                 }
 
-                let status_task = if confirmed {
+                let status_task = if signature_confirmed {
                     None
                 } else {
                     let rpc = rpc_client.clone();
@@ -124,7 +119,7 @@ impl BuyConfirmer {
                     }))
                 };
 
-                let ata_task = if token_balance > 0 {
+                let ata_task = if token_balance > pre_buy_ata_balance {
                     None
                 } else {
                     let rpc = rpc_client.clone();
@@ -138,43 +133,58 @@ impl BuyConfirmer {
                     match status_task.await {
                         Ok(Ok(response)) => {
                             if let Some(Some(status)) = response.value.first() {
-                                if status.err.is_some() {
+                                if let Some(err) = &status.err {
                                     warn!(
-                                        "链上确认: {} 交易失败 | err: {:?} | {:.0}ms",
+                                        "Buy confirm on-chain failure: [{}] {} | err: {:?} | {}ms",
+                                        group_name,
                                         mint_short,
-                                        status.err,
+                                        err,
                                         start.elapsed().as_millis(),
                                     );
-                                    auto_sell.confirm_failed(&mint, "tx failed on-chain");
+                                    auto_sell.confirm_failed(&position_key, "tx failed on-chain");
                                     tg.send(TgEvent::BuyFailed {
+                                        group_name: group_name.clone(),
                                         mint,
-                                        reason: format!("链上交易失败: {:?}", status.err),
+                                        reason: format!("tx failed on-chain: {:?}", err),
                                     });
                                     return;
                                 }
-                                confirmed = true;
+
+                                signature_confirmed = true;
                                 debug!(
-                                    "链上确认: {} 签名已确认 | {:.0}ms",
+                                    "Buy confirm signature seen: [{}] {} | {}ms",
+                                    group_name,
                                     mint_short,
                                     start.elapsed().as_millis(),
                                 );
                             }
                         }
-                        Ok(Err(e)) => {
-                            debug!("链上确认 RPC 错误: {} ({})", e, mint_short);
+                        Ok(Err(err)) => {
+                            debug!(
+                                "Buy confirm signature RPC error: [{}] {} | {}",
+                                group_name,
+                                mint_short,
+                                err,
+                            );
                         }
-                        Err(e) => {
-                            debug!("链上确认任务错误: {} ({})", e, mint_short);
+                        Err(err) => {
+                            debug!(
+                                "Buy confirm signature task error: [{}] {} | {}",
+                                group_name,
+                                mint_short,
+                                err,
+                            );
                         }
                     }
                 }
 
                 if token_balance == 0 {
                     if let Some(cached_balance) = ata_cache.get(&mint) {
-                        if cached_balance > 0 {
+                        if cached_balance > pre_buy_ata_balance {
                             token_balance = cached_balance;
                             info!(
-                                "链上确认: {} gRPC 缓存命中 ATA 余额: {} | {:.0}ms",
+                                "Buy confirm cache hit: [{}] {} | ata_balance={} | {}ms",
+                                group_name,
                                 mint_short,
                                 cached_balance,
                                 start.elapsed().as_millis(),
@@ -183,56 +193,63 @@ impl BuyConfirmer {
                     }
                 }
 
-                if token_balance == 0 {
+                if token_balance <= pre_buy_ata_balance {
                     if let Some(ata_task) = ata_task {
                         match ata_task.await {
                             Ok(Ok(balance)) => {
                                 let parsed = balance.amount.parse::<u64>().unwrap_or(0);
-                                if parsed > 0 {
+                                if parsed > pre_buy_ata_balance {
                                     token_balance = parsed;
                                     info!(
-                                        "链上确认: {} RPC ATA 余额: {} | {:.0}ms",
+                                        "Buy confirm RPC ATA hit: [{}] {} | ata_balance={} | {}ms",
+                                        group_name,
                                         mint_short,
                                         parsed,
                                         start.elapsed().as_millis(),
                                     );
                                 }
                             }
-                            Ok(Err(e)) => {
+                            Ok(Err(err)) => {
                                 debug!(
-                                    "链上确认: {} ATA RPC 查询失败: {} | {:.0}ms",
+                                    "Buy confirm ATA RPC error: [{}] {} | {}",
+                                    group_name,
                                     mint_short,
-                                    e,
-                                    start.elapsed().as_millis(),
+                                    err,
                                 );
                             }
-                            Err(e) => {
-                                debug!("链上确认: {} ATA 任务错误: {}", mint_short, e);
+                            Err(err) => {
+                                debug!(
+                                    "Buy confirm ATA task error: [{}] {} | {}",
+                                    group_name,
+                                    mint_short,
+                                    err,
+                                );
                             }
                         }
                     }
                 }
 
-                if token_balance > 0 {
-                    confirmed = true;
+                if token_balance > pre_buy_ata_balance {
+                    signature_confirmed = true;
                     break;
                 }
 
                 tokio::time::sleep(Self::poll_interval(start.elapsed())).await;
             }
 
-            if confirmed && token_balance == 0 {
+            if signature_confirmed && token_balance <= pre_buy_ata_balance {
                 warn!(
-                    "链上确认: {} 签名已确认但 ATA 余额为 0 | {:.0}ms | 尝试 getTransaction",
+                    "Buy confirm fallback to getTransaction: [{}] {} | {}ms",
+                    group_name,
                     mint_short,
                     start.elapsed().as_millis(),
                 );
 
-                let rpc2 = rpc_client.clone();
-                let sig2 = signature;
+                let rpc = rpc_client.clone();
+                let sig = signature;
                 let tx_detail = tokio::task::spawn_blocking(move || {
-                    rpc2.get_transaction(
-                        &sig2,
+                    rpc.get_transaction(
+                        &sig,
                         solana_transaction_status::UiTransactionEncoding::JsonParsed,
                     )
                 })
@@ -242,22 +259,26 @@ impl BuyConfirmer {
                     Ok(Ok(tx)) => {
                         if let Some(meta) = &tx.transaction.meta {
                             use solana_transaction_status::option_serializer::OptionSerializer;
+
                             if let OptionSerializer::Some(ref token_balances) =
                                 meta.post_token_balances
                             {
                                 let user_str = user_pubkey.to_string();
-                                for tb in token_balances.iter() {
+                                for tb in token_balances {
                                     let owner_match = match &tb.owner {
                                         OptionSerializer::Some(owner) => owner == &user_str,
                                         _ => false,
                                     };
+
                                     if owner_match {
-                                        if let Ok(amount) = tb.ui_token_amount.amount.parse::<u64>()
+                                        if let Ok(amount) =
+                                            tb.ui_token_amount.amount.parse::<u64>()
                                         {
-                                            if amount > 0 {
+                                            if amount > pre_buy_ata_balance {
                                                 token_balance = amount;
                                                 info!(
-                                                    "链上确认: {} 从交易详情提取余额: {} | {:.0}ms",
+                                                    "Buy confirm tx detail hit: [{}] {} | ata_balance={} | {}ms",
+                                                    group_name,
                                                     mint_short,
                                                     token_balance,
                                                     start.elapsed().as_millis(),
@@ -270,21 +291,36 @@ impl BuyConfirmer {
                             }
                         }
                     }
-                    Ok(Err(e)) => warn!("链上确认: {} getTransaction 失败: {}", mint_short, e),
-                    Err(e) => warn!("链上确认: {} getTransaction 任务错误: {}", mint_short, e),
+                    Ok(Err(err)) => {
+                        warn!(
+                            "Buy confirm getTransaction failed: [{}] {} | {}",
+                            group_name,
+                            mint_short,
+                            err,
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Buy confirm getTransaction task failed: [{}] {} | {}",
+                            group_name,
+                            mint_short,
+                            err,
+                        );
+                    }
                 }
             }
 
-            if token_balance > 0 {
-                let display_tokens = token_balance as f64 / 1e6;
+            if token_balance > pre_buy_ata_balance {
+                let actual_delta = token_balance.saturating_sub(pre_buy_ata_balance);
+                let display_tokens = actual_delta as f64 / 1e6;
                 let bc_price = bc_cache
                     .get(&mint)
-                    .map(|s| s.price_sol())
-                    .filter(|p| *p > 0.0);
+                    .map(|state| state.price_sol())
+                    .filter(|price| *price > 0.0);
                 let current_market_price = bc_price.unwrap_or(0.0);
 
-                let entry_price = if let Some(p) = bc_price {
-                    p
+                let entry_price = if let Some(price) = bc_price {
+                    price
                 } else if display_tokens > 0.0 {
                     buy_sol / display_tokens
                 } else {
@@ -317,32 +353,47 @@ impl BuyConfirmer {
                     bc_price
                 };
 
-                auto_sell.confirm_success(&mint, token_balance, entry_price_for_position);
+                let open_positions = auto_sell.open_position_count_for_mint(&mint);
+                let assigned_amount = if open_positions <= 1 && actual_delta > 0 {
+                    actual_delta
+                } else if estimated_tokens_raw > 0 {
+                    estimated_tokens_raw
+                } else {
+                    actual_delta
+                };
+
+                auto_sell.confirm_success(
+                    &position_key,
+                    assigned_amount.max(1),
+                    entry_price_for_position,
+                );
 
                 let mcap_str = format_mcap_usd(mcap_usd);
+                let info_position_key = position_key.clone();
                 let rpc_info = rpc_client.clone();
                 let auto_sell_info = auto_sell.clone();
                 let mint_info = mint;
                 let entry_mcap_sol_val = mcap_sol;
                 tokio::spawn(async move {
-                    let ti =
+                    let token_info =
                         crate::utils::token_info::fetch_token_info(&rpc_info, &mint_info).await;
-                    let name = if ti.name.is_empty() {
-                        let ms = mint_info.to_string();
-                        format!("{}..{}", &ms[..6], &ms[ms.len() - 4..])
+                    let name = if token_info.name.is_empty() {
+                        short_pubkey(&mint_info)
                     } else {
-                        ti.name.clone()
+                        token_info.name.clone()
                     };
-                    auto_sell_info.update_token_info(&mint_info, name, entry_mcap_sol_val);
+                    auto_sell_info.update_token_info(
+                        &info_position_key,
+                        name,
+                        entry_mcap_sol_val,
+                    );
                 });
 
-                let token_name_short = {
-                    let ms = mint.to_string();
-                    format!("{}..{}", &ms[..6], &ms[ms.len() - 4..])
-                };
+                let token_name_short = short_pubkey(&mint);
 
                 info!(
-                    "✅ 持仓确认: {} | {:.0} tokens | 成本: {} | 市值: {} | PnL: {:.2}% | 滑点: {:.1}% | 价值: {:.4} SOL (${:.2}) | {:.0}ms",
+                    "Buy confirmed: [{}] {} | {:.0} tokens | cost={} | mcap={} | pnl={:.2}% | slippage={:.1}% | value={:.4} SOL (${:.2}) | {}ms",
+                    group_name,
                     mint_short,
                     display_tokens,
                     cost_usd,
@@ -355,56 +406,63 @@ impl BuyConfirmer {
                 );
 
                 tg.send(TgEvent::BuyConfirmed {
+                    group_name: group_name.clone(),
                     mint,
                     token_name: token_name_short,
                     spent_sol: buy_sol,
-                    cost_price_usd: cost_usd.clone(),
+                    cost_price_usd: cost_usd,
                     mcap_usd: mcap_str,
                 });
 
+                let bg_position_key = position_key.clone();
                 let rpc_bg = rpc_client.clone();
                 let auto_sell_bg = auto_sell.clone();
-                let display_tokens_bg = display_tokens;
                 tokio::spawn(async move {
                     if let Some(actual_sol) =
                         Self::get_actual_sol_spent(&rpc_bg, signature, &user_pubkey).await
                     {
-                        let real_price = if display_tokens_bg > 0.0 {
-                            actual_sol / display_tokens_bg
+                        let real_price = if display_tokens > 0.0 {
+                            actual_sol / display_tokens
                         } else {
                             0.0
                         };
+
                         if real_price > 0.0 {
-                            auto_sell_bg.update_entry_price(&mint, real_price);
+                            auto_sell_bg.update_entry_price(&bg_position_key, real_price);
                             debug!(
-                                "入场价修正: {} | {:.10} SOL/token",
+                                "Buy entry price updated: {} | {:.10} SOL/token",
                                 &mint.to_string()[..12],
                                 real_price,
                             );
                         }
                     }
                 });
-            } else if confirmed {
+            } else if signature_confirmed {
                 warn!(
-                    "链上确认: {} 交易已确认但余额为 0 → 删除仓位 | {:.0}ms",
+                    "Buy confirmed but ATA unchanged: [{}] {} | {}ms",
+                    group_name,
                     mint_short,
                     start.elapsed().as_millis(),
                 );
-                auto_sell.confirm_failed(&mint, "confirmed but zero balance");
+                auto_sell.confirm_failed(&position_key, "confirmed but zero balance");
                 tg.send(TgEvent::BuyFailed {
+                    group_name: group_name.clone(),
                     mint,
-                    reason: "交易已确认但余额为 0".to_string(),
+                    reason: "transaction confirmed but ATA balance did not increase".to_string(),
                 });
             } else {
                 warn!(
-                    "链上确认: {} 超时且余额为 0 → 删除仓位 | {:.0}ms",
+                    "Buy confirm timeout: [{}] {} | {}ms",
+                    group_name,
                     mint_short,
                     start.elapsed().as_millis(),
                 );
-                auto_sell.confirm_failed(&mint, "timeout with zero balance");
+                auto_sell.confirm_failed(&position_key, "timeout with zero balance");
                 tg.send(TgEvent::BuyFailed {
+                    group_name,
                     mint,
-                    reason: "确认超时且余额为 0".to_string(),
+                    reason: "buy confirmation timed out and ATA balance stayed unchanged"
+                        .to_string(),
                 });
             }
         });
@@ -416,11 +474,10 @@ impl BuyConfirmer {
         user_pubkey: &Pubkey,
     ) -> Option<f64> {
         let rpc = rpc_client.clone();
-        let sig = signature;
         let user = *user_pubkey;
 
         let result = tokio::task::spawn_blocking(move || {
-            rpc.get_transaction(&sig, solana_transaction_status::UiTransactionEncoding::Json)
+            rpc.get_transaction(&signature, solana_transaction_status::UiTransactionEncoding::Json)
         })
         .await;
 
@@ -434,7 +491,7 @@ impl BuyConfirmer {
                                 msg.account_keys.clone()
                             }
                             solana_transaction_status::UiMessage::Parsed(msg) => {
-                                msg.account_keys.iter().map(|k| k.pubkey.clone()).collect()
+                                msg.account_keys.iter().map(|entry| entry.pubkey.clone()).collect()
                             }
                         }
                     }
@@ -442,61 +499,67 @@ impl BuyConfirmer {
                 };
 
                 let user_str = user.to_string();
-                let user_idx = account_keys.iter().position(|k| k == &user_str)?;
+                let user_idx = account_keys.iter().position(|key| key == &user_str)?;
 
                 let pre_balance = meta.pre_balances.get(user_idx)?;
                 let post_balance = meta.post_balances.get(user_idx)?;
-
-                if pre_balance > post_balance {
-                    let total_spent = pre_balance - post_balance;
-                    let fee = meta.fee;
-                    let mut deductions = fee;
-
-                    use solana_transaction_status::option_serializer::OptionSerializer;
-                    let has_new_ata = if let (
-                        OptionSerializer::Some(ref pre_tb),
-                        OptionSerializer::Some(ref post_tb),
-                    ) = (&meta.pre_token_balances, &meta.post_token_balances)
-                    {
-                        let user_str = user.to_string();
-                        let pre_has_user = pre_tb.iter().any(|tb| {
-                            matches!(&tb.owner, OptionSerializer::Some(o) if o == &user_str)
-                        });
-                        let post_has_user = post_tb.iter().any(|tb| {
-                            matches!(&tb.owner, OptionSerializer::Some(o) if o == &user_str)
-                        });
-                        !pre_has_user && post_has_user
-                    } else {
-                        false
-                    };
-
-                    if has_new_ata {
-                        deductions += ATA_RENT;
-                    }
-
-                    let token_cost = total_spent.saturating_sub(deductions);
-                    let sol = token_cost as f64 / 1e9;
-                    debug!(
-                        "实际 SOL 花费: {:.6} SOL (total={}, fee={}, ata_rent={}, token_cost={})",
-                        sol,
-                        total_spent,
-                        fee,
-                        if has_new_ata { ATA_RENT } else { 0 },
-                        token_cost,
-                    );
-                    Some(sol)
-                } else {
-                    None
+                if pre_balance <= post_balance {
+                    return None;
                 }
+
+                let total_spent = pre_balance - post_balance;
+                let fee = meta.fee;
+                let mut deductions = fee;
+
+                use solana_transaction_status::option_serializer::OptionSerializer;
+
+                let has_new_ata = if let (
+                    OptionSerializer::Some(ref pre_tb),
+                    OptionSerializer::Some(ref post_tb),
+                ) = (&meta.pre_token_balances, &meta.post_token_balances)
+                {
+                    let pre_has_user = pre_tb.iter().any(|tb| {
+                        matches!(&tb.owner, OptionSerializer::Some(owner) if owner == &user_str)
+                    });
+                    let post_has_user = post_tb.iter().any(|tb| {
+                        matches!(&tb.owner, OptionSerializer::Some(owner) if owner == &user_str)
+                    });
+                    !pre_has_user && post_has_user
+                } else {
+                    false
+                };
+
+                if has_new_ata {
+                    deductions += ATA_RENT;
+                }
+
+                let token_cost = total_spent.saturating_sub(deductions);
+                let sol = token_cost as f64 / 1e9;
+
+                debug!(
+                    "Actual SOL spent: {:.6} SOL (total={}, fee={}, ata_rent={}, token_cost={})",
+                    sol,
+                    total_spent,
+                    fee,
+                    if has_new_ata { ATA_RENT } else { 0 },
+                    token_cost,
+                );
+
+                Some(sol)
             }
-            Ok(Err(e)) => {
-                debug!("getTransaction 失败: {}", e);
+            Ok(Err(err)) => {
+                debug!("getTransaction failed: {}", err);
                 None
             }
-            Err(e) => {
-                debug!("getTransaction 任务错误: {}", e);
+            Err(err) => {
+                debug!("getTransaction join error: {}", err);
                 None
             }
         }
     }
+}
+
+fn short_pubkey(pubkey: &Pubkey) -> String {
+    let value = pubkey.to_string();
+    format!("{}..{}", &value[..6], &value[value.len() - 4..])
 }

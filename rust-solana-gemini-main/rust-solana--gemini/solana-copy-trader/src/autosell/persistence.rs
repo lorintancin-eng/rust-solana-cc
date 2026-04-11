@@ -2,16 +2,17 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::path::Path;
-use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use super::position::{Position, PositionState};
+use super::position::{Position, PositionKey, PositionState};
 
 const POSITIONS_FILE: &str = "positions.json";
 
 /// 可序列化的仓位数据（用于 JSON 持久化）
 #[derive(Serialize, Deserialize, Debug)]
 struct SavedPosition {
+    group_id: String,
+    group_name: String,
     token_mint: String,
     state: String,
     entry_sol_amount: u64,
@@ -31,7 +32,7 @@ struct SavedPosition {
 }
 
 /// 保存所有活跃仓位到 positions.json
-pub fn save_positions(positions: &DashMap<Pubkey, Position>) {
+pub fn save_positions(positions: &DashMap<PositionKey, Position>) {
     let saved: Vec<SavedPosition> = positions
         .iter()
         .filter(|p| {
@@ -44,6 +45,8 @@ pub fn save_positions(positions: &DashMap<Pubkey, Position>) {
             )
         })
         .map(|p| SavedPosition {
+            group_id: p.group.id.clone(),
+            group_name: p.group.name.clone(),
             token_mint: p.token_mint.to_string(),
             state: p.state.to_string(),
             entry_sol_amount: p.entry_sol_amount,

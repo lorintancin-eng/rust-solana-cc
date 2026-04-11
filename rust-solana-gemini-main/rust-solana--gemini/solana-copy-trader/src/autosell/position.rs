@@ -2,6 +2,8 @@ use solana_sdk::pubkey::Pubkey;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+use crate::groups::CopyGroup;
+
 // ============================================
 // 仓位状态机
 // Pending → Submitted → Confirming → Active → Selling → Closed
@@ -55,6 +57,7 @@ pub struct SellAccountSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct Position {
+    pub group: CopyGroup,
     pub token_mint: Pubkey,
     pub state: PositionState,
 
@@ -80,20 +83,30 @@ pub struct Position {
     pub buy_signature: String,
     pub sell_signature: Option<String>,
     pub sell_snapshot: Option<SellAccountSnapshot>,
+    pub pre_buy_ata_balance: u64,
 
     // 重试计数
     pub sell_attempts: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PositionKey {
+    pub group_id: String,
+    pub token_mint: Pubkey,
+}
+
 impl Position {
     /// 创建新仓位（Pending 状态）
     pub fn new(
+        group: CopyGroup,
         token_mint: Pubkey,
         entry_sol_amount: u64,
         entry_price_sol: f64,
         source_wallet: Pubkey,
+        pre_buy_ata_balance: u64,
     ) -> Self {
         Self {
+            group,
             token_mint,
             state: PositionState::Pending,
             entry_sol_amount,
@@ -109,7 +122,15 @@ impl Position {
             buy_signature: String::new(),
             sell_signature: None,
             sell_snapshot: None,
+            pre_buy_ata_balance,
             sell_attempts: 0,
+        }
+    }
+
+    pub fn key(&self) -> PositionKey {
+        PositionKey {
+            group_id: self.group.id.clone(),
+            token_mint: self.token_mint,
         }
     }
 
@@ -258,6 +279,20 @@ impl Position {
         true
     }
 
+    pub fn restore_after_sell_attempt(&mut self, previous_state: PositionState) -> bool {
+        self.state = previous_state;
+        true
+    }
+
+    pub fn apply_partial_sell(&mut self, sold_amount: u64) -> bool {
+        if sold_amount == 0 || sold_amount > self.token_amount {
+            return false;
+        }
+        self.token_amount = self.token_amount.saturating_sub(sold_amount);
+        self.state = PositionState::Active;
+        true
+    }
+
     // ============================================
     // 价格更新和 PnL 计算
     // ============================================
@@ -348,7 +383,8 @@ impl std::fmt::Display for SellReason {
 /// 卖出信号
 #[derive(Debug, Clone)]
 pub struct SellSignal {
-    pub token_mint: Pubkey,
+    pub position_key: PositionKey,
+    pub group_name: String,
     pub reason: SellReason,
     pub current_price: f64,
     pub pnl_percent: f64,

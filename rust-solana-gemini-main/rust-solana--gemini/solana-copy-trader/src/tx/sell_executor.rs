@@ -3,13 +3,13 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address;
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
 use crate::autosell::{
-    AutoSellManager, Position, PositionState, SellAccountSnapshot, SellReason, SellSignal,
+    AutoSellManager, Position, PositionKey, SellAccountSnapshot, SellReason, SellSignal,
 };
-use crate::config::{AppConfig, DynConfig, SELL_MODE_FOLLOW};
+use crate::config::AppConfig;
 use crate::grpc::{AccountSubscriber, AtaBalanceCache, BondingCurveCache};
 use crate::processor::prefetch::PrefetchCache;
 use crate::processor::pumpfun::PumpfunProcessor;
@@ -23,9 +23,6 @@ const MAX_SELL_RETRIES: u32 = 3;
 const FAST_FIRST_CONFIRM_MS: u64 = 1_500;
 const RETRY_CONFIRM_MS: u64 = 2_500;
 const DEFAULT_CONFIRM_MS: u64 = 3_000;
-const BALANCE_RETRY_INTERVAL_MS: u64 = 80;
-const STABLE_BALANCE_RETRIES: u32 = 4;
-const FOLLOW_BALANCE_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct SellPathTimings {
@@ -43,8 +40,8 @@ struct SellConfirmTrace {
     confirmed: bool,
     source: &'static str,
     signature_seen: Option<Duration>,
-    rpc_ata_zero: Option<Duration>,
-    cache_ata_zero: Option<Duration>,
+    rpc_ata_target: Option<Duration>,
+    cache_ata_target: Option<Duration>,
     total: Duration,
 }
 
@@ -64,7 +61,6 @@ fn render_optional_latency(duration: Option<Duration>) -> String {
 
 pub struct SellExecutor {
     config: AppConfig,
-    dyn_config: Arc<DynConfig>,
     rpc_client: Arc<RpcClient>,
     pumpfun: Arc<PumpfunProcessor>,
     tx_sender: Arc<TxSender>,
@@ -79,92 +75,8 @@ pub struct SellExecutor {
 }
 
 impl SellExecutor {
-    fn confirm_timeout_ms(reason: SellReason, attempt: u32) -> u64 {
-        match reason {
-            SellReason::FollowSell => {
-                if attempt == 1 {
-                    FAST_FIRST_CONFIRM_MS
-                } else {
-                    RETRY_CONFIRM_MS
-                }
-            }
-            _ => DEFAULT_CONFIRM_MS,
-        }
-    }
-
-    fn follow_mode_active(&self) -> bool {
-        self.dyn_config.sell_mode() == SELL_MODE_FOLLOW
-    }
-
-    fn should_use_aggressive_follow_path(&self, signal: &SellSignal) -> bool {
-        self.follow_mode_active() && signal.reason == SellReason::FollowSell
-    }
-
-    async fn resolve_sell_balance(
-        &self,
-        mint: &Pubkey,
-        user_ata: &Pubkey,
-        aggressive_follow: bool,
-    ) -> Option<u64> {
-        if let Some(balance) = self.ata_cache.get(mint) {
-            if balance > 0 {
-                return Some(balance);
-            }
-        }
-
-        let estimated_balance = self
-            .auto_sell
-            .get_position(mint)
-            .map(|pos| pos.token_amount)
-            .filter(|amount| *amount > 0);
-
-        let retries = if aggressive_follow {
-            FOLLOW_BALANCE_RETRIES
-        } else {
-            STABLE_BALANCE_RETRIES
-        };
-
-        for attempt in 1..=retries {
-            let rpc_balance = self.get_token_balance_rpc(user_ata);
-            if rpc_balance > 0 {
-                return Some(rpc_balance);
-            }
-
-            if aggressive_follow {
-                if let Some(amount) = estimated_balance {
-                    info!(
-                        "Follow mode: using estimated token amount before buy confirm: {}.. | amount: {} | attempt={}/{}",
-                        &mint.to_string()[..12],
-                        amount,
-                        attempt,
-                        retries,
-                    );
-                    return Some(amount);
-                }
-            }
-
-            if attempt < retries {
-                tokio::time::sleep(Duration::from_millis(BALANCE_RETRY_INTERVAL_MS)).await;
-                if let Some(balance) = self.ata_cache.get(mint) {
-                    if balance > 0 {
-                        return Some(balance);
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    fn restore_after_skipped_sell(&self, previous_position: &Position) {
-        let mut restored = previous_position.clone();
-        restored.sell_attempts += 1;
-        self.auto_sell.add_position(restored);
-    }
-
     pub fn new(
         config: AppConfig,
-        dyn_config: Arc<DynConfig>,
         rpc_client: Arc<RpcClient>,
         pumpfun: Arc<PumpfunProcessor>,
         tx_sender: Arc<TxSender>,
@@ -178,7 +90,6 @@ impl SellExecutor {
     ) -> Self {
         Self {
             config,
-            dyn_config,
             rpc_client,
             pumpfun,
             tx_sender,
@@ -193,15 +104,54 @@ impl SellExecutor {
         }
     }
 
-    /// Pump.fun direct sell: local instruction build -> TxBuilder -> multi-channel send.
-    /// Sell path never uses 0slot to avoid extra fee broadcasts on exit.
+    fn confirm_timeout_ms(reason: SellReason, attempt: u32) -> u64 {
+        match reason {
+            SellReason::FollowSell if attempt == 1 => FAST_FIRST_CONFIRM_MS,
+            SellReason::FollowSell => RETRY_CONFIRM_MS,
+            _ => DEFAULT_CONFIRM_MS,
+        }
+    }
+
+    async fn resolve_sell_snapshot(&self, position: &Position) -> Result<SellAccountSnapshot> {
+        if let Some(snapshot) = position.sell_snapshot.clone() {
+            return Ok(snapshot);
+        }
+
+        self.prefetch_cache
+            .get(&position.token_mint)
+            .map(|prefetched| SellAccountSnapshot {
+                bonding_curve: prefetched.bonding_curve,
+                associated_bonding_curve: prefetched.associated_bonding_curve,
+                user_ata: prefetched.user_ata,
+                token_program: prefetched.token_program,
+                mirror_accounts: prefetched.mirror_accounts,
+                source_wallet: prefetched.source_wallet,
+            })
+            .ok_or_else(|| anyhow::anyhow!("no sell snapshot"))
+    }
+
+    fn get_token_balance_rpc(&self, user_ata: &Pubkey) -> u64 {
+        self.rpc_client
+            .get_token_account_balance(user_ata)
+            .map(|value| value.amount.parse::<u64>().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    fn cleanup_mint_if_unused(&self, mint: &Pubkey) {
+        if self.auto_sell.open_position_count_for_mint(mint) == 0 {
+            self.ata_cache.remove(mint);
+            self.account_subscriber.untrack_mint(mint);
+            self.prefetch_cache.remove(mint);
+        }
+    }
+
     async fn try_pumpfun_sell(
         &self,
-        mint: &Pubkey,
+        position: &Position,
         token_amount: u64,
-        signal_received_at: std::time::Instant,
+        signal_received_at: Instant,
     ) -> Result<(String, SellPathTimings)> {
-        let sell_start = std::time::Instant::now();
+        let sell_start = Instant::now();
         let mut timings = SellPathTimings {
             signal_queue: sell_start.saturating_duration_since(signal_received_at),
             snapshot_load: Duration::default(),
@@ -212,30 +162,14 @@ impl SellExecutor {
             total: Duration::default(),
         };
 
-        let snapshot_load_start = std::time::Instant::now();
-        let snapshot = self
-            .auto_sell
-            .get_position(mint)
-            .and_then(|pos| pos.sell_snapshot)
-            .or_else(|| {
-                self.prefetch_cache.get(mint).map(|pf| SellAccountSnapshot {
-                    bonding_curve: pf.bonding_curve,
-                    associated_bonding_curve: pf.associated_bonding_curve,
-                    user_ata: pf.user_ata,
-                    token_program: pf.token_program,
-                    mirror_accounts: pf.mirror_accounts,
-                    source_wallet: pf.source_wallet,
-                })
-            })
-            .ok_or_else(|| anyhow::anyhow!("no sell snapshot"))?;
+        let group_config = position.group.to_app_config(&self.config);
+
+        let snapshot_load_start = Instant::now();
+        let snapshot = self.resolve_sell_snapshot(position).await?;
         timings.snapshot_load = snapshot_load_start.elapsed();
 
-        if snapshot.mirror_accounts.is_empty() {
-            anyhow::bail!("no mirror_accounts");
-        }
-
-        let bc_lookup_start = std::time::Instant::now();
-        let bc_state = if let Some(state) = self.bc_cache.get(mint) {
+        let bc_lookup_start = Instant::now();
+        let bc_state = if let Some(state) = self.bc_cache.get(&position.token_mint) {
             state
         } else {
             self.pumpfun
@@ -244,28 +178,16 @@ impl SellExecutor {
         };
         timings.bc_lookup = bc_lookup_start.elapsed();
 
-        if bc_state.complete {
-            anyhow::bail!("bonding curve completed");
-        }
-
-        let quote_build_start = std::time::Instant::now();
+        let quote_build_start = Instant::now();
         let expected_sol = bc_state.token_to_sol_quote(token_amount);
-        let slippage = self.dyn_config.sell_slippage_bps();
-        let min_sol_output = expected_sol.saturating_sub(expected_sol * slippage / 10_000);
-
-        info!(
-            "Pump.fun direct sell: {} tokens -> ~{:.4} SOL (min: {:.4}, slippage: {}bps)",
-            token_amount,
-            expected_sol as f64 / 1e9,
-            min_sol_output as f64 / 1e9,
-            slippage,
+        let min_sol_output = expected_sol.saturating_sub(
+            expected_sol * position.group.sell_slippage_bps / 10_000,
         );
         timings.quote_build = quote_build_start.elapsed();
 
         let creator = bc_state
             .creator
             .ok_or_else(|| anyhow::anyhow!("BC state missing creator"))?;
-
         let sell_ix = self.pumpfun.build_sell_instruction_from_mirror(
             &self.config.pubkey,
             &snapshot.user_ata,
@@ -281,131 +203,224 @@ impl SellExecutor {
             swap_instructions: vec![sell_ix],
             pre_instructions: vec![],
             post_instructions: vec![],
-            token_mint: *mint,
+            token_mint: position.token_mint,
             sol_amount: expected_sol,
         };
 
         let (blockhash, _) = self.blockhash_cache.get_sync();
-        let tx_build_start = std::time::Instant::now();
-        let transaction = if self.config.jito_enabled {
+        let tx_build_start = Instant::now();
+        let transaction = if group_config.jito_enabled {
             let tip = self.tx_sender.random_jito_tip_account();
             TxBuilder::build_jito_bundle_transaction(
                 &mirror,
-                &self.config,
-                &self.config.keypair,
+                &group_config,
+                &group_config.keypair,
                 blockhash,
                 &tip,
-                self.dyn_config.jito_sell_tip_lamports(),
+                position.group.tip_sell_lamports,
                 &[],
             )?
         } else {
             TxBuilder::build_transaction(
                 &mirror,
-                &self.config,
-                &self.config.keypair,
+                &group_config,
+                &group_config.keypair,
                 blockhash,
                 &[],
             )?
         };
         timings.build = tx_build_start.elapsed();
-        let send_call_start = std::time::Instant::now();
+
+        let send_call_start = Instant::now();
         let sig = self.tx_sender.fire_and_forget_without_0slot(&transaction)?;
         timings.send_call = send_call_start.elapsed();
         timings.total = sell_start.elapsed();
-        Ok((
-            sig.to_string(),
-            timings,
-        ))
+        Ok((sig.to_string(), timings))
     }
 
-    /// Handle sell signal, prefer Pump.fun direct sell, then fallback to Jupiter.
+    async fn try_jupiter_sell(&self, position: &Position, token_amount: u64) -> Result<String> {
+        let signed_tx_bytes = self.jupiter.build_sell_transaction(
+            &position.token_mint,
+            token_amount,
+            position.group.sell_slippage_bps,
+            &self.config.keypair,
+        ).await?;
+        let tx = bincode::deserialize(&signed_tx_bytes)?;
+        let sig = self.tx_sender.fire_and_forget_without_0slot(&tx)?;
+        Ok(sig.to_string())
+    }
+
+    async fn wait_sell_confirm(
+        &self,
+        position: &Position,
+        sig_str: &str,
+        max_wait_ms: u64,
+        expected_after_balance: u64,
+    ) -> SellConfirmTrace {
+        use solana_sdk::signature::Signature;
+
+        let Ok(sig) = sig_str.parse::<Signature>() else {
+            return SellConfirmTrace {
+                confirmed: false,
+                source: "invalid_signature",
+                signature_seen: None,
+                rpc_ata_target: None,
+                cache_ata_target: None,
+                total: Duration::default(),
+            };
+        };
+
+        let start = Instant::now();
+        let max_wait = Duration::from_millis(max_wait_ms);
+        let user_ata = position
+            .sell_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.user_ata)
+            .unwrap_or_else(|| get_associated_token_address(&self.config.pubkey, &position.token_mint));
+        let mut signature_seen = None;
+        let mut rpc_ata_target = None;
+        let mut cache_ata_target = None;
+
+        while start.elapsed() < max_wait {
+            if let Some(balance) = self.ata_cache.get(&position.token_mint) {
+                if balance <= expected_after_balance {
+                    cache_ata_target.get_or_insert_with(|| start.elapsed());
+                    return SellConfirmTrace {
+                        confirmed: true,
+                        source: "cache_ata_target",
+                        signature_seen,
+                        rpc_ata_target,
+                        cache_ata_target,
+                        total: start.elapsed(),
+                    };
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(80)).await;
+
+            if signature_seen.is_none() {
+                let rpc = self.rpc_client.clone();
+                let status = tokio::task::spawn_blocking(move || rpc.get_signature_statuses(&[sig]))
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok());
+                if let Some(statuses) = status {
+                    if let Some(Some(entry)) = statuses.value.first() {
+                        if entry.err.is_some() {
+                            return SellConfirmTrace {
+                                confirmed: false,
+                                source: "signature_error",
+                                signature_seen,
+                                rpc_ata_target,
+                                cache_ata_target,
+                                total: start.elapsed(),
+                            };
+                        }
+                        signature_seen = Some(start.elapsed());
+                    }
+                }
+            }
+
+            let rpc = self.rpc_client.clone();
+            let ata = user_ata;
+            let rpc_balance = tokio::task::spawn_blocking(move || {
+                rpc.get_token_account_balance(&ata)
+                    .map(|value| value.amount.parse::<u64>().unwrap_or(0))
+                    .unwrap_or(0)
+            })
+            .await
+            .unwrap_or(u64::MAX);
+
+            if rpc_balance <= expected_after_balance {
+                rpc_ata_target.get_or_insert_with(|| start.elapsed());
+                return SellConfirmTrace {
+                    confirmed: true,
+                    source: "rpc_ata_target",
+                    signature_seen,
+                    rpc_ata_target,
+                    cache_ata_target,
+                    total: start.elapsed(),
+                };
+            }
+
+            if signature_seen.is_some() && expected_after_balance == rpc_balance {
+                return SellConfirmTrace {
+                    confirmed: true,
+                    source: "signature_seen",
+                    signature_seen,
+                    rpc_ata_target,
+                    cache_ata_target,
+                    total: start.elapsed(),
+                };
+            }
+        }
+
+        SellConfirmTrace {
+            confirmed: false,
+            source: "timeout",
+            signature_seen,
+            rpc_ata_target,
+            cache_ata_target,
+            total: start.elapsed(),
+        }
+    }
+
     pub async fn handle_sell_signal(&self, signal: SellSignal) {
-        let sell_start = std::time::Instant::now();
-        let mint = signal.token_mint;
-        let Some(position_before_sell) = self.auto_sell.get_position(&mint) else {
-            warn!("卖出信号对应仓位不存在，跳过: {}", &mint.to_string()[..12]);
+        let Some(position_before_sell) = self.auto_sell.get_position(&signal.position_key) else {
             return;
         };
         let previous_state = position_before_sell.state;
-        let aggressive_follow = self.should_use_aggressive_follow_path(&signal);
+        let aggressive_follow =
+            position_before_sell.group.follow_sell_mode() && signal.reason == SellReason::FollowSell;
 
-        info!(
-            "收到卖出信号: {}.. | 原因: {} | 盈亏: {:.2}%",
-            &mint.to_string()[..12],
-            signal.reason,
-            signal.pnl_percent,
-        );
+        let snapshot = match self.resolve_sell_snapshot(&position_before_sell).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                warn!("Sell snapshot missing [{}]: {}", signal.group_name, err);
+                return;
+            }
+        };
 
-        info!(
-            "卖出模式路由: {} | previous_state={}",
-            if aggressive_follow {
-                "FOLLOW_AGGRESSIVE"
-            } else {
-                "TP_SL_STABLE"
-            },
-            previous_state,
-        );
+        let current_ata_balance = self
+            .ata_cache
+            .get(&position_before_sell.token_mint)
+            .unwrap_or_else(|| self.get_token_balance_rpc(&snapshot.user_ata));
+        let token_amount = if position_before_sell.token_amount > 0 {
+            position_before_sell.token_amount.min(current_ata_balance)
+        } else {
+            current_ata_balance
+        };
 
-        const MAX_TOTAL_SELL_ATTEMPTS: u32 = 3;
-        if position_before_sell.sell_attempts >= MAX_TOTAL_SELL_ATTEMPTS {
-            error!(
-                    "卖出已尝试 {} 次全部失败，放弃: {}",
-                position_before_sell.sell_attempts,
-                &mint.to_string()[..12],
+        if token_amount == 0 {
+            warn!(
+                "Skip sell [{}] {}: zero balance",
+                signal.group_name,
+                &position_before_sell.token_mint.to_string()[..12],
             );
-            self.auto_sell
-                .confirm_failed(&mint, "max sell attempts exceeded");
-            self.account_subscriber.untrack_mint(&mint);
-            self.prefetch_cache.remove(&mint);
             return;
         }
 
-        if !self.auto_sell.mark_selling(&mint) {
-            warn!("仓位不在可卖出状态，跳过");
+        if !self.auto_sell.mark_selling(&signal.position_key) {
             return;
         }
 
-        let user_ata = self
-            .prefetch_cache
-            .get(&mint)
-            .map(|pf| pf.user_ata)
-            .unwrap_or_else(|| get_associated_token_address(&self.config.pubkey, &mint));
-
-        let token_balance = self
-            .resolve_sell_balance(&mint, &user_ata, aggressive_follow)
-            .await
-            .unwrap_or(0);
-
-        if token_balance == 0 {
-            warn!("跳过卖出: 余额为 0");
-            self.restore_after_skipped_sell(&position_before_sell);
-            return;
-        }
-
+        let expected_after_balance = current_ata_balance.saturating_sub(token_amount);
         let mut success = false;
         let mut last_sig = String::new();
 
         for attempt in 1..=MAX_SELL_RETRIES {
             let confirm_timeout_ms = Self::confirm_timeout_ms(signal.reason, attempt);
-            info!(
-                "Pump.fun direct sell attempt #{}/{}: {}.. (amount: {}, confirm_timeout={}ms, mode={})",
-                attempt,
-                MAX_SELL_RETRIES,
-                &mint.to_string()[..12],
-                token_balance,
-                confirm_timeout_ms,
-                if aggressive_follow {
-                    "FOLLOW_AGGRESSIVE"
-                } else {
-                    "TP_SL_STABLE"
-                },
-            );
+            let send_started_at = Instant::now();
 
-            match self.try_pumpfun_sell(&mint, token_balance, sell_start).await {
+            match self
+                .try_pumpfun_sell(&position_before_sell, token_amount, send_started_at)
+                .await
+            {
                 Ok((sig, timings)) => {
                     info!(
-                        "Pump.fun direct sell submitted: https://solscan.io/tx/{} | signal_queue={} | snapshot={} | bc_lookup={} | quote_build={} | tx_build={} | send_call={} | total={}",
-                        sig,
+                        "Sell submitted: [{}] {} | signal_queue={} | snapshot={} | bc_lookup={} | quote_build={} | tx_build={} | send_call={} | total={}",
+                        signal.group_name,
+                        &position_before_sell.token_mint.to_string()[..12],
                         format_latency(timings.signal_queue),
                         format_latency(timings.snapshot_load),
                         format_latency(timings.bc_lookup),
@@ -416,357 +431,91 @@ impl SellExecutor {
                     );
 
                     let confirm_trace = self
-                        .wait_sell_confirm(&mint, &sig, confirm_timeout_ms)
+                        .wait_sell_confirm(
+                            &position_before_sell,
+                            &sig,
+                            confirm_timeout_ms,
+                            expected_after_balance,
+                        )
                         .await;
+
                     if confirm_trace.confirmed {
                         info!(
-                            "Pump.fun direct sell confirmed: {} | source={} | sig_seen={} | rpc_ata_zero={} | cache_ata_zero={} | total={}",
-                            &sig[..16],
+                            "Sell confirmed: [{}] {} | source={} | sig_seen={} | rpc_ata_target={} | cache_ata_target={} | total={}",
+                            signal.group_name,
+                            &position_before_sell.token_mint.to_string()[..12],
                             confirm_trace.source,
                             render_optional_latency(confirm_trace.signature_seen),
-                            render_optional_latency(confirm_trace.rpc_ata_zero),
-                            render_optional_latency(confirm_trace.cache_ata_zero),
+                            render_optional_latency(confirm_trace.rpc_ata_target),
+                            render_optional_latency(confirm_trace.cache_ata_target),
                             format_latency(confirm_trace.total),
                         );
-                        last_sig = sig;
                         success = true;
+                        last_sig = sig;
                         break;
-                    } else {
-                        warn!(
-                            "Pump.fun direct sell unconfirmed or failed: {} (retry)",
-                            &sig[..16]
-                        );
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        "Pump.fun direct sell attempt #{} failed: {} -> fallback Jupiter",
-                        attempt, e
-                    );
-                    match self.try_jupiter_sell(&mint, token_balance).await {
-                        Ok(sig) => {
-                            info!(
-                                "Jupiter sell submitted: https://solscan.io/tx/{} | {}ms",
-                                sig,
-                                sell_start.elapsed().as_millis(),
-                            );
+                Err(err) => {
+                    warn!("Pumpfun sell failed [{}]: {}", signal.group_name, err);
+                    if !aggressive_follow {
+                        if let Ok(sig) = self.try_jupiter_sell(&position_before_sell, token_amount).await {
                             let confirm_trace = self
-                                .wait_sell_confirm(&mint, &sig, confirm_timeout_ms)
+                                .wait_sell_confirm(
+                                    &position_before_sell,
+                                    &sig,
+                                    confirm_timeout_ms,
+                                    expected_after_balance,
+                                )
                                 .await;
                             if confirm_trace.confirmed {
-                                info!(
-                                    "Jupiter sell confirmed: {} | source={} | sig_seen={} | rpc_ata_zero={} | cache_ata_zero={} | total={}",
-                                    &sig[..16],
-                                    confirm_trace.source,
-                                    render_optional_latency(confirm_trace.signature_seen),
-                                    render_optional_latency(confirm_trace.rpc_ata_zero),
-                                    render_optional_latency(confirm_trace.cache_ata_zero),
-                                    format_latency(confirm_trace.total),
-                                );
-                                last_sig = sig;
                                 success = true;
+                                last_sig = sig;
                                 break;
                             }
                         }
-                        Err(je) => warn!("Jupiter fallback also failed: {}", je),
-                    }
-                    if attempt < MAX_SELL_RETRIES {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                 }
             }
         }
 
         if success {
-            self.try_close_ata(&mint, &user_ata).await;
-            self.auto_sell.mark_closed(&mint, last_sig.clone());
-            self.ata_cache.remove(&mint);
-            self.account_subscriber.untrack_mint(&mint);
-            self.prefetch_cache.remove(&mint);
-
-            let mint_str = mint.to_string();
+            if expected_after_balance == 0 {
+                self.auto_sell.mark_closed(&signal.position_key, last_sig.clone());
+            } else {
+                self.auto_sell.apply_partial_sell(&signal.position_key, token_amount);
+            }
+            self.cleanup_mint_if_unused(&position_before_sell.token_mint);
             self.tg.send(TgEvent::SellSuccess {
-                mint,
-                token_name: format!("{}..{}", &mint_str[..6], &mint_str[mint_str.len() - 4..]),
+                group_name: signal.group_name,
+                mint: position_before_sell.token_mint,
+                token_name: if position_before_sell.token_name.is_empty() {
+                    let ms = position_before_sell.token_mint.to_string();
+                    format!("{}..{}", &ms[..6], &ms[ms.len() - 4..])
+                } else {
+                    position_before_sell.token_name.clone()
+                },
                 reason: signal.reason.to_string(),
                 pnl_percent: signal.pnl_percent,
                 tx_sig: last_sig,
             });
         } else {
-            let remaining = self.get_token_balance_rpc(&user_ata);
-            if remaining > 0 {
-                warn!(
-                    "Sell failed but {} tokens remain, restore previous state: {}",
-                    remaining,
-                    &mint.to_string()[..12],
-                );
-                self.restore_after_skipped_sell(&position_before_sell);
-            } else {
-                warn!(
-                    "Sell failed and remaining balance is 0, mark failed: {}",
-                    &mint.to_string()[..12],
-                );
-                self.auto_sell
-                    .confirm_failed(&mint, "sell failed, zero balance");
-                self.account_subscriber.untrack_mint(&mint);
-                self.prefetch_cache.remove(&mint);
-            }
-
+            self.auto_sell
+                .restore_after_sell_attempt(&signal.position_key, previous_state);
             self.tg.send(TgEvent::SellFailed {
-                mint,
-                reason: "Pump.fun direct sell + Jupiter fallback both failed".to_string(),
+                group_name: signal.group_name,
+                mint: position_before_sell.token_mint,
+                reason: "sell retries exhausted".to_string(),
             });
         }
     }
 
-    /// Build and send a Jupiter sell transaction.
-    async fn try_jupiter_sell(&self, mint: &Pubkey, token_amount: u64) -> Result<String> {
-        let signed_tx_bytes = self
-            .jupiter
-            .build_sell_transaction(
-                mint,
-                token_amount,
-                self.dyn_config.sell_slippage_bps(),
-                &self.config.keypair,
-            )
-            .await?;
-
-        let tx_base64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &signed_tx_bytes);
-
-        let rpc_url = self.config.rpc_url.clone();
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
-
-        let send_request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendTransaction",
-            "params": [
-                tx_base64,
-                {
-                    "encoding": "base64",
-                    "skipPreflight": true,
-                    "maxRetries": 0
-                }
-            ]
-        });
-
-        let resp: serde_json::Value = http
-            .post(&rpc_url)
-            .json(&send_request)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        if let Some(error) = resp.get("error") {
-            anyhow::bail!("Jupiter sell RPC send failed: {}", error);
-        }
-
-        let sig = resp["result"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Jupiter sell returned no signature"))?;
-
-        Ok(sig.to_string())
-    }
-
-    async fn try_close_ata(&self, mint: &Pubkey, ata: &Pubkey) {
-        let balance = self
-            .ata_cache
-            .get(mint)
-            .unwrap_or_else(|| self.get_token_balance_rpc(ata));
-        if balance > 0 {
-            debug!("ATA still has balance {}, skip close", balance);
+    pub async fn handle_partial_sell(&self, group_id: &str, mint: &Pubkey, percent: u32) {
+        let Some(position) = self.auto_sell.get_position_by_group_mint(group_id, mint) else {
             return;
-        }
-
-        let token_program = self
-            .prefetch_cache
-            .get(mint)
-            .map(|pf| pf.token_program)
-            .unwrap_or_else(spl_token::id);
-
-        let close_ix = spl_token::instruction::close_account(
-            &token_program,
-            ata,
-            &self.config.pubkey,
-            &self.config.pubkey,
-            &[],
-        );
-
-        let close_ix = match close_ix {
-            Ok(ix) => ix,
-            Err(e) => {
-                debug!("Failed to build close ATA instruction: {}", e);
-                return;
-            }
         };
 
-        let rpc_bh = self.rpc_client.clone();
-        let bh_result = tokio::task::spawn_blocking(move || rpc_bh.get_latest_blockhash()).await;
-        let blockhash = match bh_result {
-            Ok(Ok(bh)) => bh,
-            _ => {
-                debug!("Failed to get blockhash, skip close ATA");
-                return;
-            }
-        };
-
-        let tx = match crate::tx::builder::TxBuilder::build_simple(
-            &[close_ix],
-            &self.config.keypair,
-            blockhash,
-        ) {
-            Ok(tx) => tx,
-            Err(e) => {
-                debug!("Failed to build close ATA transaction: {}", e);
-                return;
-            }
-        };
-
-        let rpc = self.rpc_client.clone();
-        match tokio::task::spawn_blocking(move || {
-            rpc.send_transaction_with_config(
-                &tx,
-                solana_client::rpc_config::RpcSendTransactionConfig {
-                    skip_preflight: true,
-                    ..Default::default()
-                },
-            )
-        })
-        .await
-        {
-            Ok(Ok(sig)) => {
-                info!("ATA closed: https://solscan.io/tx/{} (~0.002 SOL)", sig,);
-            }
-            Ok(Err(e)) => debug!("Close ATA failed: {}", e),
-            Err(e) => debug!("Close ATA task error: {}", e),
-        }
-    }
-
-    /// Wait for on-chain confirmation of a sell transaction.
-    async fn wait_sell_confirm(
-        &self,
-        mint: &Pubkey,
-        sig_str: &str,
-        max_wait_ms: u64,
-    ) -> SellConfirmTrace {
-        use solana_sdk::signature::Signature;
-        let sig = match sig_str.parse::<Signature>() {
-            Ok(s) => s,
-            Err(_) => {
-                return SellConfirmTrace {
-                    confirmed: false,
-                    source: "invalid_signature",
-                    signature_seen: None,
-                    rpc_ata_zero: None,
-                    cache_ata_zero: None,
-                    total: Duration::default(),
-                }
-            }
-        };
-        let max_wait = Duration::from_millis(max_wait_ms);
-        let start = std::time::Instant::now();
-        let poll_interval = Duration::from_millis(80);
-        let mut signature_seen = None;
-        let mut rpc_ata_zero = None;
-        let mut cache_ata_zero = None;
-        let user_ata = self
-            .auto_sell
-            .get_position(mint)
-            .and_then(|pos| pos.sell_snapshot.map(|snapshot| snapshot.user_ata))
-            .unwrap_or_else(|| get_associated_token_address(&self.config.pubkey, mint));
-        while start.elapsed() < max_wait {
-            if let Some(balance) = self.ata_cache.get(mint) {
-                if balance == 0 {
-                    cache_ata_zero.get_or_insert_with(|| start.elapsed());
-                    return SellConfirmTrace {
-                        confirmed: true,
-                        source: "cache_ata_zero",
-                        signature_seen,
-                        rpc_ata_zero,
-                        cache_ata_zero,
-                        total: start.elapsed(),
-                    };
-                }
-            }
-
-            tokio::time::sleep(poll_interval).await;
-            let rpc = self.rpc_client.clone();
-            let s = sig;
-            let result =
-                tokio::task::spawn_blocking(move || rpc.get_signature_statuses(&[s])).await;
-            match result {
-                Ok(Ok(resp)) => {
-                    if let Some(Some(status)) = resp.value.first() {
-                        if status.err.is_some() {
-                            warn!("Sell failed on-chain: {:?}", status.err);
-                            return SellConfirmTrace {
-                                confirmed: false,
-                                source: "signature_error",
-                                signature_seen,
-                                rpc_ata_zero,
-                                cache_ata_zero,
-                                total: start.elapsed(),
-                            };
-                        }
-                        signature_seen.get_or_insert_with(|| start.elapsed());
-                        let rpc = self.rpc_client.clone();
-                        let ata = user_ata;
-                        let ata_balance = tokio::task::spawn_blocking(move || {
-                            rpc.get_token_account_balance(&ata)
-                                .map(|b| b.amount.parse::<u64>().unwrap_or(0))
-                                .unwrap_or(0)
-                        })
-                        .await
-                        .unwrap_or(0);
-                        if ata_balance == 0 {
-                            rpc_ata_zero.get_or_insert_with(|| start.elapsed());
-                            return SellConfirmTrace {
-                                confirmed: true,
-                                source: "signature_plus_rpc_ata_zero",
-                                signature_seen,
-                                rpc_ata_zero,
-                                cache_ata_zero,
-                                total: start.elapsed(),
-                            };
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        SellConfirmTrace {
-            confirmed: false,
-            source: "timeout",
-            signature_seen,
-            rpc_ata_zero,
-            cache_ata_zero,
-            total: start.elapsed(),
-        }
-    }
-
-    /// Partial sell: 25% / 50% / 75% / 100%.
-    pub async fn handle_partial_sell(&self, mint: &Pubkey, percent: u32) {
-        let user_ata = self
-            .prefetch_cache
-            .get(mint)
-            .map(|pf| pf.user_ata)
-            .unwrap_or_else(|| get_associated_token_address(&self.config.pubkey, mint));
-
-        let total_balance = self
-            .ata_cache
-            .get(mint)
-            .unwrap_or_else(|| self.get_token_balance_rpc(&user_ata));
-
+        let total_balance = position.token_amount;
         if total_balance == 0 {
-            warn!("Partial sell skipped: zero balance");
-            self.tg.send(TgEvent::SellFailed {
-                mint: *mint,
-                reason: "zero balance".into(),
-            });
             return;
         }
 
@@ -776,122 +525,49 @@ impl SellExecutor {
             (total_balance as u128 * percent as u128 / 100) as u64
         };
 
-        if sell_amount == 0 {
-            self.tg.send(TgEvent::SellFailed {
-                mint: *mint,
-                reason: "sell amount is zero".into(),
-            });
+        let signal = SellSignal {
+            position_key: PositionKey {
+                group_id: group_id.to_string(),
+                token_mint: *mint,
+            },
+            group_name: position.group.name.clone(),
+            reason: SellReason::Manual,
+            current_price: position.current_price,
+            pnl_percent: position.pnl_percent(),
+        };
+
+        if percent >= 100 {
+            self.handle_sell_signal(signal).await;
             return;
         }
 
-        info!(
-            "Partial sell: {}% of {} = {} tokens",
-            percent,
-            &mint.to_string()[..12],
-            sell_amount
-        );
-
-        let mut success = false;
-        let mut last_sig = String::new();
-
-        for attempt in 1..=MAX_SELL_RETRIES {
-            let confirm_timeout_ms = Self::confirm_timeout_ms(SellReason::Manual, attempt);
-            match self.try_pumpfun_sell(mint, sell_amount, std::time::Instant::now()).await {
-                Ok((sig, timings)) => {
-                    info!(
-                        "Partial sell Pump.fun submitted: https://solscan.io/tx/{} | signal_queue={} | snapshot={} | bc_lookup={} | quote_build={} | tx_build={} | send_call={} | total={}",
-                        sig,
-                        format_latency(timings.signal_queue),
-                        format_latency(timings.snapshot_load),
-                        format_latency(timings.bc_lookup),
-                        format_latency(timings.quote_build),
-                        format_latency(timings.build),
-                        format_latency(timings.send_call),
-                        format_latency(timings.total),
-                    );
-                    let confirm_trace = self.wait_sell_confirm(mint, &sig, confirm_timeout_ms).await;
-                    if confirm_trace.confirmed {
-                        info!(
-                            "Partial sell confirmed: {} | source={} | sig_seen={} | rpc_ata_zero={} | cache_ata_zero={} | total={}",
-                            &sig[..16],
-                            confirm_trace.source,
-                            render_optional_latency(confirm_trace.signature_seen),
-                            render_optional_latency(confirm_trace.rpc_ata_zero),
-                            render_optional_latency(confirm_trace.cache_ata_zero),
-                            format_latency(confirm_trace.total),
-                        );
-                        last_sig = sig;
-                        success = true;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Partial sell Pump.fun attempt #{} failed: {} -> fallback Jupiter",
-                        attempt, e
-                    );
-                    match self.try_jupiter_sell(mint, sell_amount).await {
-                        Ok(sig) => {
-                            let confirm_trace = self.wait_sell_confirm(mint, &sig, confirm_timeout_ms).await;
-                            if confirm_trace.confirmed {
-                                info!(
-                                    "Partial sell Jupiter confirmed: {} | source={} | sig_seen={} | rpc_ata_zero={} | cache_ata_zero={} | total={}",
-                                    &sig[..16],
-                                    confirm_trace.source,
-                                    render_optional_latency(confirm_trace.signature_seen),
-                                    render_optional_latency(confirm_trace.rpc_ata_zero),
-                                    render_optional_latency(confirm_trace.cache_ata_zero),
-                                    format_latency(confirm_trace.total),
-                                );
-                                last_sig = sig;
-                                success = true;
-                                break;
-                            }
-                        }
-                        Err(je) => warn!("Partial sell Jupiter fallback also failed: {}", je),
-                    }
-                    if attempt < MAX_SELL_RETRIES {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            }
+        let previous_state = position.state;
+        if !self.auto_sell.mark_selling(&signal.position_key) {
+            return;
         }
 
-        let mint_str = mint.to_string();
-        let short = format!("{}..{}", &mint_str[..6], &mint_str[mint_str.len() - 4..]);
-
-        if success {
-            if percent >= 100 {
-                self.try_close_ata(mint, &user_ata).await;
-                self.auto_sell.mark_closed(mint, last_sig.clone());
-                self.ata_cache.remove(mint);
-                self.account_subscriber.untrack_mint(mint);
-                self.prefetch_cache.remove(mint);
+        match self.try_pumpfun_sell(&position, sell_amount, Instant::now()).await {
+            Ok((sig, _)) => {
+                self.auto_sell.apply_partial_sell(&signal.position_key, sell_amount);
+                self.tg.send(TgEvent::SellSuccess {
+                    group_name: signal.group_name,
+                    mint: *mint,
+                    token_name: if position.token_name.is_empty() {
+                        let ms = mint.to_string();
+                        format!("{}..{}", &ms[..6], &ms[ms.len() - 4..])
+                    } else {
+                        position.token_name.clone()
+                    },
+                    reason: format!("manual {}%", percent),
+                    pnl_percent: position.pnl_percent(),
+                    tx_sig: sig,
+                });
             }
-            self.tg.send(TgEvent::SellSuccess {
-                mint: *mint,
-                token_name: short,
-                reason: format!("manual {}%", percent),
-                pnl_percent: self
-                    .auto_sell
-                    .get_position(mint)
-                    .map(|p| p.pnl_percent())
-                    .unwrap_or(0.0),
-                tx_sig: last_sig,
-            });
-        } else {
-            self.tg.send(TgEvent::SellFailed {
-                mint: *mint,
-                reason: format!("{}% sell retries exhausted", percent),
-            });
+            Err(err) => {
+                warn!("Partial sell failed [{}]: {}", position.group.name, err);
+                self.auto_sell
+                    .restore_after_sell_attempt(&signal.position_key, previous_state);
+            }
         }
-    }
-
-    /// RPC fallback: only used when gRPC cache misses.
-    fn get_token_balance_rpc(&self, ata: &Pubkey) -> u64 {
-        self.rpc_client
-            .get_token_account_balance(ata)
-            .map(|b| b.amount.parse::<u64>().unwrap_or(0))
-            .unwrap_or(0)
     }
 }
