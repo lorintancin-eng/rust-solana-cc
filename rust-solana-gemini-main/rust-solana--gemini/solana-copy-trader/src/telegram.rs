@@ -154,7 +154,7 @@ impl TgBot {
         self.set_bot_commands().await;
         self.send_msg_kb(
             "<b>Solana 跟单机器人已上线</b>\n\n使用下方菜单可快速查看组合、设置组合和启停监听。",
-            group_menu_keyboard(),
+            group_menu_keyboard_v2(),
         )
         .await;
 
@@ -201,7 +201,7 @@ impl TgBot {
                 {"command": "addwallet", "description": "给当前组合添加钱包"},
                 {"command": "rmwallet", "description": "从当前组合移除钱包"},
                 {"command": "sellmode", "description": "查看或切换卖出模式"},
-                {"command": "pos", "description": "查看持仓，可带 group_id"},
+                {"command": "pos", "description": "查看持仓列表并手动卖出，可带 group_id"},
                 {"command": "sellall", "description": "手动卖出当前组合或指定组合持仓"},
                 {"command": "stats", "description": "查看运行统计数据"}
             ]
@@ -287,7 +287,7 @@ impl TgBot {
         if let Some(msg) = update.get("message") {
             self.handle_message(msg).await;
         } else if let Some(cb) = update.get("callback_query") {
-            self.handle_callback(cb).await;
+            self.handle_callback_v2(cb).await;
         }
     }
 
@@ -353,7 +353,7 @@ impl TgBot {
                 self.edit_msg(
                     message_id,
                     "<b>组合菜单</b>\n\n请选择要执行的操作。",
-                    group_menu_keyboard(),
+                    group_menu_keyboard_v2(),
                 )
                 .await;
             }
@@ -366,13 +366,23 @@ impl TgBot {
                 )
                 .await;
             }
+            ["gm", "positions"] => {
+                self.answer_cb(callback_id, None).await;
+                let positions = sorted_positions(self.auto_sell.get_active_positions());
+                self.edit_msg(
+                    message_id,
+                    &format_positions_v2(&positions),
+                    positions_list_keyboard(&positions),
+                )
+                .await;
+            }
             ["gm", "add"] => {
                 let name = format!("组合{}", self.groups.all_groups().len() + 1);
                 let group = self.groups.add_group(name, &self.config);
                 self.answer_cb(callback_id, Some("已新增组合")).await;
                 self.edit_msg(
                     message_id,
-                    &format_group_detail(&group, true),
+                    &format_group_detail_v2(&group, true),
                     group_detail_keyboard(&group),
                 )
                 .await;
@@ -391,7 +401,7 @@ impl TgBot {
                 if let Some(group) = self.groups.get_group(group_id) {
                     self.edit_msg(
                         message_id,
-                        &format_group_detail(
+                        &format_group_detail_v2(
                             &group,
                             self.groups.selected_group_id().as_deref() == Some(group_id),
                         ),
@@ -407,10 +417,10 @@ impl TgBot {
                         message_id,
                         &format!(
                             "<b>组合参数设置</b>\n\n{}\n\n点击下方参数按钮可选择预设值，也可以先用 <code>/usegroup {}</code> 再执行 <code>/set key value</code> 输入自定义值。",
-                            format_group_compact(&group),
+                            format_group_compact_v2(&group),
                             group.id,
                         ),
-                        group_setting_menu_keyboard(&group),
+                        group_setting_menu_keyboard_v2(&group),
                     )
                     .await;
                 }
@@ -435,7 +445,7 @@ impl TgBot {
                     if let Some(group) = self.groups.get_group(group_id) {
                         self.edit_msg(
                             message_id,
-                            &format_group_detail(
+                            &format_group_detail_v2(
                                 &group,
                                 self.groups.selected_group_id().as_deref() == Some(group_id),
                             ),
@@ -452,7 +462,7 @@ impl TgBot {
                     if let Some(group) = self.groups.get_group(group_id) {
                         self.edit_msg(
                             message_id,
-                            &format_group_detail(
+                            &format_group_detail_v2(
                                 &group,
                                 self.groups.selected_group_id().as_deref() == Some(group_id),
                             ),
@@ -469,7 +479,7 @@ impl TgBot {
                     if let Some(group) = self.groups.get_group(group_id) {
                         self.edit_msg(
                             message_id,
-                            &format_group_detail(&group, true),
+                            &format_group_detail_v2(&group, true),
                             group_detail_keyboard(&group),
                         )
                         .await;
@@ -486,7 +496,7 @@ impl TgBot {
                             "<b>设置组合参数</b>\n\n组合: <b>{}</b> ({})\n参数: <b>{}</b>\n当前值: {}\n\n请选择一个预设值。\n\n{}",
                             group.name,
                             group.id,
-                            setting_label(key),
+                            setting_label_v2(key),
                             group_value_text(&group, key),
                             setting_custom_hint(&group, key),
                         ),
@@ -506,9 +516,9 @@ impl TgBot {
                                 &format!(
                                     "<b>参数更新成功</b>\n\n{}\n\n{}",
                                     message,
-                                    format_group_compact(&group),
+                                    format_group_compact_v2(&group),
                                 ),
-                                group_setting_menu_keyboard(&group),
+                                group_setting_menu_keyboard_v2(&group),
                             )
                             .await;
                         }
@@ -533,6 +543,111 @@ impl TgBot {
         }
     }
 
+    async fn handle_callback_v2(&self, cb: &serde_json::Value) {
+        let chat_id = cb["message"]["chat"]["id"]
+            .as_i64()
+            .unwrap_or(0)
+            .to_string();
+        if chat_id != self.chat_id {
+            return;
+        }
+
+        let callback_id = cb["id"].as_str().unwrap_or_default();
+        let message_id = cb["message"]["message_id"].as_i64().unwrap_or(0);
+        let data = cb["data"].as_str().unwrap_or_default();
+        let parts: Vec<&str> = data.split(':').collect();
+
+        match parts.as_slice() {
+            ["gm", "positions"] => {
+                self.answer_cb(callback_id, None).await;
+                let positions = sorted_positions(self.auto_sell.get_active_positions());
+                self.edit_msg(
+                    message_id,
+                    &format_positions_v2(&positions),
+                    positions_list_keyboard(&positions),
+                )
+                .await;
+            }
+            ["ps", "list"] => {
+                self.answer_cb(callback_id, None).await;
+                let positions = sorted_positions(self.auto_sell.get_active_positions());
+                self.edit_msg(
+                    message_id,
+                    &format_positions_v2(&positions),
+                    positions_list_keyboard(&positions),
+                )
+                .await;
+            }
+            ["ps", "view", group_id, mint_raw] => {
+                self.answer_cb(callback_id, None).await;
+                match Pubkey::from_str(mint_raw) {
+                    Ok(mint) => {
+                        if let Some(position) =
+                            self.auto_sell.get_position_by_group_mint(group_id, &mint)
+                        {
+                            self.edit_msg(
+                                message_id,
+                                &format_position_detail(&position),
+                                position_detail_keyboard(&position),
+                            )
+                            .await;
+                        } else {
+                            let positions = sorted_positions(self.auto_sell.get_active_positions());
+                            self.edit_msg(
+                                message_id,
+                                &format_positions_v2(&positions),
+                                positions_list_keyboard(&positions),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(_) => {
+                        self.answer_cb(callback_id, Some("代币地址无效")).await;
+                    }
+                }
+            }
+            ["ps", "sell", group_id, mint_raw, percent_raw] => {
+                let mint = match Pubkey::from_str(mint_raw) {
+                    Ok(mint) => mint,
+                    Err(_) => {
+                        self.answer_cb(callback_id, Some("代币地址无效")).await;
+                        return;
+                    }
+                };
+                let percent = match percent_raw.parse::<u32>() {
+                    Ok(percent @ 1..=100) => percent,
+                    _ => {
+                        self.answer_cb(callback_id, Some("卖出比例无效")).await;
+                        return;
+                    }
+                };
+
+                self.answer_cb(callback_id, Some("卖出指令已发送")).await;
+                self._sell_executor
+                    .handle_partial_sell(group_id, &mint, percent)
+                    .await;
+
+                if let Some(position) = self.auto_sell.get_position_by_group_mint(group_id, &mint) {
+                    self.edit_msg(
+                        message_id,
+                        &format_position_detail(&position),
+                        position_detail_keyboard(&position),
+                    )
+                    .await;
+                } else {
+                    let positions = sorted_positions(self.auto_sell.get_active_positions());
+                    self.edit_msg(
+                        message_id,
+                        &format_positions_v2(&positions),
+                        positions_list_keyboard(&positions),
+                    )
+                    .await;
+                }
+            }
+            _ => self.handle_callback(cb).await,
+        }
+    }
+
     async fn cmd_help(&self) {
         self.send_msg_kb(
             "<b>命令说明</b>\n\n\
@@ -554,7 +669,7 @@ impl TgBot {
 <code>/sellall [group_id]</code> 手动全卖\n\
 <code>/stats</code> 查看运行统计\n\n\
 支持快捷设置的参数键：<code>buy</code>、<code>min_buy</code>、<code>tp</code>、<code>sl</code>、<code>trailing</code>、<code>slippage</code>、<code>sell_slippage</code>、<code>consensus</code>、<code>hold</code>、<code>tip_buy</code>、<code>tip_sell</code>、<code>zero_slot_tip</code>、<code>mode</code>、<code>enabled</code>",
-            group_menu_keyboard(),
+            group_menu_keyboard_v2(),
         )
         .await;
     }
@@ -584,7 +699,7 @@ impl TgBot {
 
         if let Some(group) = self.groups.selected_group() {
             text.push_str("\n\n");
-            text.push_str(&format_group_detail(&group, true));
+            text.push_str(&format_group_detail_v2(&group, true));
         }
 
         self.send_msg(&text).await;
@@ -607,7 +722,10 @@ impl TgBot {
 
         let group = self.groups.add_group(name, &self.config);
         self.send_msg_kb(
-            &format!("<b>组合已创建</b>\n\n{}", format_group_detail(&group, true)),
+            &format!(
+                "<b>组合已创建</b>\n\n{}",
+                format_group_detail_v2(&group, true)
+            ),
             group_detail_keyboard(&group),
         )
         .await;
@@ -681,9 +799,9 @@ impl TgBot {
             self.send_msg_kb(
                 &format!(
                     "<b>当前组合参数</b>\n\n{}",
-                    format_group_detail(&group, true)
+                    format_group_detail_v2(&group, true)
                 ),
-                group_setting_menu_keyboard(&group),
+                group_setting_menu_keyboard_v2(&group),
             )
             .await;
             return;
@@ -811,7 +929,12 @@ impl TgBot {
             return;
         }
 
-        self.send_msg(&format_positions(&positions)).await;
+        let positions = sorted_positions(positions);
+        self.send_msg_kb(
+            &format_positions_v2(&positions),
+            positions_list_keyboard(&positions),
+        )
+        .await;
     }
 
     async fn cmd_sellall(&self, args: &[&str]) {
@@ -1431,6 +1554,233 @@ fn format_positions(positions: &[Position]) -> String {
         ));
     }
     text
+}
+
+fn group_menu_keyboard_v2() -> serde_json::Value {
+    json!({
+        "inline_keyboard": [
+            [
+                {"text": "查看组合", "callback_data": "gm:overview"},
+                {"text": "新增组合", "callback_data": "gm:add"}
+            ],
+            [
+                {"text": "删除组合", "callback_data": "gm:pick:del"},
+                {"text": "启用组合", "callback_data": "gm:pick:on"}
+            ],
+            [
+                {"text": "停用组合", "callback_data": "gm:pick:off"},
+                {"text": "设置组合", "callback_data": "gm:pick:set"}
+            ],
+            [
+                {"text": "切换当前组合", "callback_data": "gm:pick:use"},
+                {"text": "查看持仓列表", "callback_data": "gm:positions"}
+            ]
+        ]
+    })
+}
+
+fn group_setting_menu_keyboard_v2(group: &CopyGroup) -> serde_json::Value {
+    json!({
+        "inline_keyboard": [
+            [
+                {"text": "买入金额", "callback_data": format!("gm:key:{}:buy", group.id)},
+                {"text": "最小买入", "callback_data": format!("gm:key:{}:min_buy", group.id)}
+            ],
+            [
+                {"text": "止盈", "callback_data": format!("gm:key:{}:tp", group.id)},
+                {"text": "止损", "callback_data": format!("gm:key:{}:sl", group.id)}
+            ],
+            [
+                {"text": "移动止损", "callback_data": format!("gm:key:{}:trailing", group.id)},
+                {"text": "共识数量", "callback_data": format!("gm:key:{}:consensus", group.id)}
+            ],
+            [
+                {"text": "买入滑点", "callback_data": format!("gm:key:{}:slippage", group.id)},
+                {"text": "卖出滑点", "callback_data": format!("gm:key:{}:sell_slippage", group.id)}
+            ],
+            [
+                {"text": "持仓时间", "callback_data": format!("gm:key:{}:hold", group.id)},
+                {"text": "卖出模式", "callback_data": format!("gm:key:{}:mode", group.id)}
+            ],
+            [
+                {"text": "买入小费", "callback_data": format!("gm:key:{}:tip_buy", group.id)},
+                {"text": "卖出小费", "callback_data": format!("gm:key:{}:tip_sell", group.id)}
+            ],
+            [
+                {"text": "0slot 小费", "callback_data": format!("gm:key:{}:zero_slot_tip", group.id)},
+                {"text": "查看组合", "callback_data": format!("gm:view:{}", group.id)}
+            ],
+            [
+                {"text": "返回菜单", "callback_data": "gm:main"}
+            ]
+        ]
+    })
+}
+
+fn format_group_compact_v2(group: &CopyGroup) -> String {
+    format!(
+        "组合: <b>{}</b> ({})\n模式: {}\n买入: {} SOL | 最小买入: {} SOL\nTP: {}% | SL: {}% | Trailing: {}%\n买入滑点: {} bps | 卖出滑点: {} bps\n共识: {} | 持仓: {} 分钟\n买入小费: {} | 卖出小费: {}\n0slot 小费: {}",
+        group.name,
+        group.id,
+        sell_mode_label(group.sell_mode),
+        group.buy_sol_amount,
+        group.min_target_buy_sol,
+        group.take_profit_percent,
+        group.stop_loss_percent,
+        group.trailing_stop_percent,
+        group.slippage_bps,
+        group.sell_slippage_bps,
+        group.consensus_min_wallets,
+        group.max_hold_seconds / 60,
+        group.tip_buy_lamports,
+        group.tip_sell_lamports,
+        group.zero_slot_tip_lamports,
+    )
+}
+
+fn format_group_detail_v2(group: &CopyGroup, selected: bool) -> String {
+    let mut text = format!(
+        "<b>{}</b> ({}){}\n状态: {}\n卖出模式: {}\n钱包数: {}\n买入: {} SOL\n最小触发买入: {} SOL\nTP: {}%\nSL: {}%\nTrailing: {}%\n买入滑点: {} bps\n卖出滑点: {} bps\n共识数量: {}\n持仓时间: {} 分钟\n买入小费: {} lamports\n卖出小费: {} lamports\n0slot 小费: {} lamports",
+        group.name,
+        group.id,
+        if selected { " [当前组合]" } else { "" },
+        if group.enabled { "启用" } else { "停用" },
+        sell_mode_label(group.sell_mode),
+        group.wallets.len(),
+        group.buy_sol_amount,
+        group.min_target_buy_sol,
+        group.take_profit_percent,
+        group.stop_loss_percent,
+        group.trailing_stop_percent,
+        group.slippage_bps,
+        group.sell_slippage_bps,
+        group.consensus_min_wallets,
+        group.max_hold_seconds / 60,
+        group.tip_buy_lamports,
+        group.tip_sell_lamports,
+        group.zero_slot_tip_lamports,
+    );
+
+    if group.wallets.is_empty() {
+        text.push_str("\n监听钱包: 暂无");
+    } else {
+        text.push_str("\n监听钱包:");
+        for wallet in &group.wallets {
+            text.push_str(&format!("\n- <code>{}</code>", wallet));
+        }
+    }
+
+    text
+}
+
+fn setting_label_v2(key: &str) -> &'static str {
+    match key {
+        "buy" => "买入金额",
+        "min_buy" => "最小触发买入额",
+        "tp" => "止盈比例",
+        "sl" => "止损比例",
+        "trailing" => "移动止损",
+        "slippage" => "买入滑点",
+        "sell_slippage" => "卖出滑点",
+        "consensus" => "共识数量",
+        "hold" => "最大持仓时间",
+        "tip_buy" => "买入小费",
+        "tip_sell" => "卖出小费",
+        "zero_slot_tip" => "0slot 小费",
+        "mode" => "卖出模式",
+        _ => "参数",
+    }
+}
+
+fn format_positions_v2(positions: &[Position]) -> String {
+    let mut text = format!("<b>持仓列表</b> ({})", positions.len());
+    for (index, pos) in positions.iter().enumerate() {
+        text.push_str(&format!(
+            "\n\n{}. <b>{}</b>\n代币地址: <code>{}</code>\n组合: {} ({})\n状态: {} | PnL: {:+.2}% | 持仓: {}",
+            index + 1,
+            position_display_name(pos),
+            pos.token_mint,
+            pos.group.name,
+            pos.group.id,
+            pos.state,
+            pos.pnl_percent(),
+            fmt_time(pos.held_seconds()),
+        ));
+    }
+    text
+}
+
+fn sorted_positions(mut positions: Vec<Position>) -> Vec<Position> {
+    positions.sort_by(|left, right| {
+        position_display_name(left)
+            .cmp(&position_display_name(right))
+            .then_with(|| {
+                left.token_mint
+                    .to_string()
+                    .cmp(&right.token_mint.to_string())
+            })
+            .then_with(|| left.group.id.cmp(&right.group.id))
+    });
+    positions
+}
+
+fn position_display_name(position: &Position) -> String {
+    if position.token_name.is_empty() {
+        short_pubkey(&position.token_mint)
+    } else {
+        position.token_name.clone()
+    }
+}
+
+fn positions_list_keyboard(positions: &[Position]) -> serde_json::Value {
+    let mut rows = Vec::new();
+    for position in positions {
+        rows.push(json!([
+            {
+                "text": format!("{} [{}]", position_display_name(position), position.group.id),
+                "callback_data": format!("ps:view:{}:{}", position.group.id, position.token_mint)
+            }
+        ]));
+    }
+    rows.push(json!([
+        {"text": "刷新", "callback_data": "ps:list"},
+        {"text": "返回菜单", "callback_data": "gm:main"}
+    ]));
+    json!({ "inline_keyboard": rows })
+}
+
+fn position_detail_keyboard(position: &Position) -> serde_json::Value {
+    json!({
+        "inline_keyboard": [
+            [
+                {"text": "25%", "callback_data": format!("ps:sell:{}:{}:25", position.group.id, position.token_mint)},
+                {"text": "50%", "callback_data": format!("ps:sell:{}:{}:50", position.group.id, position.token_mint)}
+            ],
+            [
+                {"text": "75%", "callback_data": format!("ps:sell:{}:{}:75", position.group.id, position.token_mint)},
+                {"text": "100%", "callback_data": format!("ps:sell:{}:{}:100", position.group.id, position.token_mint)}
+            ],
+            [
+                {"text": "刷新", "callback_data": format!("ps:view:{}:{}", position.group.id, position.token_mint)},
+                {"text": "返回列表", "callback_data": "ps:list"}
+            ]
+        ]
+    })
+}
+
+fn format_position_detail(position: &Position) -> String {
+    format!(
+        "<b>{}</b>\n代币地址: <code>{}</code>\n组合: {} ({})\n状态: {}\n成本: {:.4} SOL\n当前数量: {:.4}\nPnL: {:+.2}%\n持仓时长: {}",
+        position_display_name(position),
+        position.token_mint,
+        position.group.name,
+        position.group.id,
+        position.state,
+        position.entry_sol_amount as f64 / 1e9,
+        position.token_amount as f64 / 1e6,
+        position.pnl_percent(),
+        fmt_time(position.held_seconds()),
+    )
 }
 
 fn short_pubkey(pubkey: &Pubkey) -> String {

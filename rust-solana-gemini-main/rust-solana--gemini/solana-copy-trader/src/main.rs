@@ -58,6 +58,8 @@ struct SignatureSeen {
 struct BuyPathTimings {
     queue: Duration,
     prefetch_wait: Duration,
+    bc_wait: Duration,
+    bc_sync_fetch: Duration,
     quote_build: Duration,
     tx_build: Duration,
     send_call: Duration,
@@ -76,7 +78,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.21");
+    info!("   Solana 跟单交易系统 v1.6.22");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -573,8 +575,9 @@ async fn execute_buy(
     let buy_sol = group.buy_sol_amount;
     let buy_lamports = group.buy_lamports();
     let sol_price = sol_usd.get();
+    let has_target_instruction = target_instruction_data.len() >= 24;
     let mut bc_state = bc_cache.get(mint);
-    if bc_state.is_none() {
+    if !has_target_instruction && bc_state.is_none() {
         let wait_started = Instant::now();
         while wait_started.elapsed() < Duration::from_millis(BC_CACHE_WAIT_MS) {
             if let Some(state) = bc_cache.get(mint) {
@@ -584,15 +587,7 @@ async fn execute_buy(
             tokio::task::yield_now().await;
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-
-        if bc_state.is_none() {
-            if let Some(ref pf) = prefetched {
-                if let Ok(state) = pumpfun.prefetch_bonding_curve(&pf.bonding_curve).await {
-                    bc_cache.update(mint, state.clone());
-                    bc_state = Some(state);
-                }
-            }
-        }
+        timings.bc_wait = wait_started.elapsed();
     }
 
     let quote_build_start = Instant::now();
@@ -600,6 +595,16 @@ async fn execute_buy(
         if let Some(ref pf) = prefetched {
             if pf.mirror_accounts.is_empty() {
                 Err(anyhow::anyhow!("missing mirror accounts"))
+            } else if has_target_instruction {
+                pumpfun.buy_from_target_instruction(
+                    mint,
+                    &pf.user_ata,
+                    &pf.token_program,
+                    &pf.source_wallet,
+                    &pf.mirror_accounts,
+                    target_instruction_data,
+                    &config,
+                )
             } else if let Some(bc_state) = bc_state.clone() {
                 let token_amount = bc_state.sol_to_token_quote(buy_lamports);
                 pumpfun
@@ -613,16 +618,6 @@ async fn execute_buy(
                         &config,
                     )
                     .map(|mirror| (mirror, token_amount))
-            } else if target_instruction_data.len() >= 24 {
-                pumpfun.buy_from_target_instruction(
-                    mint,
-                    &pf.user_ata,
-                    &pf.token_program,
-                    &pf.source_wallet,
-                    &pf.mirror_accounts,
-                    target_instruction_data,
-                    &config,
-                )
             } else {
                 Err(anyhow::anyhow!("missing bc cache and target instruction"))
             }
@@ -717,7 +712,7 @@ async fn execute_buy(
                             let buy_usd = sol_usd.sol_to_usd(buy_sol);
 
                             info!(
-                                "Buy submitted: [{}] {} | {:.4} SOL (${:.2}) | est {:.0} tokens | price={} | mcap={} | queue={} | prefetch={} | quote_build={} | tx_build={} | send_call={} | total={} | sig={}",
+                                "Buy submitted: [{}] {} | {:.4} SOL (${:.2}) | est {:.0} tokens | price={} | mcap={} | queue={} | prefetch={} | bc_wait={} | bc_sync_fetch={} | quote_build={} | tx_build={} | send_call={} | total={} | sig={}",
                                 group.name,
                                 &mint.to_string()[..12],
                                 buy_sol,
@@ -727,6 +722,8 @@ async fn execute_buy(
                                 format_mcap_usd(entry_mcap_usd),
                                 format_latency(timings.queue),
                                 format_latency(timings.prefetch_wait),
+                                format_latency(timings.bc_wait),
+                                format_latency(timings.bc_sync_fetch),
                                 format_latency(timings.quote_build),
                                 format_latency(timings.tx_build),
                                 format_latency(timings.send_call),
