@@ -406,7 +406,7 @@ impl AutoSellManager {
                         let max_hold = pos.group.max_hold_seconds;
                         if max_hold > 0 && pos.held_seconds() >= max_hold && pos.can_sell() {
                             Some(SellSignal {
-                                position_key: pos.key(),
+                                position_key: pos.key().clone(),
                                 group_name: pos.group.name.clone(),
                                 reason: SellReason::MaxLifetime,
                                 current_price: pos.current_price,

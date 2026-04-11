@@ -80,9 +80,10 @@ impl ConsensusEngine {
             return;
         }
 
+        let timeout = entry.timeout;
         entry
             .signals
-            .retain(|candidate| now.duration_since(candidate.detected_at) < entry.timeout);
+            .retain(|candidate| now.duration_since(candidate.detected_at) < timeout);
 
         if entry.signals.iter().any(|candidate| candidate.wallet == signal.wallet) {
             debug!(
