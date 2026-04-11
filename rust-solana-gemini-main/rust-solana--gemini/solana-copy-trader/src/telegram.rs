@@ -483,11 +483,12 @@ impl TgBot {
                     self.edit_msg(
                         message_id,
                         &format!(
-                            "<b>设置组合参数</b>\n\n组合: <b>{}</b> ({})\n参数: <b>{}</b>\n当前值: {}\n\n请选择一个预设值。",
+                            "<b>设置组合参数</b>\n\n组合: <b>{}</b> ({})\n参数: <b>{}</b>\n当前值: {}\n\n请选择一个预设值。\n\n{}",
                             group.name,
                             group.id,
                             setting_label(key),
                             group_value_text(&group, key),
+                            setting_custom_hint(&group, key),
                         ),
                         group_setting_value_keyboard(group_id, key),
                     )
@@ -1082,6 +1083,30 @@ fn setting_label(key: &str) -> &'static str {
         "mode" => "卖出模式",
         _ => "参数",
     }
+}
+
+fn setting_custom_hint(group: &CopyGroup, key: &str) -> String {
+    let example_value = match key {
+        "buy" => "0.006",
+        "min_buy" => "0.5",
+        "tp" => "50",
+        "sl" => "15",
+        "trailing" => "5",
+        "slippage" => "3000",
+        "sell_slippage" => "3000",
+        "consensus" => "2",
+        "hold" => "10",
+        "tip_buy" => "10000",
+        "tip_sell" => "10000",
+        "mode" => "follow",
+        "enabled" => "on",
+        _ => "value",
+    };
+
+    format!(
+        "也可自定义输入。\n先执行 <code>/usegroup {}</code>\n再执行 <code>/set {} {}</code>",
+        group.id, key, example_value
+    )
 }
 
 fn group_menu_keyboard() -> serde_json::Value {
