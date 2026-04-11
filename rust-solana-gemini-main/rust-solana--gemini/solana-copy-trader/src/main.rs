@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.20");
+    info!("   Solana 跟单交易系统 v1.6.21");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -687,7 +687,7 @@ async fn execute_buy(
                     &config.keypair,
                     blockhash,
                     &fee_account,
-                    group.tip_buy_lamports,
+                    config.zero_slot_tip_lamports,
                     &[],
                 )
             } else if config.jito_enabled {

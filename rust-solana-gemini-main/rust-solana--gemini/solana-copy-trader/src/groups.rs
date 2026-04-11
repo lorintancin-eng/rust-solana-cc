@@ -29,6 +29,7 @@ pub struct CopyGroup {
     pub max_hold_seconds: u64,
     pub tip_buy_lamports: u64,
     pub tip_sell_lamports: u64,
+    pub zero_slot_tip_lamports: u64,
     pub sell_mode: u8,
 }
 
@@ -51,6 +52,7 @@ impl CopyGroup {
             max_hold_seconds: config.max_hold_seconds,
             tip_buy_lamports: config.jito_buy_tip_lamports,
             tip_sell_lamports: config.jito_sell_tip_lamports,
+            zero_slot_tip_lamports: config.zero_slot_tip_lamports,
             sell_mode: SELL_MODE_TP_SL,
         }
     }
@@ -82,6 +84,7 @@ impl CopyGroup {
         config.max_hold_seconds = self.max_hold_seconds;
         config.jito_buy_tip_lamports = self.tip_buy_lamports;
         config.jito_sell_tip_lamports = self.tip_sell_lamports;
+        config.zero_slot_tip_lamports = self.zero_slot_tip_lamports;
         config
     }
 }
@@ -104,6 +107,8 @@ struct PersistedGroup {
     max_hold_seconds: u64,
     tip_buy_lamports: u64,
     tip_sell_lamports: u64,
+    #[serde(default)]
+    zero_slot_tip_lamports: Option<u64>,
     sell_mode: u8,
 }
 
@@ -133,11 +138,12 @@ impl PersistedGroup {
             max_hold_seconds: group.max_hold_seconds,
             tip_buy_lamports: group.tip_buy_lamports,
             tip_sell_lamports: group.tip_sell_lamports,
+            zero_slot_tip_lamports: Some(group.zero_slot_tip_lamports),
             sell_mode: group.sell_mode,
         }
     }
 
-    fn into_group(self) -> Option<CopyGroup> {
+    fn into_group(self, base: &AppConfig) -> Option<CopyGroup> {
         let mut wallets = Vec::with_capacity(self.wallets.len());
         for wallet in self.wallets {
             match Pubkey::from_str(&wallet) {
@@ -163,6 +169,9 @@ impl PersistedGroup {
             max_hold_seconds: self.max_hold_seconds,
             tip_buy_lamports: self.tip_buy_lamports,
             tip_sell_lamports: self.tip_sell_lamports,
+            zero_slot_tip_lamports: self
+                .zero_slot_tip_lamports
+                .unwrap_or(base.zero_slot_tip_lamports),
             sell_mode: self.sell_mode,
         })
     }
@@ -189,7 +198,7 @@ impl GroupManager {
                         groups = saved
                             .groups
                             .into_iter()
-                            .filter_map(PersistedGroup::into_group)
+                            .filter_map(|group| group.into_group(config))
                             .collect();
                     }
                     Err(err) => warn!("Failed to parse {}: {}", GROUPS_FILE, err),
@@ -348,7 +357,11 @@ impl GroupManager {
             return Err(format!("group not found: {}", group_id));
         };
 
-        if let Some(index) = entry.wallets.iter().position(|candidate| candidate == wallet) {
+        if let Some(index) = entry
+            .wallets
+            .iter()
+            .position(|candidate| candidate == wallet)
+        {
             entry.wallets.remove(index);
             drop(entry);
             self.save();

@@ -553,7 +553,7 @@ impl TgBot {
 <code>/pos [group_id]</code> 查看持仓\n\
 <code>/sellall [group_id]</code> 手动全卖\n\
 <code>/stats</code> 查看运行统计\n\n\
-支持快捷设置的参数键：<code>buy</code>、<code>min_buy</code>、<code>tp</code>、<code>sl</code>、<code>trailing</code>、<code>slippage</code>、<code>sell_slippage</code>、<code>consensus</code>、<code>hold</code>、<code>tip_buy</code>、<code>tip_sell</code>、<code>mode</code>、<code>enabled</code>",
+支持快捷设置的参数键：<code>buy</code>、<code>min_buy</code>、<code>tp</code>、<code>sl</code>、<code>trailing</code>、<code>slippage</code>、<code>sell_slippage</code>、<code>consensus</code>、<code>hold</code>、<code>tip_buy</code>、<code>tip_sell</code>、<code>zero_slot_tip</code>、<code>mode</code>、<code>enabled</code>",
             group_menu_keyboard(),
         )
         .await;
@@ -1019,6 +1019,13 @@ fn apply_group_setting_value(
                 format!("tip_sell = {} lamports", v)
             })
             .map_err(|err| err.to_string()),
+        "zero_slot_tip" | "zero_slot_tip_buy" | "tip_0slot" => value
+            .parse::<u64>()
+            .map(|v| {
+                group.zero_slot_tip_lamports = v;
+                format!("zero_slot_tip = {} lamports", v)
+            })
+            .map_err(|err| err.to_string()),
         "mode" | "sell_mode" => parse_sell_mode(value).map(|mode| {
             group.sell_mode = mode;
             format!("mode = {}", sell_mode_label(mode))
@@ -1098,6 +1105,7 @@ fn setting_custom_hint(group: &CopyGroup, key: &str) -> String {
         "hold" => "10",
         "tip_buy" => "10000",
         "tip_sell" => "10000",
+        "zero_slot_tip" => "1000000",
         "mode" => "follow",
         "enabled" => "on",
         _ => "value",
@@ -1269,6 +1277,14 @@ fn group_setting_value_keyboard(group_id: &str, key: &str) -> serde_json::Value 
             value_row(group_id, key, &[("10000", "10000"), ("50000", "50000")]),
             value_row(group_id, key, &[("100000", "100000"), ("300000", "300000")]),
         ],
+        "zero_slot_tip" => vec![
+            value_row(group_id, key, &[("100000", "100000"), ("300000", "300000")]),
+            value_row(
+                group_id,
+                key,
+                &[("500000", "500000"), ("1000000", "1000000")],
+            ),
+        ],
         "mode" => vec![value_row(
             group_id,
             key,
@@ -1388,6 +1404,7 @@ fn group_value_text(group: &CopyGroup, key: &str) -> String {
         "hold" => format!("{} 分钟", group.max_hold_seconds / 60),
         "tip_buy" => format!("{} lamports", group.tip_buy_lamports),
         "tip_sell" => format!("{} lamports", group.tip_sell_lamports),
+        "zero_slot_tip" => format!("{} lamports", group.zero_slot_tip_lamports),
         "mode" => sell_mode_label(group.sell_mode).to_string(),
         _ => "-".to_string(),
     }
