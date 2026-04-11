@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.17");
+    info!("   Solana 跟单交易系统 v1.6.18");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
