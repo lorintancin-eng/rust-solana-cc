@@ -38,12 +38,28 @@ struct SellPathTimings {
     total: Duration,
 }
 
+#[derive(Debug, Clone)]
+struct SellConfirmTrace {
+    confirmed: bool,
+    source: &'static str,
+    signature_seen: Option<Duration>,
+    rpc_ata_zero: Option<Duration>,
+    cache_ata_zero: Option<Duration>,
+    total: Duration,
+}
+
 fn format_latency(duration: Duration) -> String {
     if duration.as_millis() > 0 {
         format!("{}ms", duration.as_millis())
     } else {
         format!("{}us", duration.as_micros())
     }
+}
+
+fn render_optional_latency(duration: Option<Duration>) -> String {
+    duration
+        .map(format_latency)
+        .unwrap_or_else(|| "-".to_string())
 }
 
 pub struct SellExecutor {
@@ -399,14 +415,18 @@ impl SellExecutor {
                         format_latency(timings.total),
                     );
 
-                    let confirmed = self
+                    let confirm_trace = self
                         .wait_sell_confirm(&mint, &sig, confirm_timeout_ms)
                         .await;
-                    if confirmed {
+                    if confirm_trace.confirmed {
                         info!(
-                            "Pump.fun direct sell confirmed: {} | {}ms",
+                            "Pump.fun direct sell confirmed: {} | source={} | sig_seen={} | rpc_ata_zero={} | cache_ata_zero={} | total={}",
                             &sig[..16],
-                            sell_start.elapsed().as_millis(),
+                            confirm_trace.source,
+                            render_optional_latency(confirm_trace.signature_seen),
+                            render_optional_latency(confirm_trace.rpc_ata_zero),
+                            render_optional_latency(confirm_trace.cache_ata_zero),
+                            format_latency(confirm_trace.total),
                         );
                         last_sig = sig;
                         success = true;
@@ -430,10 +450,19 @@ impl SellExecutor {
                                 sig,
                                 sell_start.elapsed().as_millis(),
                             );
-                            let confirmed = self
+                            let confirm_trace = self
                                 .wait_sell_confirm(&mint, &sig, confirm_timeout_ms)
                                 .await;
-                            if confirmed {
+                            if confirm_trace.confirmed {
+                                info!(
+                                    "Jupiter sell confirmed: {} | source={} | sig_seen={} | rpc_ata_zero={} | cache_ata_zero={} | total={}",
+                                    &sig[..16],
+                                    confirm_trace.source,
+                                    render_optional_latency(confirm_trace.signature_seen),
+                                    render_optional_latency(confirm_trace.rpc_ata_zero),
+                                    render_optional_latency(confirm_trace.cache_ata_zero),
+                                    format_latency(confirm_trace.total),
+                                );
                                 last_sig = sig;
                                 success = true;
                                 break;
@@ -618,15 +647,32 @@ impl SellExecutor {
     }
 
     /// Wait for on-chain confirmation of a sell transaction.
-    async fn wait_sell_confirm(&self, mint: &Pubkey, sig_str: &str, max_wait_ms: u64) -> bool {
+    async fn wait_sell_confirm(
+        &self,
+        mint: &Pubkey,
+        sig_str: &str,
+        max_wait_ms: u64,
+    ) -> SellConfirmTrace {
         use solana_sdk::signature::Signature;
         let sig = match sig_str.parse::<Signature>() {
             Ok(s) => s,
-            Err(_) => return false,
+            Err(_) => {
+                return SellConfirmTrace {
+                    confirmed: false,
+                    source: "invalid_signature",
+                    signature_seen: None,
+                    rpc_ata_zero: None,
+                    cache_ata_zero: None,
+                    total: Duration::default(),
+                }
+            }
         };
         let max_wait = Duration::from_millis(max_wait_ms);
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(80);
+        let mut signature_seen = None;
+        let mut rpc_ata_zero = None;
+        let mut cache_ata_zero = None;
         let user_ata = self
             .auto_sell
             .get_position(mint)
@@ -635,12 +681,15 @@ impl SellExecutor {
         while start.elapsed() < max_wait {
             if let Some(balance) = self.ata_cache.get(mint) {
                 if balance == 0 {
-                    info!(
-                        "Sell confirmed via ATA cache: {} | {}",
-                        &mint.to_string()[..12],
-                        format_latency(start.elapsed()),
-                    );
-                    return true;
+                    cache_ata_zero.get_or_insert_with(|| start.elapsed());
+                    return SellConfirmTrace {
+                        confirmed: true,
+                        source: "cache_ata_zero",
+                        signature_seen,
+                        rpc_ata_zero,
+                        cache_ata_zero,
+                        total: start.elapsed(),
+                    };
                 }
             }
 
@@ -654,8 +703,16 @@ impl SellExecutor {
                     if let Some(Some(status)) = resp.value.first() {
                         if status.err.is_some() {
                             warn!("Sell failed on-chain: {:?}", status.err);
-                            return false;
+                            return SellConfirmTrace {
+                                confirmed: false,
+                                source: "signature_error",
+                                signature_seen,
+                                rpc_ata_zero,
+                                cache_ata_zero,
+                                total: start.elapsed(),
+                            };
                         }
+                        signature_seen.get_or_insert_with(|| start.elapsed());
                         let rpc = self.rpc_client.clone();
                         let ata = user_ata;
                         let ata_balance = tokio::task::spawn_blocking(move || {
@@ -666,19 +723,29 @@ impl SellExecutor {
                         .await
                         .unwrap_or(0);
                         if ata_balance == 0 {
-                            info!(
-                                "Sell confirmed via signature+ATA: {} | {}",
-                                &mint.to_string()[..12],
-                                format_latency(start.elapsed()),
-                            );
-                            return true;
+                            rpc_ata_zero.get_or_insert_with(|| start.elapsed());
+                            return SellConfirmTrace {
+                                confirmed: true,
+                                source: "signature_plus_rpc_ata_zero",
+                                signature_seen,
+                                rpc_ata_zero,
+                                cache_ata_zero,
+                                total: start.elapsed(),
+                            };
                         }
                     }
                 }
                 _ => {}
             }
         }
-        false
+        SellConfirmTrace {
+            confirmed: false,
+            source: "timeout",
+            signature_seen,
+            rpc_ata_zero,
+            cache_ata_zero,
+            total: start.elapsed(),
+        }
     }
 
     /// Partial sell: 25% / 50% / 75% / 100%.
@@ -742,8 +809,17 @@ impl SellExecutor {
                         format_latency(timings.send_call),
                         format_latency(timings.total),
                     );
-                    let confirmed = self.wait_sell_confirm(mint, &sig, confirm_timeout_ms).await;
-                    if confirmed {
+                    let confirm_trace = self.wait_sell_confirm(mint, &sig, confirm_timeout_ms).await;
+                    if confirm_trace.confirmed {
+                        info!(
+                            "Partial sell confirmed: {} | source={} | sig_seen={} | rpc_ata_zero={} | cache_ata_zero={} | total={}",
+                            &sig[..16],
+                            confirm_trace.source,
+                            render_optional_latency(confirm_trace.signature_seen),
+                            render_optional_latency(confirm_trace.rpc_ata_zero),
+                            render_optional_latency(confirm_trace.cache_ata_zero),
+                            format_latency(confirm_trace.total),
+                        );
                         last_sig = sig;
                         success = true;
                         break;
@@ -756,8 +832,17 @@ impl SellExecutor {
                     );
                     match self.try_jupiter_sell(mint, sell_amount).await {
                         Ok(sig) => {
-                            let confirmed = self.wait_sell_confirm(mint, &sig, confirm_timeout_ms).await;
-                            if confirmed {
+                            let confirm_trace = self.wait_sell_confirm(mint, &sig, confirm_timeout_ms).await;
+                            if confirm_trace.confirmed {
+                                info!(
+                                    "Partial sell Jupiter confirmed: {} | source={} | sig_seen={} | rpc_ata_zero={} | cache_ata_zero={} | total={}",
+                                    &sig[..16],
+                                    confirm_trace.source,
+                                    render_optional_latency(confirm_trace.signature_seen),
+                                    render_optional_latency(confirm_trace.rpc_ata_zero),
+                                    render_optional_latency(confirm_trace.cache_ata_zero),
+                                    format_latency(confirm_trace.total),
+                                );
                                 last_sig = sig;
                                 success = true;
                                 break;
