@@ -6,8 +6,7 @@ use solana_sdk::{
     system_program,
 };
 use spl_associated_token_account::{
-    get_associated_token_address,
-    instruction::create_associated_token_account_idempotent,
+    get_associated_token_address, instruction::create_associated_token_account_idempotent,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -39,6 +38,8 @@ const _PUMPSWAP_PROGRAM_ID: &str = "pLgM3rWHN3W4Hxb3cKxE7b1K3qJN3vRU4QvT8wXyYz";
 
 // Pump.fun buy discriminator: sha256("global:buy")[..8]
 const BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+// Pump.fun buyExactSolIn discriminator: sha256("global:buy_exact_sol_in")[..8]
+const BUY_EXACT_SOL_IN_DISCRIMINATOR: [u8; 8] = [56, 252, 116, 8, 158, 223, 205, 95];
 // Pump.fun sell discriminator: sha256("global:sell")[..8]
 const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 // initUserVolumeAccumulator discriminator
@@ -73,6 +74,16 @@ pub struct BondingCurveState {
     pub is_cashback: bool,
 }
 
+enum TargetBuyInstruction {
+    Buy {
+        token_amount: u64,
+        max_sol_cost: u64,
+    },
+    BuyExactSolIn {
+        sol_amount: u64,
+    },
+}
+
 impl BondingCurveState {
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
         if data.len() < 49 {
@@ -85,7 +96,11 @@ impl BondingCurveState {
         } else {
             None
         };
-        let is_cashback = if data.len() > 82 { data[82] != 0 } else { false };
+        let is_cashback = if data.len() > 82 {
+            data[82] != 0
+        } else {
+            false
+        };
 
         Ok(Self {
             virtual_token_reserves: u64::from_le_bytes(data[8..16].try_into()?),
@@ -106,9 +121,7 @@ impl BondingCurveState {
         if self.virtual_token_reserves == 0 {
             return 0.0;
         }
-        self.virtual_sol_reserves as f64
-            / self.virtual_token_reserves as f64
-            / 1000.0
+        self.virtual_sol_reserves as f64 / self.virtual_token_reserves as f64 / 1000.0
     }
 
     /// 计算市值 (SOL)
@@ -140,6 +153,10 @@ impl BondingCurveState {
     }
 }
 
+fn max_pump_raw_supply() -> u64 {
+    (PUMP_TOTAL_SUPPLY as u64) * 1_000_000
+}
+
 pub struct PumpfunProcessor {
     rpc_client: Arc<RpcClient>,
 }
@@ -158,10 +175,7 @@ impl PumpfunProcessor {
     }
 
     /// 从交易的 account keys 中提取 token mint 和 bonding curve 地址
-    fn extract_pumpfun_accounts(
-        &self,
-        trade: &DetectedTrade,
-    ) -> Result<(Pubkey, Pubkey, Pubkey)> {
+    fn extract_pumpfun_accounts(&self, trade: &DetectedTrade) -> Result<(Pubkey, Pubkey, Pubkey)> {
         // Pump.fun buy/sell 指令的 account 布局:
         // 0: global
         // 1: fee_recipient
@@ -198,7 +212,10 @@ impl PumpfunProcessor {
         let mut last_err = None;
         for attempt in 0..3u32 {
             if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(200 * 2u64.pow(attempt - 1))).await;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    200 * 2u64.pow(attempt - 1),
+                ))
+                .await;
             }
 
             let bc = *bonding_curve;
@@ -216,32 +233,27 @@ impl PumpfunProcessor {
             .context("bonding curve RPC task panicked")?;
 
             match result {
-                Ok(response) => {
-                    match response.value {
-                        Some(account) => {
-                            if account.owner != pumpfun_id {
-                                info!(
-                                    "Bonding curve {} owner is {} (not PumpFun), token migrated",
-                                    &bonding_curve.to_string()[..12],
-                                    account.owner,
-                                );
-                                anyhow::bail!("Bonding curve migrated to PumpSwap");
-                            }
-                            return BondingCurveState::from_account_data(&account.data);
-                        }
-                        None => {
-                            last_err = Some(format!(
-                                "account not found (attempt #{})",
-                                attempt + 1,
-                            ));
-                            debug!(
-                                "Bonding curve {} not found (attempt #{}, commitment=processed)",
+                Ok(response) => match response.value {
+                    Some(account) => {
+                        if account.owner != pumpfun_id {
+                            info!(
+                                "Bonding curve {} owner is {} (not PumpFun), token migrated",
                                 &bonding_curve.to_string()[..12],
-                                attempt + 1,
+                                account.owner,
                             );
+                            anyhow::bail!("Bonding curve migrated to PumpSwap");
                         }
+                        return BondingCurveState::from_account_data(&account.data);
                     }
-                }
+                    None => {
+                        last_err = Some(format!("account not found (attempt #{})", attempt + 1,));
+                        debug!(
+                            "Bonding curve {} not found (attempt #{}, commitment=processed)",
+                            &bonding_curve.to_string()[..12],
+                            attempt + 1,
+                        );
+                    }
+                },
                 Err(e) => {
                     last_err = Some(format!("RPC error (attempt #{}): {}", attempt + 1, e));
                     warn!(
@@ -286,14 +298,10 @@ impl PumpfunProcessor {
         // 预计算 source_wallet 的所有可能 PDA
         let mut source_pdas: Vec<(Pubkey, Pubkey)> = Vec::new(); // (source_pda, our_pda)
         for seed in seed_patterns {
-            let (source_pda, _) = Pubkey::find_program_address(
-                &[*seed, source_wallet.as_ref()],
-                &program_id,
-            );
-            let (our_pda, _) = Pubkey::find_program_address(
-                &[*seed, our_wallet.as_ref()],
-                &program_id,
-            );
+            let (source_pda, _) =
+                Pubkey::find_program_address(&[*seed, source_wallet.as_ref()], &program_id);
+            let (our_pda, _) =
+                Pubkey::find_program_address(&[*seed, our_wallet.as_ref()], &program_id);
             source_pdas.push((source_pda, our_pda));
         }
 
@@ -302,8 +310,8 @@ impl PumpfunProcessor {
             .enumerate()
             .map(|(i, acct)| {
                 match i {
-                    5 => *our_ata,     // user_ata
-                    6 => *our_wallet,  // user (signer)
+                    5 => *our_ata,    // user_ata
+                    6 => *our_wallet, // user (signer)
                     _ => {
                         // 检查是否匹配任何用户 PDA
                         for (source_pda, our_pda) in &source_pdas {
@@ -350,7 +358,7 @@ impl PumpfunProcessor {
             .enumerate()
             .map(|(i, acct)| {
                 match i {
-                    6 => AccountMeta::new(*acct, true),  // signer
+                    6 => AccountMeta::new(*acct, true), // signer
                     // writable: fee(1), bc(3), abc(4), ata(5), user(6), creator_vault(9), accumulator(13)
                     1 | 3 | 4 | 5 | 9 | 13 => AccountMeta::new(*acct, false),
                     _ => AccountMeta::new_readonly(*acct, false),
@@ -388,10 +396,8 @@ impl PumpfunProcessor {
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 
         // PDA 派生
-        let creator_vault = Pubkey::find_program_address(
-            &[b"creator-vault", creator.as_ref()],
-            &program_id,
-        ).0;
+        let creator_vault =
+            Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &program_id).0;
 
         // 从 mirror_accounts 只取代币相关地址（位置 [2-4] 跨所有 buy 变体稳定）
         let mint = mirror_accounts[2];
@@ -399,25 +405,23 @@ impl PumpfunProcessor {
         let assoc_bc = mirror_accounts[4];
 
         // bonding_curve_v2 = PDA 派生（必需的 remaining account）
-        let bonding_curve_v2 = Pubkey::find_program_address(
-            &[b"bonding-curve-v2", mint.as_ref()],
-            &program_id,
-        ).0;
+        let bonding_curve_v2 =
+            Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &program_id).0;
 
         // 14 固定账户（2026 Pump.fun sell IDL）
         let mut accounts = vec![
-            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false),  // 0  global
-            AccountMeta::new(Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap(), false),    // 1  fee_recipient
-            AccountMeta::new_readonly(mint, false),                                        // 2  mint
-            AccountMeta::new(bonding_curve, false),                                        // 3  bonding_curve
-            AccountMeta::new(assoc_bc, false),                                             // 4  assoc_bonding_curve
-            AccountMeta::new(*user_ata, false),                                            // 5  user_ata
-            AccountMeta::new(*user, true),                                                 // 6  user (signer)
-            AccountMeta::new_readonly(system_program::id(), false),                        // 7  system_program
-            AccountMeta::new(creator_vault, false),                                        // 8  creator_vault (PDA)
-            AccountMeta::new_readonly(*token_program_id, false),                           // 9  token_program
+            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false), // 0  global
+            AccountMeta::new(Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap(), false), // 1  fee_recipient
+            AccountMeta::new_readonly(mint, false),                                    // 2  mint
+            AccountMeta::new(bonding_curve, false), // 3  bonding_curve
+            AccountMeta::new(assoc_bc, false),      // 4  assoc_bonding_curve
+            AccountMeta::new(*user_ata, false),     // 5  user_ata
+            AccountMeta::new(*user, true),          // 6  user (signer)
+            AccountMeta::new_readonly(system_program::id(), false), // 7  system_program
+            AccountMeta::new(creator_vault, false), // 8  creator_vault (PDA)
+            AccountMeta::new_readonly(*token_program_id, false), // 9  token_program
             AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(), false), // 10 event_authority
-            AccountMeta::new_readonly(program_id, false),                                  // 11 program
+            AccountMeta::new_readonly(program_id, false), // 11 program
             AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(), false), // 12 fee_config
             AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(), false), // 13 fee_program
         ];
@@ -451,7 +455,9 @@ impl PumpfunProcessor {
         token_program_id: &Pubkey,
     ) -> Instruction {
         let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-            user, mint, token_program_id,
+            user,
+            mint,
+            token_program_id,
         );
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
 
@@ -502,13 +508,17 @@ impl PumpfunProcessor {
             Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &program_id).0
         };
 
-        let curve_state = self.fetch_and_validate_bonding_curve(&bonding_curve).await?;
+        let curve_state = self
+            .fetch_and_validate_bonding_curve(&bonding_curve)
+            .await?;
         let expected_sol = curve_state.token_to_sol_quote(token_amount);
         let min_sol_output = expected_sol - (expected_sol * config.slippage_bps / 10_000);
 
         debug!(
             "Pump.fun 卖出: {} tokens → ~{:.4} SOL (min: {:.4})",
-            token_amount, expected_sol as f64 / 1e9, min_sol_output as f64 / 1e9,
+            token_amount,
+            expected_sol as f64 / 1e9,
+            min_sol_output as f64 / 1e9,
         );
 
         let mut data = Vec::with_capacity(24);
@@ -517,14 +527,15 @@ impl PumpfunProcessor {
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 
         // 替换 mirror_accounts 中的用户特定账户（和买入一样的逻辑）
-        let replaced = Self::replace_user_pdas(mirror_accounts, source_wallet, &config.pubkey, user_ata);
+        let replaced =
+            Self::replace_user_pdas(mirror_accounts, source_wallet, &config.pubkey, user_ata);
 
         let accounts: Vec<AccountMeta> = replaced
             .iter()
             .enumerate()
             .map(|(i, acct)| {
                 match i {
-                    6 => AccountMeta::new(*acct, true),  // signer
+                    6 => AccountMeta::new(*acct, true), // signer
                     // writable: fee(1), bc(3), abc(4), ata(5), creator_vault(9), accumulator(13)
                     1 | 3 | 4 | 5 | 9 | 13 => AccountMeta::new(*acct, false),
                     _ => AccountMeta::new_readonly(*acct, false),
@@ -585,9 +596,8 @@ impl PumpfunProcessor {
     ) -> Result<MirrorInstruction> {
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
 
-        let (bonding_curve, _) = Pubkey::find_program_address(
-            &[b"bonding-curve", mint.as_ref()], &program_id,
-        );
+        let (bonding_curve, _) =
+            Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &program_id);
 
         // 获取完整的 bonding curve 数据（包含 creator、is_cashback）
         let rpc = self.rpc_client.clone();
@@ -602,7 +612,8 @@ impl PumpfunProcessor {
             anyhow::bail!("bonding curve 已完成（已迁移）");
         }
 
-        let creator = curve_state.creator
+        let creator = curve_state
+            .creator
             .ok_or_else(|| anyhow::anyhow!("bonding curve 无 creator 字段（数据太短）"))?;
 
         // 检测 token program：查 mint 账户 owner
@@ -625,10 +636,14 @@ impl PumpfunProcessor {
 
         // 用户 ATA 和 BC 的 ATA
         let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &config.pubkey, mint, &token_program_id,
+            &config.pubkey,
+            mint,
+            &token_program_id,
         );
         let assoc_bc = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &bonding_curve, mint, &token_program_id,
+            &bonding_curve,
+            mint,
+            &token_program_id,
         );
 
         // ============================================
@@ -644,17 +659,13 @@ impl PumpfunProcessor {
         let creator_vault = if has_mirror {
             buy_mirror_accounts.unwrap()[9]
         } else {
-            Pubkey::find_program_address(
-                &[b"creator-vault", creator.as_ref()], &program_id,
-            ).0
+            Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &program_id).0
         };
 
         let event_authority = if has_mirror {
             buy_mirror_accounts.unwrap()[10]
         } else {
-            Pubkey::find_program_address(
-                &[b"__event_authority"], &program_id,
-            ).0
+            Pubkey::find_program_address(&[b"__event_authority"], &program_id).0
         };
 
         // fee_config 和 fee_program 是全局常量，直接用已验证的地址
@@ -664,9 +675,7 @@ impl PumpfunProcessor {
         let bonding_curve_v2 = if has_mirror && buy_mirror_accounts.unwrap().len() > 16 {
             buy_mirror_accounts.unwrap()[16]
         } else {
-            Pubkey::find_program_address(
-                &[b"bonding-curve-v2", mint.as_ref()], &program_id,
-            ).0
+            Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &program_id).0
         };
 
         info!(
@@ -686,7 +695,11 @@ impl PumpfunProcessor {
         // bonding curve extend（旧格式 < 151 字节需要先 extend）
         const BONDING_CURVE_NEW_SIZE: usize = 151;
         if bc_data.len() < BONDING_CURVE_NEW_SIZE {
-            info!("Bonding curve 需要 extend: {} → {}", bc_data.len(), BONDING_CURVE_NEW_SIZE);
+            info!(
+                "Bonding curve 需要 extend: {} → {}",
+                bc_data.len(),
+                BONDING_CURVE_NEW_SIZE
+            );
             let extend_ix = Instruction {
                 program_id,
                 accounts: vec![
@@ -711,34 +724,36 @@ impl PumpfunProcessor {
 
         // 14 固定账户
         let mut accounts = vec![
-            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false),  // 0
-            AccountMeta::new(Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap(), false),    // 1
-            AccountMeta::new_readonly(*mint, false),                                       // 2
-            AccountMeta::new(bonding_curve, false),                                        // 3
-            AccountMeta::new(assoc_bc, false),                                             // 4
-            AccountMeta::new(user_ata, false),                                             // 5
-            AccountMeta::new(config.pubkey, true),                                         // 6
-            AccountMeta::new_readonly(system_program::id(), false),                        // 7
-            AccountMeta::new(creator_vault, false),                                        // 8
-            AccountMeta::new_readonly(token_program_id, false),                            // 9
-            AccountMeta::new_readonly(event_authority, false),                              // 10
-            AccountMeta::new_readonly(program_id, false),                                  // 11
-            AccountMeta::new_readonly(fee_config, false),                                  // 12
-            AccountMeta::new_readonly(fee_program_addr, false),                            // 13
+            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false), // 0
+            AccountMeta::new(Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap(), false),   // 1
+            AccountMeta::new_readonly(*mint, false),                                     // 2
+            AccountMeta::new(bonding_curve, false),                                      // 3
+            AccountMeta::new(assoc_bc, false),                                           // 4
+            AccountMeta::new(user_ata, false),                                           // 5
+            AccountMeta::new(config.pubkey, true),                                       // 6
+            AccountMeta::new_readonly(system_program::id(), false),                      // 7
+            AccountMeta::new(creator_vault, false),                                      // 8
+            AccountMeta::new_readonly(token_program_id, false),                          // 9
+            AccountMeta::new_readonly(event_authority, false),                           // 10
+            AccountMeta::new_readonly(program_id, false),                                // 11
+            AccountMeta::new_readonly(fee_config, false),                                // 12
+            AccountMeta::new_readonly(fee_program_addr, false),                          // 13
         ];
 
         // remaining accounts
         if curve_state.is_cashback {
             let (user_vol_acc, _) = Pubkey::find_program_address(
-                &[b"user_volume_accumulator", config.pubkey.as_ref()], &program_id,
+                &[b"user_volume_accumulator", config.pubkey.as_ref()],
+                &program_id,
             );
 
             // 检查 UVA 是否已初始化
             let rpc3 = self.rpc_client.clone();
             let uva = user_vol_acc;
-            let uva_exists = tokio::task::spawn_blocking(move || {
-                rpc3.get_account_data(&uva).is_ok()
-            }).await.unwrap_or(false);
+            let uva_exists =
+                tokio::task::spawn_blocking(move || rpc3.get_account_data(&uva).is_ok())
+                    .await
+                    .unwrap_or(false);
 
             if !uva_exists {
                 info!("初始化 user_volume_accumulator (cashback 模式)");
@@ -801,7 +816,9 @@ impl PumpfunProcessor {
             mirror_accounts.len(),
         );
 
-        let curve_state = self.fetch_and_validate_bonding_curve(&bonding_curve).await?;
+        let curve_state = self
+            .fetch_and_validate_bonding_curve(&bonding_curve)
+            .await?;
 
         if curve_state.complete {
             anyhow::bail!("bonding curve 已完成（已迁移外盘）");
@@ -809,14 +826,23 @@ impl PumpfunProcessor {
 
         let sol_amount = config.buy_lamports();
         let token_amount = curve_state.sol_to_token_quote(sol_amount);
+        self.validate_buy_amount(token_amount, Some(curve_state))?;
         let max_sol_cost = sol_amount + (sol_amount * config.slippage_bps / 10_000);
 
         let buy_ix = self.build_buy_instruction_from_mirror(
-            &config.pubkey, user_ata, source_wallet, mirror_accounts, token_amount, max_sol_cost,
+            &config.pubkey,
+            user_ata,
+            source_wallet,
+            mirror_accounts,
+            token_amount,
+            max_sol_cost,
         );
 
         let create_ata_ix = create_associated_token_account_idempotent(
-            &config.pubkey, &config.pubkey, mint, token_program_id,
+            &config.pubkey,
+            &config.pubkey,
+            mint,
+            token_program_id,
         );
 
         Ok(MirrorInstruction {
@@ -831,6 +857,84 @@ impl PumpfunProcessor {
     /// 使用预取的 bonding curve 状态直接构建买入指令（零 RPC）
     /// 共识触发时如果缓存已有状态，用此方法跳过 RPC
     /// 使用缓存的 bonding curve 状态 + mirror_accounts 构建买入（零 RPC）
+    fn validate_buy_amount(
+        &self,
+        token_amount: u64,
+        curve_state: Option<&BondingCurveState>,
+    ) -> Result<()> {
+        if token_amount == 0 {
+            anyhow::bail!("buy quote returned zero tokens");
+        }
+
+        if token_amount > max_pump_raw_supply() {
+            anyhow::bail!(
+                "buy quote abnormal: token amount {} exceeds max supply {}",
+                token_amount,
+                max_pump_raw_supply()
+            );
+        }
+
+        if let Some(curve_state) = curve_state {
+            if curve_state.real_token_reserves > 0 && token_amount > curve_state.real_token_reserves
+            {
+                anyhow::bail!(
+                    "buy quote abnormal: token amount {} exceeds real reserves {}",
+                    token_amount,
+                    curve_state.real_token_reserves
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse_target_buy_instruction(
+        &self,
+        target_instruction_data: &[u8],
+    ) -> Result<TargetBuyInstruction> {
+        if target_instruction_data.len() < 24 {
+            anyhow::bail!(
+                "target instruction data too short: {} bytes",
+                target_instruction_data.len()
+            );
+        }
+
+        let disc: [u8; 8] = target_instruction_data[..8]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid target instruction discriminator"))?;
+
+        if disc == BUY_DISCRIMINATOR {
+            let token_amount =
+                u64::from_le_bytes(target_instruction_data[8..16].try_into().unwrap_or([0; 8]));
+            let max_sol_cost =
+                u64::from_le_bytes(target_instruction_data[16..24].try_into().unwrap_or([0; 8]));
+
+            if token_amount == 0 || max_sol_cost == 0 {
+                anyhow::bail!(
+                    "invalid target buy data: tokens={}, sol={}",
+                    token_amount,
+                    max_sol_cost
+                );
+            }
+
+            Ok(TargetBuyInstruction::Buy {
+                token_amount,
+                max_sol_cost,
+            })
+        } else if disc == BUY_EXACT_SOL_IN_DISCRIMINATOR {
+            let sol_amount =
+                u64::from_le_bytes(target_instruction_data[8..16].try_into().unwrap_or([0; 8]));
+
+            if sol_amount == 0 {
+                anyhow::bail!("invalid target buy_exact_sol_in data: sol=0");
+            }
+
+            Ok(TargetBuyInstruction::BuyExactSolIn { sol_amount })
+        } else {
+            anyhow::bail!("unsupported target buy discriminator: {:?}", disc);
+        }
+    }
+
     pub fn buy_from_cached_state(
         &self,
         mint: &Pubkey,
@@ -851,15 +955,25 @@ impl PumpfunProcessor {
 
         debug!(
             "报价(缓存): {} SOL → {} tokens | {} accounts",
-            config.buy_sol_amount, token_amount, mirror_accounts.len(),
+            config.buy_sol_amount,
+            token_amount,
+            mirror_accounts.len(),
         );
 
         let buy_ix = self.build_buy_instruction_from_mirror(
-            &config.pubkey, user_ata, source_wallet, mirror_accounts, token_amount, max_sol_cost,
+            &config.pubkey,
+            user_ata,
+            source_wallet,
+            mirror_accounts,
+            token_amount,
+            max_sol_cost,
         );
 
         let create_ata_ix = create_associated_token_account_idempotent(
-            &config.pubkey, &config.pubkey, mint, token_program_id,
+            &config.pubkey,
+            &config.pubkey,
+            mint,
+            token_program_id,
         );
 
         Ok(MirrorInstruction {
@@ -893,21 +1007,20 @@ impl PumpfunProcessor {
         target_instruction_data: &[u8],
         config: &AppConfig,
     ) -> Result<(MirrorInstruction, u64)> {
-        // 提取目标的 token_amount 和 max_sol_cost
-        if target_instruction_data.len() < 24 {
-            anyhow::bail!("目标指令数据太短: {} bytes", target_instruction_data.len());
-        }
-
-        let target_token_amount = u64::from_le_bytes(
-            target_instruction_data[8..16].try_into().unwrap_or([0; 8]),
-        );
-        let target_max_sol = u64::from_le_bytes(
-            target_instruction_data[16..24].try_into().unwrap_or([0; 8]),
-        );
-
-        if target_token_amount == 0 || target_max_sol == 0 {
-            anyhow::bail!("目标指令数据无效: tokens={}, sol={}", target_token_amount, target_max_sol);
-        }
+        let (target_token_amount, target_max_sol) = match self
+            .parse_target_buy_instruction(target_instruction_data)?
+        {
+            TargetBuyInstruction::Buy {
+                token_amount,
+                max_sol_cost,
+            } => (token_amount, max_sol_cost),
+            TargetBuyInstruction::BuyExactSolIn { sol_amount } => {
+                anyhow::bail!(
+                        "buy_exact_sol_in target fallback unsupported without bonding curve cache: sol={}",
+                        sol_amount
+                    );
+            }
+        };
 
         // 从目标指令反推 bonding curve 虚拟储备，再用 AMM 公式精确计算
         //
@@ -941,6 +1054,7 @@ impl PumpfunProcessor {
         let numerator = estimated_v_token * (our_sol_amount as u128);
         let denominator = estimated_v_sol + (our_sol_amount as u128);
         let our_token_amount = (numerator / denominator).max(1) as u64;
+        self.validate_buy_amount(our_token_amount, None)?;
         let our_max_sol_cost = our_sol_amount + (our_sol_amount * config.slippage_bps / 10_000);
 
         debug!(
@@ -953,21 +1067,31 @@ impl PumpfunProcessor {
         );
 
         let buy_ix = self.build_buy_instruction_from_mirror(
-            &config.pubkey, user_ata, source_wallet, mirror_accounts,
-            our_token_amount, our_max_sol_cost,
+            &config.pubkey,
+            user_ata,
+            source_wallet,
+            mirror_accounts,
+            our_token_amount,
+            our_max_sol_cost,
         );
 
         let create_ata_ix = create_associated_token_account_idempotent(
-            &config.pubkey, &config.pubkey, mint, token_program_id,
+            &config.pubkey,
+            &config.pubkey,
+            mint,
+            token_program_id,
         );
 
-        Ok((MirrorInstruction {
-            swap_instructions: vec![buy_ix],
-            pre_instructions: vec![create_ata_ix],
-            post_instructions: vec![],
-            token_mint: *mint,
-            sol_amount: our_sol_amount,
-        }, our_token_amount))
+        Ok((
+            MirrorInstruction {
+                swap_instructions: vec![buy_ix],
+                pre_instructions: vec![create_ata_ix],
+                post_instructions: vec![],
+                token_mint: *mint,
+                sol_amount: our_sol_amount,
+            },
+            our_token_amount,
+        ))
     }
 }
 
@@ -993,16 +1117,24 @@ impl TradeProcessor for PumpfunProcessor {
             Pubkey::from_str(TOKEN_PROGRAM).unwrap()
         };
         let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &config.pubkey, &mint, &token_prog,
+            &config.pubkey,
+            &mint,
+            &token_prog,
         );
 
         if trade.is_buy {
             self.buy_with_mirror(
-                &mint, &user_ata, &token_prog,
-                &trade.source_wallet, &trade.instruction_accounts, config,
-            ).await
+                &mint,
+                &user_ata,
+                &token_prog,
+                &trade.source_wallet,
+                &trade.instruction_accounts,
+                config,
+            )
+            .await
         } else {
-            let balance = self.rpc_client
+            let balance = self
+                .rpc_client
                 .get_token_account_balance(&user_ata)
                 .map(|b| b.amount.parse::<u64>().unwrap_or(0))
                 .unwrap_or(0);
@@ -1010,9 +1142,14 @@ impl TradeProcessor for PumpfunProcessor {
                 anyhow::bail!("No tokens to sell for mint {}", mint);
             }
             self.sell_with_mirror(
-                &mint, balance, &user_ata,
-                &trade.source_wallet, &trade.instruction_accounts, config,
-            ).await
+                &mint,
+                balance,
+                &user_ata,
+                &trade.source_wallet,
+                &trade.instruction_accounts,
+                config,
+            )
+            .await
         }
     }
 }

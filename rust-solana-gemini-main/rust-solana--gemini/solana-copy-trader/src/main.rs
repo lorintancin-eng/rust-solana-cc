@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.29");
+    info!("   Solana 跟单交易系统 v1.6.30");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -590,7 +590,7 @@ async fn execute_buy(
     let sol_price = sol_usd.get();
     let has_target_instruction = target_instruction_data.len() >= 24;
     let mut bc_state = bc_cache.get(mint);
-    if !has_target_instruction && bc_state.is_none() {
+    if bc_state.is_none() {
         let wait_started = Instant::now();
         while wait_started.elapsed() < Duration::from_millis(BC_CACHE_WAIT_MS) {
             if let Some(state) = bc_cache.get(mint) {
@@ -608,16 +608,6 @@ async fn execute_buy(
         if let Some(ref pf) = prefetched {
             if pf.mirror_accounts.is_empty() {
                 Err(anyhow::anyhow!("missing mirror accounts"))
-            } else if has_target_instruction {
-                pumpfun.buy_from_target_instruction(
-                    mint,
-                    &pf.user_ata,
-                    &pf.token_program,
-                    &pf.source_wallet,
-                    &pf.mirror_accounts,
-                    target_instruction_data,
-                    &config,
-                )
             } else if let Some(bc_state) = bc_state.clone() {
                 let token_amount = bc_state.sol_to_token_quote(buy_lamports);
                 pumpfun
@@ -631,6 +621,16 @@ async fn execute_buy(
                         &config,
                     )
                     .map(|mirror| (mirror, token_amount))
+            } else if has_target_instruction {
+                pumpfun.buy_from_target_instruction(
+                    mint,
+                    &pf.user_ata,
+                    &pf.token_program,
+                    &pf.source_wallet,
+                    &pf.mirror_accounts,
+                    target_instruction_data,
+                    &config,
+                )
             } else {
                 Err(anyhow::anyhow!("missing bc cache and target instruction"))
             }
