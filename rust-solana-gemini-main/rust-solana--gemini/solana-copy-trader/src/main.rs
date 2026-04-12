@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.31");
+    info!("   Solana 跟单交易系统 v1.6.32");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -305,6 +305,7 @@ async fn main() -> Result<()> {
             let trigger_mint = trigger.token_mint;
             let trigger_wallets = trigger.wallets.clone();
             let trigger_detected_at = trigger.triggered_at;
+            let zero_slot_buy_enabled = exec_group_manager.zero_slot_buy_enabled();
             let canonical_signature = trigger.canonical_signature.clone();
             let canonical_wallet = trigger.canonical_wallet;
             let canonical_token_program = trigger.canonical_token_program;
@@ -327,6 +328,7 @@ async fn main() -> Result<()> {
                     &trigger_mint,
                     &trigger_wallets,
                     trigger_detected_at,
+                    zero_slot_buy_enabled,
                     &canonical_instruction_data,
                     &cfg,
                     &rpc,
@@ -495,6 +497,7 @@ async fn main() -> Result<()> {
                 let limiter = buy_exec_limiter.clone();
                 let trade_wallet = trade.source_wallet;
                 let group_clone = group.clone();
+                let zero_slot_buy_enabled = group_manager.zero_slot_buy_enabled();
                 tokio::spawn(async move {
                     let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
                     execute_buy(
@@ -502,6 +505,7 @@ async fn main() -> Result<()> {
                         &token_mint,
                         &[trade_wallet],
                         trade.detected_at,
+                        zero_slot_buy_enabled,
                         &target_instruction_data,
                         &cfg,
                         &rpc,
@@ -551,6 +555,7 @@ async fn execute_buy(
     mint: &Pubkey,
     wallets: &[Pubkey],
     detected_at: Instant,
+    zero_slot_buy_enabled: bool,
     target_instruction_data: &[u8],
     base_config: &AppConfig,
     rpc_client: &Arc<RpcClient>,
@@ -705,8 +710,45 @@ async fn execute_buy(
 
             match tx_result {
                 Ok(transaction) => {
+                    let zero_slot_tx = if zero_slot_buy_enabled && !config.zero_slot_urls.is_empty()
+                    {
+                        let tip_account = tx_sender.random_0slot_tip_account();
+                        Some(TxBuilder::build_0slot_transaction(
+                            &mirror,
+                            &config,
+                            &config.keypair,
+                            blockhash,
+                            &tip_account,
+                            base_config.zero_slot_tip_lamports,
+                            &[],
+                        ))
+                    } else {
+                        None
+                    };
+
+                    let zero_slot_tx = match zero_slot_tx.transpose() {
+                        Ok(tx) => tx,
+                        Err(err) => {
+                            error!(
+                                "Buy 0slot tx build failed [{}] {}: {}",
+                                group.name,
+                                &mint.to_string()[..12],
+                                err
+                            );
+                            tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    };
+
                     let send_call_start = Instant::now();
-                    match tx_sender.fire_and_forget_without_0slot(&transaction) {
+                    let send_result = if zero_slot_buy_enabled && !config.zero_slot_urls.is_empty()
+                    {
+                        tx_sender.fire_and_forget(&transaction, zero_slot_tx.as_ref())
+                    } else {
+                        tx_sender.fire_and_forget_without_0slot(&transaction)
+                    };
+
+                    match send_result {
                         Ok(sig) => {
                             timings.send_call = send_call_start.elapsed();
                             let total_latency = start.elapsed();

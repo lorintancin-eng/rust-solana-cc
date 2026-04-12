@@ -155,7 +155,7 @@ impl TgBot {
         self.set_bot_commands().await;
         self.send_msg_kb(
             "<b>Solana 跟单机器人已上线</b>\n\n使用下方菜单可快速查看组合、设置组合和启停监听。",
-            group_menu_keyboard_v2(),
+            group_menu_keyboard_v2(self.groups.zero_slot_buy_enabled()),
         )
         .await;
 
@@ -358,7 +358,29 @@ impl TgBot {
                 self.edit_msg(
                     message_id,
                     "<b>组合菜单</b>\n\n请选择要执行的操作。",
-                    group_menu_keyboard_v2(),
+                    group_menu_keyboard_v2(self.groups.zero_slot_buy_enabled()),
+                )
+                .await;
+            }
+            ["gm", "toggle_zero_slot_buy"] => {
+                if self.config.zero_slot_urls.is_empty() {
+                    self.answer_cb(callback_id, Some("未配置 0slot 端点")).await;
+                    return;
+                }
+                let enabled = self.groups.toggle_zero_slot_buy_enabled();
+                self.answer_cb(
+                    callback_id,
+                    Some(if enabled {
+                        "0slot 买入通道已开启"
+                    } else {
+                        "0slot 买入通道已关闭"
+                    }),
+                )
+                .await;
+                self.edit_msg(
+                    message_id,
+                    "<b>组合菜单</b>\n\n请选择要执行的操作。",
+                    group_menu_keyboard_v2(enabled),
                 )
                 .await;
             }
@@ -744,7 +766,7 @@ impl TgBot {
 <code>/sellall [group_id]</code> 手动全卖\n\
 <code>/stats</code> 查看运行统计\n\n\
 支持快捷设置的参数键：<code>buy</code>、<code>min_buy</code>、<code>tp</code>、<code>sl</code>、<code>trailing</code>、<code>slippage</code>、<code>sell_slippage</code>、<code>consensus</code>、<code>hold</code>、<code>tip_buy</code>、<code>tip_sell</code>、<code>zero_slot_tip</code>、<code>buy_mode</code>、<code>mode</code>、<code>enabled</code>",
-            group_menu_keyboard_v2(),
+            group_menu_keyboard_v2(self.groups.zero_slot_buy_enabled()),
         )
         .await;
     }
@@ -771,6 +793,11 @@ impl TgBot {
             self.auto_sell.get_active_positions().len(),
             self.consensus.pending_count(),
         );
+
+        text.push_str(&format!(
+            "\n0slot 买入通道: {}",
+            zero_slot_buy_status_label(self.groups.zero_slot_buy_enabled())
+        ));
 
         if let Some(group) = self.groups.selected_group() {
             text.push_str("\n\n");
@@ -1425,6 +1452,9 @@ fn group_menu_keyboard() -> serde_json::Value {
             ],
             [
                 {"text": "切换当前组合", "callback_data": "gm:pick:use"}
+            ],
+            [
+                {"text": zero_slot_buy_button_label(zero_slot_buy_enabled), "callback_data": "gm:toggle_zero_slot_buy"}
             ]
         ]
     })
@@ -1619,6 +1649,10 @@ fn value_row(group_id: &str, key: &str, values: &[(&str, &str)]) -> serde_json::
 
 fn format_groups_overview(groups: &GroupManager, selected: Option<String>) -> String {
     let mut text = "<b>组合列表</b>".to_string();
+    text.push_str(&format!(
+        "\n0slot 买入通道: {}",
+        zero_slot_buy_status_label(groups.zero_slot_buy_enabled())
+    ));
     for group in groups.all_groups() {
         let selected_tag = if selected.as_deref() == Some(group.id.as_str()) {
             " [当前组合]"
@@ -1738,7 +1772,7 @@ fn format_positions(positions: &[Position]) -> String {
     text
 }
 
-fn group_menu_keyboard_v2() -> serde_json::Value {
+fn group_menu_keyboard_v2(zero_slot_buy_enabled: bool) -> serde_json::Value {
     json!({
         "inline_keyboard": [
             [
@@ -1756,9 +1790,28 @@ fn group_menu_keyboard_v2() -> serde_json::Value {
             [
                 {"text": "切换当前组合", "callback_data": "gm:pick:use"},
                 {"text": "查看持仓列表", "callback_data": "gm:positions"}
+            ],
+            [
+                {"text": zero_slot_buy_button_label(zero_slot_buy_enabled), "callback_data": "gm:toggle_zero_slot_buy"}
             ]
         ]
     })
+}
+
+fn zero_slot_buy_button_label(enabled: bool) -> &'static str {
+    if enabled {
+        "关闭 0slot 买入"
+    } else {
+        "开启 0slot 买入"
+    }
+}
+
+fn zero_slot_buy_status_label(enabled: bool) -> &'static str {
+    if enabled {
+        "已开启"
+    } else {
+        "已关闭"
+    }
 }
 
 fn group_setting_menu_keyboard_v2(group: &CopyGroup) -> serde_json::Value {

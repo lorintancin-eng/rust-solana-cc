@@ -131,6 +131,8 @@ struct PersistedGroupsState {
     groups: Vec<PersistedGroup>,
     selected_group_id: Option<String>,
     blocklist: Vec<String>,
+    #[serde(default)]
+    zero_slot_buy_enabled: bool,
 }
 
 impl PersistedGroup {
@@ -197,6 +199,7 @@ pub struct GroupManager {
     groups: Arc<DashMap<String, CopyGroup>>,
     selected_group_id: RwLock<Option<String>>,
     blocklist: DashSet<Pubkey>,
+    zero_slot_buy_enabled: RwLock<bool>,
 }
 
 impl GroupManager {
@@ -204,6 +207,7 @@ impl GroupManager {
         let mut groups = Vec::new();
         let mut selected_group_id = None;
         let mut blocklist = Vec::new();
+        let mut zero_slot_buy_enabled = false;
 
         if Path::new(GROUPS_FILE).exists() {
             match fs::read_to_string(GROUPS_FILE) {
@@ -211,6 +215,7 @@ impl GroupManager {
                     Ok(saved) => {
                         selected_group_id = saved.selected_group_id;
                         blocklist = saved.blocklist;
+                        zero_slot_buy_enabled = saved.zero_slot_buy_enabled;
                         groups = saved
                             .groups
                             .into_iter()
@@ -231,6 +236,7 @@ impl GroupManager {
             groups: Arc::new(DashMap::new()),
             selected_group_id: RwLock::new(selected_group_id),
             blocklist: DashSet::new(),
+            zero_slot_buy_enabled: RwLock::new(zero_slot_buy_enabled),
         });
 
         for group in groups {
@@ -420,6 +426,24 @@ impl GroupManager {
         self.blocklist.iter().map(|entry| *entry.key()).collect()
     }
 
+    pub fn zero_slot_buy_enabled(&self) -> bool {
+        *self.zero_slot_buy_enabled.read().unwrap()
+    }
+
+    pub fn set_zero_slot_buy_enabled(&self, enabled: bool) {
+        *self.zero_slot_buy_enabled.write().unwrap() = enabled;
+        self.save();
+    }
+
+    pub fn toggle_zero_slot_buy_enabled(&self) -> bool {
+        let mut enabled = self.zero_slot_buy_enabled.write().unwrap();
+        *enabled = !*enabled;
+        let current = *enabled;
+        drop(enabled);
+        self.save();
+        current
+    }
+
     fn next_group_id(&self) -> String {
         let max_index = self
             .groups
@@ -439,6 +463,7 @@ impl GroupManager {
                 .collect(),
             selected_group_id: self.selected_group_id(),
             blocklist: self.blocklist().iter().map(ToString::to_string).collect(),
+            zero_slot_buy_enabled: self.zero_slot_buy_enabled(),
         };
 
         match serde_json::to_string_pretty(&state) {
