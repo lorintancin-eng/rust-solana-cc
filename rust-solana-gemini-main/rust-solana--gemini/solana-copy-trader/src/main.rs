@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.23");
+    info!("   Solana 跟单交易系统 v1.6.24");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -674,18 +674,7 @@ async fn execute_buy(
         Ok((mirror, _)) => {
             let (blockhash, _) = blockhash_cache.get_sync();
             let tx_build_start = Instant::now();
-            let tx_result = if !config.zero_slot_urls.is_empty() {
-                let fee_account = tx_sender.random_0slot_tip_account();
-                TxBuilder::build_0slot_transaction(
-                    &mirror,
-                    &config,
-                    &config.keypair,
-                    blockhash,
-                    &fee_account,
-                    config.zero_slot_tip_lamports,
-                    &[],
-                )
-            } else if config.jito_enabled {
+            let tx_result = if config.jito_enabled {
                 let tip = tx_sender.random_jito_tip_account();
                 TxBuilder::build_jito_bundle_transaction(
                     &mirror,
@@ -704,7 +693,7 @@ async fn execute_buy(
             match tx_result {
                 Ok(transaction) => {
                     let send_call_start = Instant::now();
-                    match tx_sender.fire_and_forget(&transaction, None) {
+                    match tx_sender.fire_and_forget_without_0slot(&transaction) {
                         Ok(sig) => {
                             timings.send_call = send_call_start.elapsed();
                             let total_latency = start.elapsed();
