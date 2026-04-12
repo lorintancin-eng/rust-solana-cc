@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.27");
+    info!("   Solana 跟单交易系统 v1.6.29");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -411,8 +411,6 @@ async fn main() -> Result<()> {
 
             if wants_entry {
                 entry_groups.push(group.clone());
-            } else {
-                consensus_engine.revoke_signal(&group.id, &token_mint, &trade.source_wallet);
             }
 
             if !trade.is_buy && group.follow_sell_mode() {
