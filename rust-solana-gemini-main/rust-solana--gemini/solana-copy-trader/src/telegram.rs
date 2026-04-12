@@ -1454,7 +1454,7 @@ fn group_menu_keyboard() -> serde_json::Value {
                 {"text": "切换当前组合", "callback_data": "gm:pick:use"}
             ],
             [
-                {"text": zero_slot_buy_button_label(zero_slot_buy_enabled), "callback_data": "gm:toggle_zero_slot_buy"}
+                {"text": "切换 0slot 买入", "callback_data": "gm:toggle_zero_slot_buy"}
             ]
         ]
     })
