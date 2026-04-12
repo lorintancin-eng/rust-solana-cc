@@ -10,6 +10,8 @@ use tracing::{info, warn};
 use crate::config::{AppConfig, SELL_MODE_TP_SL};
 
 const GROUPS_FILE: &str = "copy_groups.json";
+pub const ENTRY_MODE_SMART_BUY: u8 = 0;
+pub const ENTRY_MODE_SMART_SELL: u8 = 1;
 
 #[derive(Debug, Clone)]
 pub struct CopyGroup {
@@ -30,6 +32,7 @@ pub struct CopyGroup {
     pub tip_buy_lamports: u64,
     pub tip_sell_lamports: u64,
     pub zero_slot_tip_lamports: u64,
+    pub entry_mode: u8,
     pub sell_mode: u8,
 }
 
@@ -53,6 +56,7 @@ impl CopyGroup {
             tip_buy_lamports: config.jito_buy_tip_lamports,
             tip_sell_lamports: config.jito_sell_tip_lamports,
             zero_slot_tip_lamports: config.zero_slot_tip_lamports,
+            entry_mode: ENTRY_MODE_SMART_BUY,
             sell_mode: SELL_MODE_TP_SL,
         }
     }
@@ -67,6 +71,14 @@ impl CopyGroup {
 
     pub fn follow_sell_mode(&self) -> bool {
         self.sell_mode != SELL_MODE_TP_SL
+    }
+
+    pub fn buy_on_smart_buy(&self) -> bool {
+        self.entry_mode == ENTRY_MODE_SMART_BUY
+    }
+
+    pub fn buy_on_smart_sell(&self) -> bool {
+        self.entry_mode == ENTRY_MODE_SMART_SELL
     }
 
     pub fn to_app_config(&self, base: &AppConfig) -> AppConfig {
@@ -109,6 +121,8 @@ struct PersistedGroup {
     tip_sell_lamports: u64,
     #[serde(default)]
     zero_slot_tip_lamports: Option<u64>,
+    #[serde(default)]
+    entry_mode: u8,
     sell_mode: u8,
 }
 
@@ -139,6 +153,7 @@ impl PersistedGroup {
             tip_buy_lamports: group.tip_buy_lamports,
             tip_sell_lamports: group.tip_sell_lamports,
             zero_slot_tip_lamports: Some(group.zero_slot_tip_lamports),
+            entry_mode: group.entry_mode,
             sell_mode: group.sell_mode,
         }
     }
@@ -172,6 +187,7 @@ impl PersistedGroup {
             zero_slot_tip_lamports: self
                 .zero_slot_tip_lamports
                 .unwrap_or(base.zero_slot_tip_lamports),
+            entry_mode: self.entry_mode,
             sell_mode: self.sell_mode,
         })
     }

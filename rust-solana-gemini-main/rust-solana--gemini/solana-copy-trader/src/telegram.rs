@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use crate::autosell::{AutoSellManager, Position, SellReason, SellSignal};
 use crate::config::{AppConfig, SELL_MODE_FOLLOW, SELL_MODE_TP_SL};
 use crate::consensus::ConsensusEngine;
-use crate::groups::{CopyGroup, GroupManager};
+use crate::groups::{CopyGroup, GroupManager, ENTRY_MODE_SMART_BUY, ENTRY_MODE_SMART_SELL};
 use crate::tx::sell_executor::SellExecutor;
 use crate::utils::sol_price::SolUsdPrice;
 
@@ -201,6 +201,7 @@ impl TgBot {
                 {"command": "addwallet", "description": "给当前组合添加钱包"},
                 {"command": "rmwallet", "description": "从当前组合移除钱包"},
                 {"command": "renamegroup", "description": "修改当前组合名称"},
+                {"command": "buymode", "description": "switch buy trigger mode"},
                 {"command": "sellmode", "description": "查看或切换卖出模式"},
                 {"command": "pos", "description": "查看持仓列表并手动卖出，可带 group_id"},
                 {"command": "sellall", "description": "手动卖出当前组合或指定组合持仓"},
@@ -327,6 +328,7 @@ impl TgBot {
             "/addwallet" => self.cmd_addwallet(&parts[1..]).await,
             "/rmwallet" => self.cmd_rmwallet(&parts[1..]).await,
             "/renamegroup" => self.cmd_renamegroup(&parts[1..]).await,
+            "/buymode" => self.cmd_buymode(&parts[1..]).await,
             "/sellmode" => self.cmd_sellmode(&parts[1..]).await,
             "/pos" => self.cmd_positions(&parts[1..]).await,
             "/sellall" => self.cmd_sellall(&parts[1..]).await,
@@ -735,11 +737,12 @@ impl TgBot {
 <code>/addwallet 地址</code> 添加钱包\n\
 <code>/rmwallet 地址</code> 移除钱包\n\
 <code>/renamegroup 新名称</code> 修改当前组合名称\n\
+<code>/buymode buy|sell</code> 切换跟单买入模式\n\
 <code>/sellmode follow|tp_sl</code> 切换卖出模式\n\
 <code>/pos [group_id]</code> 查看持仓\n\
 <code>/sellall [group_id]</code> 手动全卖\n\
 <code>/stats</code> 查看运行统计\n\n\
-支持快捷设置的参数键：<code>buy</code>、<code>min_buy</code>、<code>tp</code>、<code>sl</code>、<code>trailing</code>、<code>slippage</code>、<code>sell_slippage</code>、<code>consensus</code>、<code>hold</code>、<code>tip_buy</code>、<code>tip_sell</code>、<code>zero_slot_tip</code>、<code>mode</code>、<code>enabled</code>",
+支持快捷设置的参数键：<code>buy</code>、<code>min_buy</code>、<code>tp</code>、<code>sl</code>、<code>trailing</code>、<code>slippage</code>、<code>sell_slippage</code>、<code>consensus</code>、<code>hold</code>、<code>tip_buy</code>、<code>tip_sell</code>、<code>zero_slot_tip</code>、<code>buy_mode</code>、<code>mode</code>、<code>enabled</code>",
             group_menu_keyboard_v2(),
         )
         .await;
@@ -980,6 +983,37 @@ impl TgBot {
                     )
                     .await;
                 }
+            }
+            Err(err) => self.send_msg(&err).await,
+        }
+    }
+
+    async fn cmd_buymode(&self, args: &[&str]) {
+        let Some(mut group) = self.groups.selected_group() else {
+            self.send_msg("no selected group").await;
+            return;
+        };
+
+        if args.is_empty() {
+            self.send_msg(&format!(
+                "Current group <b>{}</b> buy trigger mode: <b>{}</b>",
+                group.name,
+                entry_mode_label(group.entry_mode),
+            ))
+            .await;
+            return;
+        }
+
+        match parse_entry_mode(args[0]) {
+            Ok(mode) => {
+                group.entry_mode = mode;
+                self.groups.replace_group(group.clone());
+                self.send_msg(&format!(
+                    "Group <b>{}</b> buy trigger mode updated to <b>{}</b>",
+                    group.name,
+                    entry_mode_label(mode),
+                ))
+                .await;
             }
             Err(err) => self.send_msg(&err).await,
         }
@@ -1248,6 +1282,10 @@ fn apply_group_setting_value(
                 format!("zero_slot_tip = {} lamports", v)
             })
             .map_err(|err| err.to_string()),
+        "buy_mode" | "entry_mode" => parse_entry_mode(value).map(|mode| {
+            group.entry_mode = mode;
+            format!("buy_mode = {}", entry_mode_label(mode))
+        }),
         "mode" | "sell_mode" => parse_sell_mode(value).map(|mode| {
             group.sell_mode = mode;
             format!("mode = {}", sell_mode_label(mode))
@@ -1257,6 +1295,16 @@ fn apply_group_setting_value(
             format!("enabled = {}", enabled)
         }),
         _ => Err(format!("未知参数键: {}", key)),
+    }
+}
+
+fn parse_entry_mode(value: &str) -> Result<u8, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "buy" | "smart_buy" | "buy_follow" | "buy-follow" => Ok(ENTRY_MODE_SMART_BUY),
+        "sell" | "smart_sell" | "sell_buy" | "sell-follow" | "sell_follow" => {
+            Ok(ENTRY_MODE_SMART_SELL)
+        }
+        _ => Err("invalid buy mode, use buy or sell".to_string()),
     }
 }
 
@@ -1281,6 +1329,14 @@ fn sell_mode_label(mode: u8) -> &'static str {
         "跟卖模式"
     } else {
         "止盈止损模式"
+    }
+}
+
+fn entry_mode_label(mode: u8) -> &'static str {
+    if mode == ENTRY_MODE_SMART_SELL {
+        "sell-trigger buy"
+    } else {
+        "buy-trigger buy"
     }
 }
 
@@ -1328,13 +1384,14 @@ fn setting_custom_hint(group: &CopyGroup, key: &str) -> String {
         "tip_buy" => "10000",
         "tip_sell" => "10000",
         "zero_slot_tip" => "1000000",
+        "buy_mode" => "buy",
         "mode" => "follow",
         "enabled" => "on",
         _ => "value",
     };
 
     format!(
-        "也可自定义输入。\n先执行 <code>/usegroup {}</code>\n再执行 <code>/set {} {}</code>",
+        "Custom input is also supported. Run <code>/usegroup {}</code> then <code>/set {} {}</code>",
         group.id, key, example_value
     )
 }
@@ -1499,8 +1556,8 @@ fn group_setting_value_keyboard(group_id: &str, key: &str) -> serde_json::Value 
             value_row(group_id, key, &[("5000 bps", "5000"), ("8000 bps", "8000")]),
         ],
         "hold" => vec![
-            value_row(group_id, key, &[("5 分钟", "5"), ("10 分钟", "10")]),
-            value_row(group_id, key, &[("20 分钟", "20"), ("30 分钟", "30")]),
+            value_row(group_id, key, &[("5 min", "5"), ("10 min", "10")]),
+            value_row(group_id, key, &[("20 min", "20"), ("30 min", "30")]),
         ],
         "tip_buy" | "tip_sell" => vec![
             value_row(group_id, key, &[("10000", "10000"), ("50000", "50000")]),
@@ -1514,18 +1571,23 @@ fn group_setting_value_keyboard(group_id: &str, key: &str) -> serde_json::Value 
                 &[("500000", "500000"), ("1000000", "1000000")],
             ),
         ],
+        "buy_mode" => vec![value_row(
+            group_id,
+            key,
+            &[("buy-trigger", "buy"), ("sell-trigger", "sell")],
+        )],
         "mode" => vec![value_row(
             group_id,
             key,
-            &[("跟卖模式", "follow"), ("止盈止损", "tp_sl")],
+            &[("follow sell", "follow"), ("tp/sl", "tp_sl")],
         )],
-        _ => vec![value_row(group_id, key, &[("默认", "0")])],
+        _ => vec![value_row(group_id, key, &[("default", "0")])],
     };
 
     let mut keyboard = rows;
     keyboard.push(json!([
-        {"text": "返回参数页", "callback_data": format!("gm:set:{}", group_id)},
-        {"text": "返回菜单", "callback_data": "gm:main"}
+        {"text": "back to settings", "callback_data": format!("gm:set:{}", group_id)},
+        {"text": "back to menu", "callback_data": "gm:main"}
     ]));
     json!({ "inline_keyboard": keyboard })
 }
@@ -1544,20 +1606,21 @@ fn value_row(group_id: &str, key: &str, values: &[(&str, &str)]) -> serde_json::
 }
 
 fn format_groups_overview(groups: &GroupManager, selected: Option<String>) -> String {
-    let mut text = "<b>组合列表</b>".to_string();
+    let mut text = "<b>Groups</b>".to_string();
     for group in groups.all_groups() {
         let selected_tag = if selected.as_deref() == Some(group.id.as_str()) {
-            " [当前]"
+            " [current]"
         } else {
             ""
         };
         text.push_str(&format!(
-            "\n\n<b>{}</b> ({}){}\n状态: {}\n钱包数: {}\n模式: {}\n买入: {} SOL | 共识: {}",
+            "\n\n<b>{}</b> ({}){}\nstatus: {}\nwallets: {}\nbuy mode: {}\nsell mode: {}\nbuy: {} SOL | consensus: {}",
             group.name,
             group.id,
             selected_tag,
-            if group.enabled { "启用" } else { "停用" },
+            if group.enabled { "enabled" } else { "disabled" },
             group.wallets.len(),
+            entry_mode_label(group.entry_mode),
             sell_mode_label(group.sell_mode),
             group.buy_sol_amount,
             group.consensus_min_wallets,
@@ -1630,10 +1693,11 @@ fn group_value_text(group: &CopyGroup, key: &str) -> String {
         "slippage" => format!("{} bps", group.slippage_bps),
         "sell_slippage" => format!("{} bps", group.sell_slippage_bps),
         "consensus" => group.consensus_min_wallets.to_string(),
-        "hold" => format!("{} 分钟", group.max_hold_seconds / 60),
+        "hold" => format!("{} min", group.max_hold_seconds / 60),
         "tip_buy" => format!("{} lamports", group.tip_buy_lamports),
         "tip_sell" => format!("{} lamports", group.tip_sell_lamports),
         "zero_slot_tip" => format!("{} lamports", group.zero_slot_tip_lamports),
+        "buy_mode" => entry_mode_label(group.entry_mode).to_string(),
         "mode" => sell_mode_label(group.sell_mode).to_string(),
         _ => "-".to_string(),
     }
@@ -1689,35 +1753,36 @@ fn group_setting_menu_keyboard_v2(group: &CopyGroup) -> serde_json::Value {
     json!({
         "inline_keyboard": [
             [
-                {"text": "买入金额", "callback_data": format!("gm:key:{}:buy", group.id)},
-                {"text": "最小买入", "callback_data": format!("gm:key:{}:min_buy", group.id)}
+                {"text": "buy amount", "callback_data": format!("gm:key:{}:buy", group.id)},
+                {"text": "min buy", "callback_data": format!("gm:key:{}:min_buy", group.id)}
             ],
             [
-                {"text": "止盈", "callback_data": format!("gm:key:{}:tp", group.id)},
-                {"text": "止损", "callback_data": format!("gm:key:{}:sl", group.id)}
+                {"text": "take profit", "callback_data": format!("gm:key:{}:tp", group.id)},
+                {"text": "stop loss", "callback_data": format!("gm:key:{}:sl", group.id)}
             ],
             [
-                {"text": "移动止损", "callback_data": format!("gm:key:{}:trailing", group.id)},
-                {"text": "共识数量", "callback_data": format!("gm:key:{}:consensus", group.id)}
+                {"text": "trailing", "callback_data": format!("gm:key:{}:trailing", group.id)},
+                {"text": "consensus", "callback_data": format!("gm:key:{}:consensus", group.id)}
             ],
             [
-                {"text": "买入滑点", "callback_data": format!("gm:key:{}:slippage", group.id)},
-                {"text": "卖出滑点", "callback_data": format!("gm:key:{}:sell_slippage", group.id)}
+                {"text": "buy slippage", "callback_data": format!("gm:key:{}:slippage", group.id)},
+                {"text": "sell slippage", "callback_data": format!("gm:key:{}:sell_slippage", group.id)}
             ],
             [
-                {"text": "持仓时间", "callback_data": format!("gm:key:{}:hold", group.id)},
-                {"text": "卖出模式", "callback_data": format!("gm:key:{}:mode", group.id)}
+                {"text": "hold time", "callback_data": format!("gm:key:{}:hold", group.id)},
+                {"text": "buy mode", "callback_data": format!("gm:key:{}:buy_mode", group.id)}
             ],
             [
-                {"text": "买入小费", "callback_data": format!("gm:key:{}:tip_buy", group.id)},
-                {"text": "卖出小费", "callback_data": format!("gm:key:{}:tip_sell", group.id)}
+                {"text": "buy tip", "callback_data": format!("gm:key:{}:tip_buy", group.id)},
+                {"text": "sell tip", "callback_data": format!("gm:key:{}:tip_sell", group.id)}
             ],
             [
-                {"text": "0slot 小费", "callback_data": format!("gm:key:{}:zero_slot_tip", group.id)},
-                {"text": "查看组合", "callback_data": format!("gm:view:{}", group.id)}
+                {"text": "0slot tip", "callback_data": format!("gm:key:{}:zero_slot_tip", group.id)},
+                {"text": "sell mode", "callback_data": format!("gm:key:{}:mode", group.id)}
             ],
             [
-                {"text": "返回菜单", "callback_data": "gm:main"}
+                {"text": "view group", "callback_data": format!("gm:view:{}", group.id)},
+                {"text": "back to menu", "callback_data": "gm:main"}
             ]
         ]
     })
@@ -1772,9 +1837,10 @@ fn group_rename_keyboard(group: &CopyGroup) -> serde_json::Value {
 
 fn format_group_compact_v2(group: &CopyGroup) -> String {
     format!(
-        "组合: <b>{}</b> ({})\n模式: {}\n买入: {} SOL | 最小买入: {} SOL\nTP: {}% | SL: {}% | Trailing: {}%\n买入滑点: {} bps | 卖出滑点: {} bps\n共识: {} | 持仓: {} 分钟\n买入小费: {} | 卖出小费: {}\n0slot 小费: {}",
+        "group: <b>{}</b> ({})\nbuy mode: {}\nsell mode: {}\nbuy: {} SOL | min buy: {} SOL\nTP: {}% | SL: {}% | trailing: {}%\nbuy slippage: {} bps | sell slippage: {} bps\nconsensus: {} | hold: {} min\nbuy tip: {} | sell tip: {}\n0slot tip: {}",
         group.name,
         group.id,
+        entry_mode_label(group.entry_mode),
         sell_mode_label(group.sell_mode),
         group.buy_sol_amount,
         group.min_target_buy_sol,
@@ -1793,11 +1859,12 @@ fn format_group_compact_v2(group: &CopyGroup) -> String {
 
 fn format_group_detail_v2(group: &CopyGroup, selected: bool) -> String {
     let mut text = format!(
-        "<b>{}</b> ({}){}\n状态: {}\n卖出模式: {}\n钱包数: {}\n买入: {} SOL\n最小触发买入: {} SOL\nTP: {}%\nSL: {}%\nTrailing: {}%\n买入滑点: {} bps\n卖出滑点: {} bps\n共识数量: {}\n持仓时间: {} 分钟\n买入小费: {} lamports\n卖出小费: {} lamports\n0slot 小费: {} lamports",
+        "<b>{}</b> ({}){}\nstatus: {}\nbuy mode: {}\nsell mode: {}\nwallets: {}\nbuy: {} SOL\nmin trigger buy: {} SOL\nTP: {}%\nSL: {}%\ntrailing: {}%\nbuy slippage: {} bps\nsell slippage: {} bps\nconsensus: {}\nhold: {} min\nbuy tip: {} lamports\nsell tip: {} lamports\n0slot tip: {} lamports",
         group.name,
         group.id,
-        if selected { " [当前组合]" } else { "" },
-        if group.enabled { "启用" } else { "停用" },
+        if selected { " [current]" } else { "" },
+        if group.enabled { "enabled" } else { "disabled" },
+        entry_mode_label(group.entry_mode),
         sell_mode_label(group.sell_mode),
         group.wallets.len(),
         group.buy_sol_amount,
@@ -1815,9 +1882,9 @@ fn format_group_detail_v2(group: &CopyGroup, selected: bool) -> String {
     );
 
     if group.wallets.is_empty() {
-        text.push_str("\n监听钱包: 暂无");
+        text.push_str("\nwallets: none");
     } else {
-        text.push_str("\n监听钱包:");
+        text.push_str("\nwallets:");
         for wallet in &group.wallets {
             text.push_str(&format!("\n- <code>{}</code>", wallet));
         }
@@ -1828,20 +1895,21 @@ fn format_group_detail_v2(group: &CopyGroup, selected: bool) -> String {
 
 fn setting_label_v2(key: &str) -> &'static str {
     match key {
-        "buy" => "买入金额",
-        "min_buy" => "最小触发买入额",
-        "tp" => "止盈比例",
-        "sl" => "止损比例",
-        "trailing" => "移动止损",
-        "slippage" => "买入滑点",
-        "sell_slippage" => "卖出滑点",
-        "consensus" => "共识数量",
-        "hold" => "最大持仓时间",
-        "tip_buy" => "买入小费",
-        "tip_sell" => "卖出小费",
-        "zero_slot_tip" => "0slot 小费",
-        "mode" => "卖出模式",
-        _ => "参数",
+        "buy" => "buy amount",
+        "min_buy" => "min buy",
+        "tp" => "take profit",
+        "sl" => "stop loss",
+        "trailing" => "trailing stop",
+        "slippage" => "buy slippage",
+        "sell_slippage" => "sell slippage",
+        "consensus" => "consensus",
+        "hold" => "hold time",
+        "tip_buy" => "buy tip",
+        "tip_sell" => "sell tip",
+        "zero_slot_tip" => "0slot tip",
+        "buy_mode" => "buy mode",
+        "mode" => "sell mode",
+        _ => "setting",
     }
 }
 

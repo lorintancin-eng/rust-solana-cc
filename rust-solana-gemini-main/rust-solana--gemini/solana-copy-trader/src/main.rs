@@ -24,7 +24,7 @@ use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellReason, SellS
 use config::AppConfig;
 use consensus::engine::{BuySignal, ConsensusTrigger};
 use consensus::ConsensusEngine;
-use groups::{CopyGroup, GroupManager};
+use groups::{CopyGroup, GroupManager, ENTRY_MODE_SMART_BUY};
 use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache, GrpcSubscriber};
 use processor::prefetch::PrefetchCache;
 use processor::pumpfun::PumpfunProcessor;
@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.25");
+    info!("   Solana 跟单交易系统 v1.6.26");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -401,13 +401,21 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        if !trade.is_buy {
-            for group in matching_groups {
-                consensus_engine.revoke_signal(&group.id, &token_mint, &trade.source_wallet);
-                if !group.follow_sell_mode() {
-                    continue;
-                }
+        let mut entry_groups = Vec::new();
+        for group in matching_groups {
+            let wants_entry = if trade.is_buy {
+                group.buy_on_smart_buy()
+            } else {
+                group.buy_on_smart_sell()
+            };
 
+            if wants_entry {
+                entry_groups.push(group.clone());
+            } else {
+                consensus_engine.revoke_signal(&group.id, &token_mint, &trade.source_wallet);
+            }
+
+            if !trade.is_buy && group.follow_sell_mode() {
                 if let Some(position) =
                     auto_sell_manager.get_position_by_group_mint(&group.id, &token_mint)
                 {
@@ -422,6 +430,9 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+
+        if entry_groups.is_empty() {
             continue;
         }
 
@@ -450,7 +461,12 @@ async fn main() -> Result<()> {
             });
         }
 
-        for group in matching_groups {
+        for group in entry_groups {
+            let target_instruction_data = if group.entry_mode == ENTRY_MODE_SMART_BUY {
+                trade.instruction_data.clone()
+            } else {
+                Vec::new()
+            };
             if group.min_target_buy_lamports() > 0
                 && trade.sol_amount_lamports > 0
                 && trade.sol_amount_lamports < group.min_target_buy_lamports()
@@ -480,7 +496,6 @@ async fn main() -> Result<()> {
                 let stats = tg_stats.clone();
                 let limiter = buy_exec_limiter.clone();
                 let trade_wallet = trade.source_wallet;
-                let target_instruction_data = trade.instruction_data.clone();
                 let group_clone = group.clone();
                 tokio::spawn(async move {
                     let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
@@ -518,7 +533,7 @@ async fn main() -> Result<()> {
                         signature: trade.signature.clone(),
                         consensus_min_wallets: group.consensus_min_wallets,
                         consensus_timeout_secs: group.consensus_timeout_secs,
-                        instruction_data: trade.instruction_data.clone(),
+                        instruction_data: target_instruction_data.clone(),
                         instruction_accounts: trade.instruction_accounts.clone(),
                         sol_amount_lamports: trade.sol_amount_lamports,
                         is_pre_execution: trade.is_pre_execution,
