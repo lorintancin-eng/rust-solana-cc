@@ -826,7 +826,7 @@ impl PumpfunProcessor {
 
         let sol_amount = config.buy_lamports();
         let token_amount = curve_state.sol_to_token_quote(sol_amount);
-        self.validate_buy_amount(token_amount, Some(curve_state))?;
+        self.validate_buy_amount(token_amount, Some(&curve_state))?;
         let max_sol_cost = sol_amount + (sol_amount * config.slippage_bps / 10_000);
 
         let buy_ix = self.build_buy_instruction_from_mirror(
