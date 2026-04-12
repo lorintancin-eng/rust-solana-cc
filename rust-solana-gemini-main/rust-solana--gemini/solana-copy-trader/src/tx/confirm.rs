@@ -406,6 +406,7 @@ impl BuyConfirmer {
                 );
 
                 tg.send(TgEvent::BuyConfirmed {
+                    group_id: position_key.group_id.clone(),
                     group_name: group_name.clone(),
                     mint,
                     token_name: token_name_short,
