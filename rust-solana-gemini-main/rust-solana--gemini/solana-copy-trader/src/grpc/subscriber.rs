@@ -27,6 +27,7 @@ const RAYDIUM_CPMM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 // buy  = sha256("global:buy")[..8]
 // sell = sha256("global:sell")[..8]
 const PUMPFUN_BUY_DISC: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+const PUMPFUN_BUY_EXACT_SOL_IN_DISC: [u8; 8] = [56, 252, 116, 8, 158, 223, 205, 95];
 const PUMPFUN_SELL_DISC: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 
 // PumpSwap: 使用统一的 swap 指令，通过 token 方向判断 buy/sell
@@ -440,6 +441,7 @@ impl GrpcSubscriber {
                     Self::serialize_transaction_from_proto(tx_data).unwrap_or_default();
                 // meta 为空 = 预执行（交易尚未被 leader 执行，可 Backrun）
                 trade.is_pre_execution = meta.is_none();
+                self.enrich_trade_from_meta(&mut trade, message, meta, &account_keys);
                 return Ok(Some(trade));
             }
         }
@@ -492,6 +494,7 @@ impl GrpcSubscriber {
                             Self::serialize_transaction_from_proto(tx_data).unwrap_or_default();
                         // inner instructions 来自 meta，所以交易已执行，不可 Backrun
                         trade.is_pre_execution = false;
+                        self.enrich_trade_from_meta(&mut trade, message, meta, &account_keys);
                         return Ok(Some(trade));
                     }
                 }
@@ -539,10 +542,8 @@ impl GrpcSubscriber {
             .filter_map(|&idx| all_account_keys.get(idx as usize).copied())
             .collect();
 
-        // 从 Pump.fun buy 指令数据提取 max_sol_cost (买入 SOL 数量)
-        // data 布局: [0..8] discriminator, [8..16] token_amount, [16..24] max_sol_cost
-        let sol_amount_lamports = if is_buy && data.len() >= 24 {
-            u64::from_le_bytes(data[16..24].try_into().unwrap_or([0; 8]))
+        let sol_amount_lamports = if is_buy {
+            Self::extract_buy_lamports(&trade_type, data)
         } else {
             0
         };
@@ -689,7 +690,7 @@ impl GrpcSubscriber {
             // 有明确的 buy/sell 两个独立指令
             // ========================================
             TradeType::Pumpfun => {
-                if disc == PUMPFUN_BUY_DISC {
+                if disc == PUMPFUN_BUY_DISC || disc == PUMPFUN_BUY_EXACT_SOL_IN_DISC {
                     true
                 } else if disc == PUMPFUN_SELL_DISC {
                     false
@@ -818,6 +819,127 @@ impl GrpcSubscriber {
 
         // source 不是 WSOL ATA → 大概率是 token ATA → SELL
         false
+    }
+
+    fn extract_buy_lamports(trade_type: &TradeType, data: &[u8]) -> u64 {
+        if data.len() < 24 {
+            return 0;
+        }
+
+        match trade_type {
+            TradeType::Pumpfun => {
+                let disc = &data[..8];
+                if disc == PUMPFUN_BUY_DISC {
+                    u64::from_le_bytes(data[16..24].try_into().unwrap_or([0; 8]))
+                } else if disc == PUMPFUN_BUY_EXACT_SOL_IN_DISC {
+                    u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]))
+                } else {
+                    0
+                }
+            }
+            TradeType::PumpSwap => u64::from_le_bytes(data[16..24].try_into().unwrap_or([0; 8])),
+            _ => 0,
+        }
+    }
+
+    fn enrich_trade_from_meta(
+        &self,
+        trade: &mut DetectedTrade,
+        message: &yellowstone_grpc_proto::prelude::Message,
+        meta: Option<&yellowstone_grpc_proto::prelude::TransactionStatusMeta>,
+        all_account_keys: &[Pubkey],
+    ) {
+        if !trade.is_buy || trade.sol_amount_lamports > 0 {
+            return;
+        }
+
+        let Some(meta) = meta else {
+            return;
+        };
+
+        if let Some(lamports) = Self::derive_buy_lamports_from_meta(
+            meta,
+            message,
+            all_account_keys,
+            trade.source_wallet,
+        ) {
+            trade.sol_amount_lamports = lamports;
+        }
+    }
+
+    fn derive_buy_lamports_from_meta(
+        meta: &yellowstone_grpc_proto::prelude::TransactionStatusMeta,
+        message: &yellowstone_grpc_proto::prelude::Message,
+        all_account_keys: &[Pubkey],
+        source_wallet: Pubkey,
+    ) -> Option<u64> {
+        let mut transfer_total = 0u64;
+
+        for ix in &message.instructions {
+            transfer_total = transfer_total.saturating_add(Self::extract_system_transfer_lamports(
+                ix.program_id_index as usize,
+                &ix.accounts,
+                &ix.data,
+                all_account_keys,
+                source_wallet,
+            ));
+        }
+
+        for inner_group in &meta.inner_instructions {
+            for inner_ix in &inner_group.instructions {
+                transfer_total =
+                    transfer_total.saturating_add(Self::extract_system_transfer_lamports(
+                        inner_ix.program_id_index as usize,
+                        &inner_ix.accounts,
+                        &inner_ix.data,
+                        all_account_keys,
+                        source_wallet,
+                    ));
+            }
+        }
+
+        if transfer_total > 0 {
+            return Some(transfer_total);
+        }
+
+        let source_index = all_account_keys.iter().position(|k| *k == source_wallet)?;
+        let pre = *meta.pre_balances.get(source_index)?;
+        let post = *meta.post_balances.get(source_index)?;
+        let delta = pre.saturating_sub(post);
+        if delta == 0 {
+            return None;
+        }
+
+        Some(delta.saturating_sub(meta.fee))
+    }
+
+    fn extract_system_transfer_lamports(
+        program_index: usize,
+        account_indices: &[u8],
+        data: &[u8],
+        all_account_keys: &[Pubkey],
+        source_wallet: Pubkey,
+    ) -> u64 {
+        if program_index >= all_account_keys.len()
+            || all_account_keys[program_index] != solana_sdk::system_program::id()
+            || account_indices.is_empty()
+            || data.len() < 12
+        {
+            return 0;
+        }
+
+        let source_index = account_indices[0] as usize;
+        if source_index >= all_account_keys.len() || all_account_keys[source_index] != source_wallet
+        {
+            return 0;
+        }
+
+        let instruction = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+        if instruction != 2 {
+            return 0;
+        }
+
+        u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8]))
     }
 }
 
