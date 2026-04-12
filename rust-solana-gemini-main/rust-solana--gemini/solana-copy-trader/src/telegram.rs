@@ -200,6 +200,7 @@ impl TgBot {
                 {"command": "wallets", "description": "查看当前组合的钱包列表"},
                 {"command": "addwallet", "description": "给当前组合添加钱包"},
                 {"command": "rmwallet", "description": "从当前组合移除钱包"},
+                {"command": "renamegroup", "description": "修改当前组合名称"},
                 {"command": "sellmode", "description": "查看或切换卖出模式"},
                 {"command": "pos", "description": "查看持仓列表并手动卖出，可带 group_id"},
                 {"command": "sellall", "description": "手动卖出当前组合或指定组合持仓"},
@@ -325,6 +326,7 @@ impl TgBot {
             "/wallets" => self.cmd_wallets().await,
             "/addwallet" => self.cmd_addwallet(&parts[1..]).await,
             "/rmwallet" => self.cmd_rmwallet(&parts[1..]).await,
+            "/renamegroup" => self.cmd_renamegroup(&parts[1..]).await,
             "/sellmode" => self.cmd_sellmode(&parts[1..]).await,
             "/pos" => self.cmd_positions(&parts[1..]).await,
             "/sellall" => self.cmd_sellall(&parts[1..]).await,
@@ -421,6 +423,74 @@ impl TgBot {
                             group.id,
                         ),
                         group_setting_menu_keyboard_v2(&group),
+                    )
+                    .await;
+                }
+            }
+            ["gw", "a", group_id] => {
+                self.answer_cb(callback_id, None).await;
+                if let Some(group) = self.groups.get_group(group_id) {
+                    self.edit_msg(
+                        message_id,
+                        &format!(
+                            "<b>添加钱包</b>\n\n组合: <b>{}</b> ({})\n\n先执行 <code>/usegroup {}</code>\n再执行 <code>/addwallet 钱包地址</code>\n\n当前钱包数: {}",
+                            group.name,
+                            group.id,
+                            group.id,
+                            group.wallets.len(),
+                        ),
+                        group_wallet_hint_keyboard(&group),
+                    )
+                    .await;
+                }
+            }
+            ["gw", "r", group_id] => {
+                self.answer_cb(callback_id, None).await;
+                if let Some(group) = self.groups.get_group(group_id) {
+                    self.edit_msg(
+                        message_id,
+                        &format!(
+                            "<b>删除钱包</b>\n\n组合: <b>{}</b> ({})\n请选择要删除的钱包。",
+                            group.name, group.id
+                        ),
+                        group_wallet_remove_keyboard(&group),
+                    )
+                    .await;
+                }
+            }
+            ["gw", "x", group_id, wallet_raw] => {
+                self.answer_cb(callback_id, None).await;
+                match Pubkey::from_str(wallet_raw) {
+                    Ok(wallet) => match self.groups.remove_wallet(group_id, &wallet) {
+                        Ok(()) => {
+                            if let Some(group) = self.groups.get_group(group_id) {
+                                self.edit_msg(
+                                    message_id,
+                                    &format_group_detail_v2(
+                                        &group,
+                                        self.groups.selected_group_id().as_deref()
+                                            == Some(group_id),
+                                    ),
+                                    group_detail_keyboard(&group),
+                                )
+                                .await;
+                            }
+                        }
+                        Err(err) => self.answer_cb(callback_id, Some(&err)).await,
+                    },
+                    Err(_) => self.answer_cb(callback_id, Some("钱包地址无效")).await,
+                }
+            }
+            ["gn", group_id] => {
+                self.answer_cb(callback_id, None).await;
+                if let Some(group) = self.groups.get_group(group_id) {
+                    self.edit_msg(
+                        message_id,
+                        &format!(
+                            "<b>修改组合名称</b>\n\n当前组合: <b>{}</b> ({})\n\n先执行 <code>/usegroup {}</code>\n再执行 <code>/renamegroup 新名称</code>",
+                            group.name, group.id, group.id
+                        ),
+                        group_rename_keyboard(&group),
                     )
                     .await;
                 }
@@ -664,6 +734,7 @@ impl TgBot {
 <code>/wallets</code> 查看当前组合钱包\n\
 <code>/addwallet 地址</code> 添加钱包\n\
 <code>/rmwallet 地址</code> 移除钱包\n\
+<code>/renamegroup 新名称</code> 修改当前组合名称\n\
 <code>/sellmode follow|tp_sl</code> 切换卖出模式\n\
 <code>/pos [group_id]</code> 查看持仓\n\
 <code>/sellall [group_id]</code> 手动全卖\n\
@@ -883,6 +954,34 @@ impl TgBot {
                 Err(err) => self.send_msg(&err).await,
             },
             Err(_) => self.send_msg("钱包地址格式无效。").await,
+        }
+    }
+
+    async fn cmd_renamegroup(&self, args: &[&str]) {
+        let Some(group) = self.groups.selected_group() else {
+            self.send_msg("当前没有选中的组合。").await;
+            return;
+        };
+
+        if args.is_empty() {
+            self.send_msg("用法: /renamegroup <新名称>").await;
+            return;
+        }
+
+        match self.groups.rename_group(&group.id, args.join(" ")) {
+            Ok(()) => {
+                if let Some(updated) = self.groups.get_group(&group.id) {
+                    self.send_msg_kb(
+                        &format!(
+                            "<b>组合名称已更新</b>\n\n{}",
+                            format_group_detail_v2(&updated, true)
+                        ),
+                        group_detail_keyboard(&updated),
+                    )
+                    .await;
+                }
+            }
+            Err(err) => self.send_msg(&err).await,
         }
     }
 
@@ -1312,7 +1411,14 @@ fn group_detail_keyboard(group: &CopyGroup) -> serde_json::Value {
                 {"text": "设为当前组合", "callback_data": format!("gm:use:{}", group.id)}
             ],
             [
-                {"text": toggle_text, "callback_data": toggle_cb},
+                {"text": "添加钱包", "callback_data": format!("gw:a:{}", group.id)},
+                {"text": "删除钱包", "callback_data": format!("gw:r:{}", group.id)}
+            ],
+            [
+                {"text": "修改名称", "callback_data": format!("gn:{}", group.id)},
+                {"text": toggle_text, "callback_data": toggle_cb}
+            ],
+            [
                 {"text": "删除组合", "callback_data": format!("gm:del:{}", group.id)}
             ],
             [
@@ -1612,6 +1718,53 @@ fn group_setting_menu_keyboard_v2(group: &CopyGroup) -> serde_json::Value {
             ],
             [
                 {"text": "返回菜单", "callback_data": "gm:main"}
+            ]
+        ]
+    })
+}
+
+fn group_wallet_hint_keyboard(group: &CopyGroup) -> serde_json::Value {
+    json!({
+        "inline_keyboard": [
+            [
+                {"text": "查看钱包列表", "callback_data": format!("gm:view:{}", group.id)},
+                {"text": "删除钱包", "callback_data": format!("gw:r:{}", group.id)}
+            ],
+            [
+                {"text": "返回组合", "callback_data": format!("gm:view:{}", group.id)}
+            ]
+        ]
+    })
+}
+
+fn group_wallet_remove_keyboard(group: &CopyGroup) -> serde_json::Value {
+    let mut rows = Vec::new();
+    if group.wallets.is_empty() {
+        rows.push(json!([
+            {"text": "暂无钱包", "callback_data": format!("gm:view:{}", group.id)}
+        ]));
+    } else {
+        for wallet in &group.wallets {
+            rows.push(json!([
+                {
+                    "text": short_pubkey(wallet),
+                    "callback_data": format!("gw:x:{}:{}", group.id, wallet)
+                }
+            ]));
+        }
+    }
+    rows.push(json!([
+        {"text": "返回组合", "callback_data": format!("gm:view:{}", group.id)}
+    ]));
+    json!({ "inline_keyboard": rows })
+}
+
+fn group_rename_keyboard(group: &CopyGroup) -> serde_json::Value {
+    json!({
+        "inline_keyboard": [
+            [
+                {"text": "返回组合", "callback_data": format!("gm:view:{}", group.id)},
+                {"text": "查看全部组合", "callback_data": "gm:overview"}
             ]
         ]
     })
