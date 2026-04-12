@@ -27,6 +27,7 @@ pub enum TgEvent {
         latency_ms: u64,
     },
     BuyConfirmed {
+        group_id: String,
         group_name: String,
         mint: Pubkey,
         token_name: String,
@@ -1138,18 +1139,27 @@ impl TgBot {
                 latency_ms,
             ),
             TgEvent::BuyConfirmed {
+                group_id,
                 group_name,
+                mint,
                 token_name,
                 spent_sol,
                 cost_price_usd,
                 mcap_usd,
-                ..
             } => {
                 self.stats.buy_success.fetch_add(1, Ordering::Relaxed);
-                format!(
+                let text = format!(
                     "<b>买入确认成功</b>\n\n组合: <b>{}</b>\n代币: {}\n花费: {:.4} SOL\n成本价: {}\n市值: {}",
                     group_name, token_name, spent_sol, cost_price_usd, mcap_usd
-                )
+                );
+                if let Some(position) = self.auto_sell.get_position_by_group_mint(&group_id, &mint)
+                {
+                    self.send_msg_kb(&text, position_detail_keyboard(&position))
+                        .await;
+                    String::new()
+                } else {
+                    text
+                }
             }
             TgEvent::BuyFailed {
                 group_name,
@@ -1187,7 +1197,9 @@ impl TgBot {
             ),
         };
 
-        self.send_msg(&text).await;
+        if !text.is_empty() {
+            self.send_msg(&text).await;
+        }
     }
 }
 
