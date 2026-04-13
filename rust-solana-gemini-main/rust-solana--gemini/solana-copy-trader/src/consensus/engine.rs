@@ -359,6 +359,7 @@ fn should_replace_signal(existing: &BuySignal, incoming: &BuySignal) -> bool {
 struct VoteTally<'a> {
     effective_signals: Vec<&'a BuySignal>,
     confirmed_signals: Vec<&'a BuySignal>,
+    confirmed_wallets: Vec<Pubkey>,
     candidate_wallets: Vec<Pubkey>,
     effective_wallets: Vec<Pubkey>,
     total_votes: usize,
@@ -406,6 +407,7 @@ fn tally_votes<'a>(signals: &'a [BuySignal], min_wallets: usize) -> VoteTally<'a
     VoteTally {
         effective_signals,
         confirmed_signals,
+        confirmed_wallets,
         candidate_wallets,
         effective_wallets,
         total_votes,
