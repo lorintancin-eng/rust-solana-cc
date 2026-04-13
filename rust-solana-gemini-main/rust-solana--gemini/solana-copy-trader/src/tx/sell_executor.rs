@@ -509,6 +509,7 @@ impl SellExecutor {
             }
             self.cleanup_mint_if_unused(&position_before_sell.token_mint);
             self.tg.send(TgEvent::SellSuccess {
+                group_id: signal.position_key.group_id.clone(),
                 group_name: signal.group_name,
                 mint: position_before_sell.token_mint,
                 token_name: if position_before_sell.token_name.is_empty() {
@@ -520,11 +521,16 @@ impl SellExecutor {
                 reason: signal.reason.to_string(),
                 pnl_percent: signal.pnl_percent,
                 tx_sig: last_sig,
+                buy_sig: position_before_sell.buy_signature.clone(),
+                hold_seconds: position_before_sell.held_seconds(),
+                entry_sol_amount: position_before_sell.entry_sol_amount as f64 / 1e9,
+                fully_closed: expected_after_balance == 0,
             });
         } else {
             self.auto_sell
                 .restore_after_sell_attempt(&signal.position_key, previous_state);
             self.tg.send(TgEvent::SellFailed {
+                group_id: signal.position_key.group_id.clone(),
                 group_name: signal.group_name,
                 mint: position_before_sell.token_mint,
                 reason: "sell retries exhausted".to_string(),
@@ -577,6 +583,7 @@ impl SellExecutor {
                 self.auto_sell
                     .apply_partial_sell(&signal.position_key, sell_amount);
                 self.tg.send(TgEvent::SellSuccess {
+                    group_id: signal.position_key.group_id.clone(),
                     group_name: signal.group_name,
                     mint: *mint,
                     token_name: if position.token_name.is_empty() {
@@ -588,6 +595,10 @@ impl SellExecutor {
                     reason: format!("manual {}%", percent),
                     pnl_percent: position.pnl_percent(),
                     tx_sig: sig,
+                    buy_sig: position.buy_signature.clone(),
+                    hold_seconds: position.held_seconds(),
+                    entry_sol_amount: position.entry_sol_amount as f64 / 1e9,
+                    fully_closed: false,
                 });
             }
             Err(err) => {

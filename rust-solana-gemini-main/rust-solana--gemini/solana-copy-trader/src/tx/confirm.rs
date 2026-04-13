@@ -143,6 +143,7 @@ impl BuyConfirmer {
                                     );
                                     auto_sell.confirm_failed(&position_key, "tx failed on-chain");
                                     tg.send(TgEvent::BuyFailed {
+                                        group_id: position_key.group_id.clone(),
                                         group_name: group_name.clone(),
                                         mint,
                                         reason: format!("tx failed on-chain: {:?}", err),
@@ -162,17 +163,13 @@ impl BuyConfirmer {
                         Ok(Err(err)) => {
                             debug!(
                                 "Buy confirm signature RPC error: [{}] {} | {}",
-                                group_name,
-                                mint_short,
-                                err,
+                                group_name, mint_short, err,
                             );
                         }
                         Err(err) => {
                             debug!(
                                 "Buy confirm signature task error: [{}] {} | {}",
-                                group_name,
-                                mint_short,
-                                err,
+                                group_name, mint_short, err,
                             );
                         }
                     }
@@ -212,17 +209,13 @@ impl BuyConfirmer {
                             Ok(Err(err)) => {
                                 debug!(
                                     "Buy confirm ATA RPC error: [{}] {} | {}",
-                                    group_name,
-                                    mint_short,
-                                    err,
+                                    group_name, mint_short, err,
                                 );
                             }
                             Err(err) => {
                                 debug!(
                                     "Buy confirm ATA task error: [{}] {} | {}",
-                                    group_name,
-                                    mint_short,
-                                    err,
+                                    group_name, mint_short, err,
                                 );
                             }
                         }
@@ -271,8 +264,7 @@ impl BuyConfirmer {
                                     };
 
                                     if owner_match {
-                                        if let Ok(amount) =
-                                            tb.ui_token_amount.amount.parse::<u64>()
+                                        if let Ok(amount) = tb.ui_token_amount.amount.parse::<u64>()
                                         {
                                             if amount > pre_buy_ata_balance {
                                                 token_balance = amount;
@@ -294,17 +286,13 @@ impl BuyConfirmer {
                     Ok(Err(err)) => {
                         warn!(
                             "Buy confirm getTransaction failed: [{}] {} | {}",
-                            group_name,
-                            mint_short,
-                            err,
+                            group_name, mint_short, err,
                         );
                     }
                     Err(err) => {
                         warn!(
                             "Buy confirm getTransaction task failed: [{}] {} | {}",
-                            group_name,
-                            mint_short,
-                            err,
+                            group_name, mint_short, err,
                         );
                     }
                 }
@@ -382,11 +370,7 @@ impl BuyConfirmer {
                     } else {
                         token_info.name.clone()
                     };
-                    auto_sell_info.update_token_info(
-                        &info_position_key,
-                        name,
-                        entry_mcap_sol_val,
-                    );
+                    auto_sell_info.update_token_info(&info_position_key, name, entry_mcap_sol_val);
                 });
 
                 let token_name_short = short_pubkey(&mint);
@@ -447,6 +431,7 @@ impl BuyConfirmer {
                 );
                 auto_sell.confirm_failed(&position_key, "confirmed but zero balance");
                 tg.send(TgEvent::BuyFailed {
+                    group_id: position_key.group_id.clone(),
                     group_name: group_name.clone(),
                     mint,
                     reason: "transaction confirmed but ATA balance did not increase".to_string(),
@@ -460,6 +445,7 @@ impl BuyConfirmer {
                 );
                 auto_sell.confirm_failed(&position_key, "timeout with zero balance");
                 tg.send(TgEvent::BuyFailed {
+                    group_id: position_key.group_id.clone(),
                     group_name,
                     mint,
                     reason: "buy confirmation timed out and ATA balance stayed unchanged"
@@ -478,7 +464,10 @@ impl BuyConfirmer {
         let user = *user_pubkey;
 
         let result = tokio::task::spawn_blocking(move || {
-            rpc.get_transaction(&signature, solana_transaction_status::UiTransactionEncoding::Json)
+            rpc.get_transaction(
+                &signature,
+                solana_transaction_status::UiTransactionEncoding::Json,
+            )
         })
         .await;
 
@@ -491,9 +480,11 @@ impl BuyConfirmer {
                             solana_transaction_status::UiMessage::Raw(msg) => {
                                 msg.account_keys.clone()
                             }
-                            solana_transaction_status::UiMessage::Parsed(msg) => {
-                                msg.account_keys.iter().map(|entry| entry.pubkey.clone()).collect()
-                            }
+                            solana_transaction_status::UiMessage::Parsed(msg) => msg
+                                .account_keys
+                                .iter()
+                                .map(|entry| entry.pubkey.clone())
+                                .collect(),
                         }
                     }
                     _ => return None,

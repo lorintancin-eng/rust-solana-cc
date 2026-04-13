@@ -1,6 +1,7 @@
 mod autosell;
 mod config;
 mod consensus;
+mod group_stats;
 mod groups;
 mod grpc;
 mod processor;
@@ -78,7 +79,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.33");
+    info!("   Solana 跟单交易系统 v1.6.34");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -736,6 +737,12 @@ async fn execute_buy(
                                 err
                             );
                             tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
+                            tg.send(TgEvent::BuyFailed {
+                                group_id: group.id.clone(),
+                                group_name: group.name.clone(),
+                                mint: *mint,
+                                reason: format!("0slot tx build failed: {}", err),
+                            });
                             return;
                         }
                     };
@@ -821,6 +828,7 @@ async fn execute_buy(
                             );
                             tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
                             tg.send(TgEvent::BuyFailed {
+                                group_id: group.id.clone(),
                                 group_name: group.name.clone(),
                                 mint: *mint,
                                 reason: err.to_string(),
@@ -836,6 +844,12 @@ async fn execute_buy(
                         err
                     );
                     tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
+                    tg.send(TgEvent::BuyFailed {
+                        group_id: group.id.clone(),
+                        group_name: group.name.clone(),
+                        mint: *mint,
+                        reason: format!("buy tx build failed: {}", err),
+                    });
                 }
             }
         }

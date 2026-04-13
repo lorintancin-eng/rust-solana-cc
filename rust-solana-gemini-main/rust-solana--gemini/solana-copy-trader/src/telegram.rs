@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 use crate::autosell::{AutoSellManager, Position, SellReason, SellSignal};
 use crate::config::{AppConfig, SELL_MODE_FOLLOW, SELL_MODE_TP_SL};
 use crate::consensus::ConsensusEngine;
+use crate::group_stats::{build_closed_trade_record, GroupPerformanceStore};
 use crate::groups::{CopyGroup, GroupManager, ENTRY_MODE_SMART_BUY, ENTRY_MODE_SMART_SELL};
 use crate::tx::sell_executor::SellExecutor;
 use crate::utils::sol_price::SolUsdPrice;
@@ -36,19 +37,26 @@ pub enum TgEvent {
         mcap_usd: String,
     },
     BuyFailed {
+        group_id: String,
         group_name: String,
         mint: Pubkey,
         reason: String,
     },
     SellSuccess {
+        group_id: String,
         group_name: String,
         mint: Pubkey,
         token_name: String,
         reason: String,
         pnl_percent: f64,
         tx_sig: String,
+        buy_sig: String,
+        hold_seconds: u64,
+        entry_sol_amount: f64,
+        fully_closed: bool,
     },
     SellFailed {
+        group_id: String,
         group_name: String,
         mint: Pubkey,
         reason: String,
@@ -111,6 +119,7 @@ pub struct TgBot {
     is_running: Arc<AtomicBool>,
     stats: Arc<TgStats>,
     _sol_usd: SolUsdPrice,
+    performance: GroupPerformanceStore,
     event_rx: Option<mpsc::UnboundedReceiver<TgEvent>>,
 }
 
@@ -144,6 +153,7 @@ impl TgBot {
             is_running,
             stats,
             _sol_usd: sol_usd,
+            performance: GroupPerformanceStore::load_or_default(),
             event_rx: Some(event_rx),
         }
     }
@@ -152,6 +162,7 @@ impl TgBot {
         let mut offset: i64 = 0;
         let mut event_rx = self.event_rx.take().expect("event_rx already taken");
 
+        self.performance.sync_groups(&self.groups);
         self.set_bot_commands().await;
         self.send_msg_kb(
             "<b>Solana 跟单机器人已上线</b>\n\n使用下方菜单可快速查看组合、设置组合和启停监听。",
@@ -206,7 +217,8 @@ impl TgBot {
                 {"command": "sellmode", "description": "查看或切换卖出模式"},
                 {"command": "pos", "description": "查看持仓列表并手动卖出，可带 group_id"},
                 {"command": "sellall", "description": "手动卖出当前组合或指定组合持仓"},
-                {"command": "stats", "description": "查看运行统计数据"}
+                {"command": "stats", "description": "查看运行统计数据"},
+                {"command": "gstats", "description": "查看组合绩效报表"}
             ]
         });
         let _ = self.http.post(&url).json(&body).send().await;
@@ -334,6 +346,7 @@ impl TgBot {
             "/pos" => self.cmd_positions(&parts[1..]).await,
             "/sellall" => self.cmd_sellall(&parts[1..]).await,
             "/stats" => self.cmd_stats().await,
+            "/gstats" => self.cmd_group_stats().await,
             _ => {}
         }
     }
@@ -386,10 +399,21 @@ impl TgBot {
             }
             ["gm", "overview"] => {
                 self.answer_cb(callback_id, None).await;
+                self.performance.sync_groups(&self.groups);
                 self.edit_msg(
                     message_id,
                     &format_groups_overview(&self.groups, self.groups.selected_group_id()),
                     groups_overview_keyboard(&self.groups),
+                )
+                .await;
+            }
+            ["gm", "perf"] => {
+                self.answer_cb(callback_id, None).await;
+                self.performance.sync_groups(&self.groups);
+                self.edit_msg(
+                    message_id,
+                    &self.performance.render_overview_html(&self.groups),
+                    group_performance_keyboard(),
                 )
                 .await;
             }
@@ -764,7 +788,8 @@ impl TgBot {
 <code>/sellmode follow|tp_sl</code> 切换卖出模式\n\
 <code>/pos [group_id]</code> 查看持仓\n\
 <code>/sellall [group_id]</code> 手动全卖\n\
-<code>/stats</code> 查看运行统计\n\n\
+<code>/stats</code> 查看运行统计\n\
+<code>/gstats</code> 查看组合绩效\n\n\
 支持快捷设置的参数键：<code>buy</code>、<code>min_buy</code>、<code>tp</code>、<code>sl</code>、<code>trailing</code>、<code>slippage</code>、<code>sell_slippage</code>、<code>consensus</code>、<code>hold</code>、<code>tip_buy</code>、<code>tip_sell</code>、<code>zero_slot_tip</code>、<code>buy_mode</code>、<code>mode</code>、<code>enabled</code>",
             group_menu_keyboard_v2(self.groups.zero_slot_buy_enabled()),
         )
@@ -808,6 +833,7 @@ impl TgBot {
     }
 
     async fn cmd_groups(&self) {
+        self.performance.sync_groups(&self.groups);
         self.send_msg_kb(
             &format_groups_overview(&self.groups, self.groups.selected_group_id()),
             groups_overview_keyboard(&self.groups),
@@ -1136,6 +1162,15 @@ impl TgBot {
         self.send_msg(&text).await;
     }
 
+    async fn cmd_group_stats(&self) {
+        self.performance.sync_groups(&self.groups);
+        self.send_msg_kb(
+            &self.performance.render_overview_html(&self.groups),
+            group_performance_keyboard(),
+        )
+        .await;
+    }
+
     async fn handle_event(&self, event: TgEvent) {
         let text = match event {
             TgEvent::ConsensusReached {
@@ -1175,6 +1210,8 @@ impl TgBot {
                 mcap_usd,
             } => {
                 self.stats.buy_success.fetch_add(1, Ordering::Relaxed);
+                self.performance
+                    .record_buy_confirmed(&self.groups, &group_id, &group_name);
                 let text = format!(
                     "<b>买入确认成功</b>\n\n组合: <b>{}</b>\n代币: {}\n花费: {:.4} SOL\n成本价: {}\n市值: {}",
                     group_name, token_name, spent_sol, cost_price_usd, mcap_usd
@@ -1189,11 +1226,14 @@ impl TgBot {
                 }
             }
             TgEvent::BuyFailed {
+                group_id,
                 group_name,
                 mint,
                 reason,
             } => {
                 self.stats.buy_failed.fetch_add(1, Ordering::Relaxed);
+                self.performance
+                    .record_buy_failed(&self.groups, &group_id, &group_name);
                 format!(
                     "<b>买入失败</b>\n\n组合: <b>{}</b>\n代币: <code>{}</code>\n原因: {}",
                     group_name,
@@ -1202,26 +1242,53 @@ impl TgBot {
                 )
             }
             TgEvent::SellSuccess {
+                group_id,
                 group_name,
+                mint,
                 token_name,
                 reason,
                 pnl_percent,
                 tx_sig,
-                ..
-            } => format!(
-                "<b>卖出成功</b>\n\n组合: <b>{}</b>\n代币: {}\n原因: {}\nPnL: {:+.2}%\n<a href=\"https://solscan.io/tx/{}\">查看链上交易</a>",
-                group_name, token_name, reason, pnl_percent, tx_sig
-            ),
+                buy_sig,
+                hold_seconds,
+                entry_sol_amount,
+                fully_closed,
+            } => {
+                if fully_closed {
+                    let record = build_closed_trade_record(
+                        group_id.clone(),
+                        group_name.clone(),
+                        mint.to_string(),
+                        token_name.clone(),
+                        buy_sig,
+                        tx_sig.clone(),
+                        reason.clone(),
+                        entry_sol_amount,
+                        pnl_percent,
+                        hold_seconds,
+                    );
+                    self.performance.record_closed_trade(&self.groups, record);
+                }
+                format!(
+                    "<b>卖出成功</b>\n\n组合: <b>{}</b>\n代币: {}\n原因: {}\nPnL: {:+.2}%\n<a href=\"https://solscan.io/tx/{}\">查看链上交易</a>",
+                    group_name, token_name, reason, pnl_percent, tx_sig
+                )
+            }
             TgEvent::SellFailed {
+                group_id,
                 group_name,
                 mint,
                 reason,
-            } => format!(
-                "<b>卖出失败</b>\n\n组合: <b>{}</b>\n代币: <code>{}</code>\n原因: {}",
-                group_name,
-                short_pubkey(&mint),
-                reason,
-            ),
+            } => {
+                self.performance
+                    .record_sell_failed(&self.groups, &group_id, &group_name);
+                format!(
+                    "<b>卖出失败</b>\n\n组合: <b>{}</b>\n代币: <code>{}</code>\n原因: {}",
+                    group_name,
+                    short_pubkey(&mint),
+                    reason,
+                )
+            }
         };
 
         if !text.is_empty() {
@@ -1468,6 +1535,9 @@ fn groups_overview_keyboard(groups: &GroupManager) -> serde_json::Value {
             {"text": "设置", "callback_data": format!("gm:set:{}", group.id)}
         ]));
     }
+    rows.push(json!([
+        {"text": "组合绩效", "callback_data": "gm:perf"}
+    ]));
     rows.push(json!([
         {"text": "新增组合", "callback_data": "gm:add"},
         {"text": "菜单", "callback_data": "gm:main"}
@@ -1792,7 +1862,24 @@ fn group_menu_keyboard_v2(zero_slot_buy_enabled: bool) -> serde_json::Value {
                 {"text": "查看持仓列表", "callback_data": "gm:positions"}
             ],
             [
+                {"text": "组合绩效", "callback_data": "gm:perf"}
+            ],
+            [
                 {"text": zero_slot_buy_button_label(zero_slot_buy_enabled), "callback_data": "gm:toggle_zero_slot_buy"}
+            ]
+        ]
+    })
+}
+
+fn group_performance_keyboard() -> serde_json::Value {
+    json!({
+        "inline_keyboard": [
+            [
+                {"text": "刷新组合绩效", "callback_data": "gm:perf"},
+                {"text": "查看组合", "callback_data": "gm:overview"}
+            ],
+            [
+                {"text": "返回菜单", "callback_data": "gm:main"}
             ]
         ]
     })
