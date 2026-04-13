@@ -123,7 +123,13 @@ impl AutoSellManager {
         max_attempts: u32,
     ) {
         if let Some(mut pos) = self.positions.get_mut(key) {
-            pos.suspend_auto_sell(previous_state, max_attempts);
+            pos.state = previous_state;
+            pos.sell_attempts = pos.sell_attempts.max(max_attempts);
+            warn!(
+                "Position {} auto-sell suspended after repeated failures | attempts={}",
+                &pos.token_mint.to_string()[..12],
+                pos.sell_attempts,
+            );
         }
         self.save();
     }
@@ -433,7 +439,8 @@ impl AutoSellManager {
                         let max_hold = pos.group.max_hold_seconds;
                         if max_hold > 0
                             && pos.held_seconds() >= max_hold
-                            && pos.can_auto_sell(MAX_AUTO_SELL_SIGNAL_ATTEMPTS)
+                            && pos.can_sell()
+                            && !pos.max_sell_attempts_reached(MAX_AUTO_SELL_SIGNAL_ATTEMPTS)
                         {
                             Some(SellSignal {
                                 position_key: pos.key().clone(),
@@ -485,7 +492,8 @@ impl AutoSellManager {
 
         if pos.group.max_hold_seconds > 0
             && pos.held_seconds() >= pos.group.max_hold_seconds
-            && pos.can_auto_sell(MAX_AUTO_SELL_SIGNAL_ATTEMPTS)
+            && pos.can_sell()
+            && !pos.max_sell_attempts_reached(MAX_AUTO_SELL_SIGNAL_ATTEMPTS)
         {
             return Some(SellSignal {
                 position_key: key,

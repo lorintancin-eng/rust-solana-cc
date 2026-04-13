@@ -437,7 +437,9 @@ async fn main() -> Result<()> {
                 if let Some(position) =
                     auto_sell_manager.get_position_by_group_mint(&group.id, &token_mint)
                 {
-                    if position.can_auto_sell(MAX_AUTO_SELL_SIGNAL_ATTEMPTS) {
+                    if position.can_sell()
+                        && !position.max_sell_attempts_reached(MAX_AUTO_SELL_SIGNAL_ATTEMPTS)
+                    {
                         let _ = sell_signal_tx.send(SellSignal {
                             position_key: position.key(),
                             group_name: group.name.clone(),
