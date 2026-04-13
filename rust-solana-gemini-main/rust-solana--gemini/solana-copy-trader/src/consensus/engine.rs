@@ -170,19 +170,27 @@ impl ConsensusEngine {
                 .min_by_key(|candidate| candidate.detected_at)
                 .map(|candidate| candidate.signature.clone())
                 .unwrap_or_default();
+            let effective_wallets = tally.effective_wallets.clone();
+            let canonical_signature = canonical_signal.signature.clone();
+            let canonical_wallet = canonical_signal.wallet;
+            let canonical_token_program = canonical_signal.token_program;
+            let canonical_instruction_data = canonical_signal.instruction_data.clone();
+            let canonical_instruction_accounts = canonical_signal.instruction_accounts.clone();
+
+            drop(tally);
 
             entry.triggered = true;
             let trigger = ConsensusTrigger {
                 group_id: signal.group_id,
                 group_name: signal.group_name,
                 token_mint: signal.token_mint,
-                wallets: tally.effective_wallets,
+                wallets: effective_wallets,
                 first_signature,
-                canonical_signature: canonical_signal.signature.clone(),
-                canonical_wallet: canonical_signal.wallet,
-                canonical_token_program: canonical_signal.token_program,
-                canonical_instruction_data: canonical_signal.instruction_data.clone(),
-                canonical_instruction_accounts: canonical_signal.instruction_accounts.clone(),
+                canonical_signature,
+                canonical_wallet,
+                canonical_token_program,
+                canonical_instruction_data,
+                canonical_instruction_accounts,
                 triggered_at: Instant::now(),
             };
 
@@ -239,7 +247,9 @@ impl ConsensusEngine {
             let after = entry.signals.len();
             let was_triggered = entry.triggered;
             let tally = tally_votes(&entry.signals, entry.min_wallets);
-            entry.triggered = tally.should_trigger();
+            let should_still_trigger = tally.should_trigger();
+            drop(tally);
+            entry.triggered = should_still_trigger;
             if was_triggered && !entry.triggered {
                 info!(
                     "Consensus retracted: [{}] {} | wallet={}..{} | sig: {}..{}",
