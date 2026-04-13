@@ -124,17 +124,22 @@ impl ConsensusEngine {
         } else {
             entry.signals.push(signal.clone());
         }
-        let candidate_signals: Vec<&BuySignal> = entry
+        let effective_signals: Vec<&BuySignal> = entry
             .signals
             .iter()
             .filter(|candidate| candidate.counts_for_candidate_consensus())
             .collect();
-        let confirmed_signals: Vec<&BuySignal> = candidate_signals
+        let confirmed_signals: Vec<&BuySignal> = effective_signals
             .iter()
             .copied()
             .filter(|candidate| candidate.counts_as_confirmed_vote())
             .collect();
-        let unique_wallets: Vec<Pubkey> = candidate_signals
+        let candidate_only_signals: Vec<&BuySignal> = effective_signals
+            .iter()
+            .copied()
+            .filter(|candidate| !candidate.counts_as_confirmed_vote())
+            .collect();
+        let effective_wallets: Vec<Pubkey> = effective_signals
             .iter()
             .map(|candidate| candidate.wallet)
             .collect();
@@ -142,26 +147,40 @@ impl ConsensusEngine {
             .iter()
             .map(|candidate| candidate.wallet)
             .collect();
+        let candidate_wallets: Vec<Pubkey> = candidate_only_signals
+            .iter()
+            .map(|candidate| candidate.wallet)
+            .collect();
+        let total_votes = confirmed_wallets.len() + candidate_wallets.len();
 
         info!(
-            "Consensus signal: [{}] {} | confirmed={} | candidates={}/{} wallets | raw={}",
+            "Consensus signal: [{}] {} | confirmed={} | candidates={} | total={}/{} | raw={}",
             signal.group_name,
             &signal.token_mint.to_string()[..12],
             confirmed_wallets.len(),
-            unique_wallets.len(),
+            candidate_wallets.len(),
+            total_votes,
             entry.min_wallets,
             entry.signals.len(),
         );
 
-        if !confirmed_wallets.is_empty() && unique_wallets.len() >= entry.min_wallets {
-            let Some(canonical_signal) = confirmed_signals
+        let trigger_on_candidates = candidate_wallets.len() >= entry.min_wallets;
+        let trigger_on_mixed = !confirmed_wallets.is_empty() && total_votes >= entry.min_wallets;
+
+        if trigger_on_candidates || trigger_on_mixed {
+            let canonical_pool = if trigger_on_candidates {
+                &effective_signals
+            } else {
+                &confirmed_signals
+            };
+            let Some(canonical_signal) = canonical_pool
                 .iter()
                 .max_by_key(|candidate| candidate.canonical_score())
                 .map(|candidate| (*candidate).clone())
             else {
                 return;
             };
-            let first_signature = candidate_signals
+            let first_signature = effective_signals
                 .iter()
                 .min_by_key(|candidate| candidate.detected_at)
                 .map(|candidate| candidate.signature.clone())
@@ -172,7 +191,7 @@ impl ConsensusEngine {
                 group_id: signal.group_id,
                 group_name: signal.group_name,
                 token_mint: signal.token_mint,
-                wallets: unique_wallets,
+                wallets: effective_wallets,
                 first_signature,
                 canonical_signature: canonical_signal.signature.clone(),
                 canonical_wallet: canonical_signal.wallet,
