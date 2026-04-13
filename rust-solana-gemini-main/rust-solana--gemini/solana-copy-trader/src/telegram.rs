@@ -422,7 +422,7 @@ impl TgBot {
                 let positions = sorted_positions(self.auto_sell.get_active_positions());
                 self.edit_msg(
                     message_id,
-                    &format_positions_v2(&positions),
+                    &format_positions_v2(&positions, self._sol_usd.get()),
                     positions_list_keyboard(&positions),
                 )
                 .await;
@@ -682,7 +682,7 @@ impl TgBot {
                 let positions = sorted_positions(self.auto_sell.get_active_positions());
                 self.edit_msg(
                     message_id,
-                    &format_positions_v2(&positions),
+                    &format_positions_v2(&positions, self._sol_usd.get()),
                     positions_list_keyboard(&positions),
                 )
                 .await;
@@ -692,7 +692,7 @@ impl TgBot {
                 let positions = sorted_positions(self.auto_sell.get_active_positions());
                 self.edit_msg(
                     message_id,
-                    &format_positions_v2(&positions),
+                    &format_positions_v2(&positions, self._sol_usd.get()),
                     positions_list_keyboard(&positions),
                 )
                 .await;
@@ -706,7 +706,7 @@ impl TgBot {
                         {
                             self.edit_msg(
                                 message_id,
-                                &format_position_detail(&position),
+                                &format_position_detail(&position, self._sol_usd.get()),
                                 position_detail_keyboard(&position),
                             )
                             .await;
@@ -714,7 +714,7 @@ impl TgBot {
                             let positions = sorted_positions(self.auto_sell.get_active_positions());
                             self.edit_msg(
                                 message_id,
-                                &format_positions_v2(&positions),
+                                &format_positions_v2(&positions, self._sol_usd.get()),
                                 positions_list_keyboard(&positions),
                             )
                             .await;
@@ -749,7 +749,7 @@ impl TgBot {
                 if let Some(position) = self.auto_sell.get_position_by_group_mint(group_id, &mint) {
                     self.edit_msg(
                         message_id,
-                        &format_position_detail(&position),
+                        &format_position_detail(&position, self._sol_usd.get()),
                         position_detail_keyboard(&position),
                     )
                     .await;
@@ -757,7 +757,7 @@ impl TgBot {
                     let positions = sorted_positions(self.auto_sell.get_active_positions());
                     self.edit_msg(
                         message_id,
-                        &format_positions_v2(&positions),
+                        &format_positions_v2(&positions, self._sol_usd.get()),
                         positions_list_keyboard(&positions),
                     )
                     .await;
@@ -1118,7 +1118,7 @@ impl TgBot {
 
         let positions = sorted_positions(positions);
         self.send_msg_kb(
-            &format_positions_v2(&positions),
+            &format_positions_v2(&positions, self._sol_usd.get()),
             positions_list_keyboard(&positions),
         )
         .await;
@@ -2065,11 +2065,13 @@ fn setting_label_v2(key: &str) -> &'static str {
     }
 }
 
-fn format_positions_v2(positions: &[Position]) -> String {
+fn format_positions_v2(positions: &[Position], sol_usd_price: f64) -> String {
     let mut text = format!("<b>持仓列表</b> ({})", positions.len());
     for (index, pos) in positions.iter().enumerate() {
+        let entry_mcap = format_market_cap(pos.entry_mcap_sol, sol_usd_price);
+        let current_mcap = format_market_cap(current_market_cap_sol(pos), sol_usd_price);
         text.push_str(&format!(
-            "\n\n{}. <b>{}</b>\n代币地址: <code>{}</code>\n组合: {} ({})\n状态: {} | PnL: {:+.2}% | 持仓: {}",
+            "\n\n{}. <b>{}</b>\n代币地址: <code>{}</code>\n组合: {} ({})\n状态: {} | PnL: {:+.2}% | 持仓: {}\n买入市值: {} | 当前市值: {}",
             index + 1,
             position_display_name(pos),
             pos.token_mint,
@@ -2078,6 +2080,8 @@ fn format_positions_v2(positions: &[Position]) -> String {
             pos.state,
             pos.pnl_percent(),
             fmt_time(pos.held_seconds()),
+            entry_mcap,
+            current_mcap,
         ));
     }
     text
@@ -2141,19 +2145,48 @@ fn position_detail_keyboard(position: &Position) -> serde_json::Value {
     })
 }
 
-fn format_position_detail(position: &Position) -> String {
+fn format_position_detail(position: &Position, sol_usd_price: f64) -> String {
+    let entry_mcap = format_market_cap(position.entry_mcap_sol, sol_usd_price);
+    let current_mcap = format_market_cap(current_market_cap_sol(position), sol_usd_price);
     format!(
-        "<b>{}</b>\n代币地址: <code>{}</code>\n组合: {} ({})\n状态: {}\n成本: {:.4} SOL\n当前数量: {:.4}\nPnL: {:+.2}%\n持仓时长: {}",
+        "<b>{}</b>\n代币地址: <code>{}</code>\n组合: {} ({})\n状态: {}\n成本: {:.4} SOL\n买入市值: {}\n当前市值: {}\n当前数量: {:.4}\nPnL: {:+.2}%\n持仓时长: {}",
         position_display_name(position),
         position.token_mint,
         position.group.name,
         position.group.id,
         position.state,
         position.entry_sol_amount as f64 / 1e9,
+        entry_mcap,
+        current_mcap,
         position.token_amount as f64 / 1e6,
         position.pnl_percent(),
         fmt_time(position.held_seconds()),
     )
+}
+
+fn current_market_cap_sol(position: &Position) -> f64 {
+    position.current_price * 1_000_000_000.0
+}
+
+fn format_market_cap(market_cap_sol: f64, sol_usd_price: f64) -> String {
+    if market_cap_sol <= 0.0 || sol_usd_price <= 0.0 {
+        return "-".to_string();
+    }
+    format_usd_short(market_cap_sol * sol_usd_price)
+}
+
+fn format_usd_short(value: f64) -> String {
+    if value >= 1_000_000_000.0 {
+        format!("${:.2}B", value / 1_000_000_000.0)
+    } else if value >= 1_000_000.0 {
+        format!("${:.2}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("${:.2}K", value / 1_000.0)
+    } else if value >= 1.0 {
+        format!("${:.2}", value)
+    } else {
+        format!("${:.4}", value)
+    }
 }
 
 fn short_pubkey(pubkey: &Pubkey) -> String {
