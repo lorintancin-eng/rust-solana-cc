@@ -4209,7 +4209,7 @@ dependencies = [
 
 [[package]]
 name = "solana-copy-trader"
-version = "1.6.40"
+version = "1.6.41"
 dependencies = [
  "anyhow",
  "async-trait",

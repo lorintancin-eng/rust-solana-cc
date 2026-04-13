@@ -21,6 +21,7 @@ use crate::tx::sender::TxSender;
 
 const MAX_SELL_RETRIES: u32 = 3;
 const MAX_ZERO_BALANCE_SKIPS: u32 = 5;
+const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
 const FAST_FIRST_CONFIRM_MS: u64 = 1_500;
 const RETRY_CONFIRM_MS: u64 = 2_500;
 const DEFAULT_CONFIRM_MS: u64 = 3_000;
@@ -425,6 +426,8 @@ impl SellExecutor {
         let expected_after_balance = current_ata_balance.saturating_sub(token_amount);
         let mut success = false;
         let mut last_sig = String::new();
+        let mut saw_signature_error = false;
+        let mut failure_reason = "sell retries exhausted".to_string();
 
         for attempt in 1..=MAX_SELL_RETRIES {
             let confirm_timeout_ms = Self::confirm_timeout_ms(signal.reason, attempt);
@@ -472,6 +475,18 @@ impl SellExecutor {
                         last_sig = sig;
                         break;
                     }
+
+                    if confirm_trace.source == "signature_error" {
+                        saw_signature_error = true;
+                        failure_reason = "sell failed on-chain".to_string();
+                        warn!(
+                            "Sell aborted after on-chain failure: [{}] {} | sig: {}",
+                            signal.group_name,
+                            &position_before_sell.token_mint.to_string()[..12],
+                            sig,
+                        );
+                        break;
+                    }
                 }
                 Err(err) => {
                     warn!("Pumpfun sell failed [{}]: {}", signal.group_name, err);
@@ -493,9 +508,25 @@ impl SellExecutor {
                                 last_sig = sig;
                                 break;
                             }
+
+                            if confirm_trace.source == "signature_error" {
+                                saw_signature_error = true;
+                                failure_reason = "sell failed on-chain".to_string();
+                                warn!(
+                                    "Jupiter sell aborted after on-chain failure: [{}] {} | sig: {}",
+                                    signal.group_name,
+                                    &position_before_sell.token_mint.to_string()[..12],
+                                    sig,
+                                );
+                                break;
+                            }
                         }
                     }
                 }
+            }
+
+            if saw_signature_error {
+                break;
             }
         }
 
@@ -527,13 +558,41 @@ impl SellExecutor {
                 fully_closed: expected_after_balance == 0,
             });
         } else {
-            self.auto_sell
-                .restore_after_sell_attempt(&signal.position_key, previous_state);
+            let auto_attempt_cap_reached = self
+                .auto_sell
+                .get_position(&signal.position_key)
+                .map(|pos| pos.max_sell_attempts_reached(MAX_AUTO_SELL_SIGNAL_ATTEMPTS))
+                .unwrap_or(false);
+            let suspend_auto_sell = signal.reason != SellReason::Manual
+                && (saw_signature_error || auto_attempt_cap_reached);
+
+            if suspend_auto_sell {
+                if auto_attempt_cap_reached && !saw_signature_error {
+                    failure_reason = format!(
+                        "auto-sell suspended after {} failed cycles",
+                        MAX_AUTO_SELL_SIGNAL_ATTEMPTS
+                    );
+                }
+                self.auto_sell.suspend_auto_sell(
+                    &signal.position_key,
+                    previous_state,
+                    MAX_AUTO_SELL_SIGNAL_ATTEMPTS,
+                );
+                warn!(
+                    "Auto-sell suspended: [{}] {} | reason: {}",
+                    signal.group_name,
+                    &position_before_sell.token_mint.to_string()[..12],
+                    failure_reason,
+                );
+            } else {
+                self.auto_sell
+                    .restore_after_sell_attempt(&signal.position_key, previous_state);
+            }
             self.tg.send(TgEvent::SellFailed {
                 group_id: signal.position_key.group_id.clone(),
                 group_name: signal.group_name,
                 mint: position_before_sell.token_mint,
-                reason: "sell retries exhausted".to_string(),
+                reason: failure_reason,
             });
         }
     }

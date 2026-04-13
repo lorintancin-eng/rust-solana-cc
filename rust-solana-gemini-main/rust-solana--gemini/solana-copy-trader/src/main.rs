@@ -48,6 +48,7 @@ const BLOCKHASH_REFRESH_MS: u64 = 120;
 const PREFETCH_WAIT_MS: u64 = 8;
 const BC_CACHE_WAIT_MS: u64 = 40;
 const BUY_EXECUTOR_PARALLELISM: usize = 4;
+const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone)]
 struct SignatureSeen {
@@ -80,7 +81,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 璺熷崟浜ゆ槗绯荤粺 v1.6.40");
+    info!("   Solana 鐠虹喎宕熸禍銈嗘缁崵绮?v1.6.41");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -88,9 +89,9 @@ async fn main() -> Result<()> {
     let group_manager = GroupManager::load_or_default(&config);
     let target_wallets = group_manager.all_target_wallets();
 
-    info!("浜ゆ槗閽卞寘: {}", config.pubkey);
+    info!("娴溿倖妲楅柦鍗炲瘶: {}", config.pubkey);
     info!(
-        "缁勫悎鏁? {} | 鐩爣閽卞寘鏁? {}",
+        "缂佸嫬鎮庨弫? {} | 閻╊喗鐖ｉ柦鍗炲瘶閺? {}",
         group_manager.all_groups().len(),
         target_wallets.len(),
     );
@@ -436,7 +437,7 @@ async fn main() -> Result<()> {
                 if let Some(position) =
                     auto_sell_manager.get_position_by_group_mint(&group.id, &token_mint)
                 {
-                    if position.can_sell() {
+                    if position.can_auto_sell(MAX_AUTO_SELL_SIGNAL_ATTEMPTS) {
                         let _ = sell_signal_tx.send(SellSignal {
                             position_key: position.key(),
                             group_name: group.name.clone(),

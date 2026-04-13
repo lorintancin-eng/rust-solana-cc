@@ -14,6 +14,8 @@ use crate::config::AppConfig;
 use crate::grpc::{AccountUpdate, BondingCurveCache};
 use crate::utils::sol_price::SolUsdPrice;
 
+const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
+
 pub struct AutoSellManager {
     positions: Arc<DashMap<PositionKey, Position>>,
     config: AppConfig,
@@ -110,6 +112,18 @@ impl AutoSellManager {
     pub fn restore_after_sell_attempt(&self, key: &PositionKey, previous_state: PositionState) {
         if let Some(mut pos) = self.positions.get_mut(key) {
             pos.restore_after_sell_attempt(previous_state);
+        }
+        self.save();
+    }
+
+    pub fn suspend_auto_sell(
+        &self,
+        key: &PositionKey,
+        previous_state: PositionState,
+        max_attempts: u32,
+    ) {
+        if let Some(mut pos) = self.positions.get_mut(key) {
+            pos.suspend_auto_sell(previous_state, max_attempts);
         }
         self.save();
     }
@@ -417,7 +431,10 @@ impl AutoSellManager {
                         };
 
                         let max_hold = pos.group.max_hold_seconds;
-                        if max_hold > 0 && pos.held_seconds() >= max_hold && pos.can_sell() {
+                        if max_hold > 0
+                            && pos.held_seconds() >= max_hold
+                            && pos.can_auto_sell(MAX_AUTO_SELL_SIGNAL_ATTEMPTS)
+                        {
                             Some(SellSignal {
                                 position_key: pos.key().clone(),
                                 group_name: pos.group.name.clone(),
@@ -468,7 +485,7 @@ impl AutoSellManager {
 
         if pos.group.max_hold_seconds > 0
             && pos.held_seconds() >= pos.group.max_hold_seconds
-            && pos.can_sell()
+            && pos.can_auto_sell(MAX_AUTO_SELL_SIGNAL_ATTEMPTS)
         {
             return Some(SellSignal {
                 position_key: key,
