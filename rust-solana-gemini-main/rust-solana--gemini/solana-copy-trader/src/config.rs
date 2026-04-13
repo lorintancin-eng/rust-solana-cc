@@ -5,20 +5,16 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
-/// 全局配置，从 .env 加载
+/// 鍏ㄥ眬閰嶇疆锛屼粠 .env 鍔犺浇
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     // RPC & gRPC
     pub rpc_url: String,
     pub secondary_rpc_url: Option<String>,
-    /// 交易监听流默认走 Shyft RabbitStream pre-exec。
-    /// 兼容旧变量：优先读取 RABBITSTREAM_URL，其次 GRPC_URL。
-    pub grpc_url: String,
-    /// 交易监听流 token。
-    /// 兼容旧变量：优先读取 RABBITSTREAM_TOKEN，其次 GRPC_TOKEN。
-    pub grpc_token: Option<String>,
-    /// 账户监控用的 gRPC URL（RabbitStream 不支持账户订阅，需要普通 gRPC）
-    /// 不设置时回退到 SHYFT_GRPC_URL / GRPC_ACCOUNT_URL；再退到旧的 GRPC_URL
+    pub fast_status_rpc_url: Option<String>,
+    /// 浜ゆ槗鐩戝惉娴侀粯璁よ蛋 Shyft RabbitStream pre-exec銆?    /// 鍏煎鏃у彉閲忥細浼樺厛璇诲彇 RABBITSTREAM_URL锛屽叾娆?GRPC_URL銆?    pub grpc_url: String,
+    /// 浜ゆ槗鐩戝惉娴?token銆?    /// 鍏煎鏃у彉閲忥細浼樺厛璇诲彇 RABBITSTREAM_TOKEN锛屽叾娆?GRPC_TOKEN銆?    pub grpc_token: Option<String>,
+    /// 璐︽埛鐩戞帶鐢ㄧ殑 gRPC URL锛圧abbitStream 涓嶆敮鎸佽处鎴疯闃咃紝闇€瑕佹櫘閫?gRPC锛?    /// 涓嶈缃椂鍥為€€鍒?SHYFT_GRPC_URL / GRPC_ACCOUNT_URL锛涘啀閫€鍒版棫鐨?GRPC_URL
     pub grpc_account_url: String,
     pub grpc_account_token: Option<String>,
 
@@ -36,12 +32,11 @@ pub struct AppConfig {
     // Trading
     pub buy_sol_amount: f64,
     pub slippage_bps: u64,
-    /// 卖出专用滑点（meme 币卖出波动大，需要更高滑点）
+    /// 鍗栧嚭涓撶敤婊戠偣锛坢eme 甯佸崠鍑烘尝鍔ㄥぇ锛岄渶瑕佹洿楂樻粦鐐癸級
     pub sell_slippage_bps: u64,
     pub compute_units: u32,
     pub priority_fee_micro_lamport: u64,
-    /// 目标钱包最小买入 SOL 数（过滤小额噪音），0 表示不过滤
-    /// .env: MIN_TARGET_BUY_SOL=0.5
+    /// 鐩爣閽卞寘鏈€灏忎拱鍏?SOL 鏁帮紙杩囨护灏忛鍣煶锛夛紝0 琛ㄧず涓嶈繃婊?    /// .env: MIN_TARGET_BUY_SOL=0.5
     pub min_target_buy_sol: f64,
 
     // Jito
@@ -49,15 +44,14 @@ pub struct AppConfig {
     pub jito_block_engine_urls: Vec<String>,
     pub jito_buy_tip_lamports: u64,
     pub jito_sell_tip_lamports: u64,
-    /// Jito 认证 UUID（x-jito-auth header），大幅提升 rate limit
-    /// VPS 上用 `uuidgen` 生成，填入 .env JITO_AUTH_UUID
+    /// Jito 璁よ瘉 UUID锛坸-jito-auth header锛夛紝澶у箙鎻愬崌 rate limit
+    /// VPS 涓婄敤 `uuidgen` 鐢熸垚锛屽～鍏?.env JITO_AUTH_UUID
     pub jito_auth_uuid: Option<String>,
 
-    // 0slot staked connection（质押加速，提升同区块率）
-    /// 0slot endpoint URLs（带 api-key），逗号分隔
-    /// 例: http://ny1.0slot.trade/?api-key=xxx,http://la1.0slot.trade/?api-key=xxx
+    // 0slot staked connection锛堣川鎶煎姞閫燂紝鎻愬崌鍚屽尯鍧楃巼锛?    /// 0slot endpoint URLs锛堝甫 api-key锛夛紝閫楀彿鍒嗛殧
+    /// 渚? http://ny1.0slot.trade/?api-key=xxx,http://la1.0slot.trade/?api-key=xxx
     pub zero_slot_urls: Vec<String>,
-    /// 0slot fee（lamports），默认 0.001 SOL
+    /// 0slot fee锛坙amports锛夛紝榛樿 0.001 SOL
     pub zero_slot_tip_lamports: u64,
 
     // Confirmation
@@ -70,7 +64,7 @@ pub struct AppConfig {
     pub trailing_stop_percent: f64,
     pub max_hold_seconds: u64,
     pub price_check_interval_secs: u64,
-    /// SOL/USD 默认价格（API 获取失败时使用）
+    /// SOL/USD 榛樿浠锋牸锛圓PI 鑾峰彇澶辫触鏃朵娇鐢級
     pub default_sol_usd_price: f64,
 
     // Telegram Bot
@@ -98,11 +92,14 @@ impl AppConfig {
         Ok(Self {
             rpc_url: env_or("RPC_URL", "https://api.mainnet-beta.solana.com"),
             secondary_rpc_url: std::env::var("SECONDARY_RPC_URL").ok(),
+            fast_status_rpc_url: std::env::var("FAST_STATUS_RPC_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             grpc_url: first_env(&["RABBITSTREAM_URL", "GRPC_URL"])
                 .unwrap_or_else(|| "https://grpc.triton.one".to_string()),
             grpc_token: first_env(&["RABBITSTREAM_TOKEN", "GRPC_TOKEN"]),
-            // 账户监控 gRPC：显式使用普通 Yellowstone gRPC，避免误接 RabbitStream。
-            grpc_account_url: first_env(&["GRPC_ACCOUNT_URL", "SHYFT_GRPC_URL"])
+            // 璐︽埛鐩戞帶 gRPC锛氭樉寮忎娇鐢ㄦ櫘閫?Yellowstone gRPC锛岄伩鍏嶈鎺?RabbitStream銆?            grpc_account_url: first_env(&["GRPC_ACCOUNT_URL", "SHYFT_GRPC_URL"])
                 .or_else(|| first_env(&["GRPC_URL"]).filter(|url| !is_rabbitstream_url(url)))
                 .unwrap_or_else(|| "https://grpc.triton.one".to_string()),
             grpc_account_token: first_env(&["GRPC_ACCOUNT_TOKEN", "SHYFT_GRPC_TOKEN"])
@@ -173,7 +170,7 @@ impl AppConfig {
         })
     }
 
-    /// 买入的 lamports 数量
+    /// 涔板叆鐨?lamports 鏁伴噺
     pub fn buy_lamports(&self) -> u64 {
         (self.buy_sol_amount * 1_000_000_000.0) as u64
     }
@@ -204,8 +201,7 @@ fn env_parse<T: FromStr>(key: &str, default: T) -> T {
 }
 
 // ============================================
-// DynConfig: 运行时可动态修改的参数（原子操作，无锁）
-// ============================================
+// DynConfig: 杩愯鏃跺彲鍔ㄦ€佷慨鏀圭殑鍙傛暟锛堝師瀛愭搷浣滐紝鏃犻攣锛?// ============================================
 
 fn store_f64(atom: &AtomicU64, val: f64) {
     atom.store(val.to_bits(), Ordering::Relaxed);
@@ -214,12 +210,11 @@ fn load_f64(atom: &AtomicU64) -> f64 {
     f64::from_bits(atom.load(Ordering::Relaxed))
 }
 
-/// 卖出模式: 0=止盈止损模式(TP/SL/Trailing), 1=跟卖模式(Follow Smart Money Sell)
+/// 鍗栧嚭妯″紡: 0=姝㈢泩姝㈡崯妯″紡(TP/SL/Trailing), 1=璺熷崠妯″紡(Follow Smart Money Sell)
 pub const SELL_MODE_TP_SL: u8 = 0;
 pub const SELL_MODE_FOLLOW: u8 = 1;
 
-/// 可在运行时通过 TG /set 修改的参数
-pub struct DynConfig {
+/// 鍙湪杩愯鏃堕€氳繃 TG /set 淇敼鐨勫弬鏁?pub struct DynConfig {
     buy_sol_amount: AtomicU64, // f64 bits
     slippage_bps: AtomicU64,
     sell_slippage_bps: AtomicU64,
@@ -231,14 +226,13 @@ pub struct DynConfig {
     jito_buy_tip_lamports: AtomicU64,
     jito_sell_tip_lamports: AtomicU64,
     zero_slot_tip_lamports: AtomicU64,
-    /// 卖出模式: SELL_MODE_TP_SL(0) 或 SELL_MODE_FOLLOW(1)
+    /// 鍗栧嚭妯″紡: SELL_MODE_TP_SL(0) 鎴?SELL_MODE_FOLLOW(1)
     sell_mode: AtomicU8,
-    /// 目标钱包最小买入 SOL 过滤
+    /// 鐩爣閽卞寘鏈€灏忎拱鍏?SOL 杩囨护
     min_target_buy_sol: AtomicU64, // f64 bits
-    /// 跟踪钱包列表（需要重启 gRPC 订阅才生效）
+    /// 璺熻釜閽卞寘鍒楄〃锛堥渶瑕侀噸鍚?gRPC 璁㈤槄鎵嶇敓鏁堬級
     pub target_wallets: RwLock<Vec<Pubkey>>,
-    /// 代币黑名单
-    pub blocklist: dashmap::DashSet<Pubkey>,
+    /// 浠ｅ竵榛戝悕鍗?    pub blocklist: dashmap::DashSet<Pubkey>,
 }
 
 impl DynConfig {
@@ -354,22 +348,22 @@ impl DynConfig {
         store_f64(&self.min_target_buy_sol, v);
     }
 
-    /// 是否已拉黑该代币
+    /// 鏄惁宸叉媺榛戣浠ｅ竵
     pub fn is_blocked(&self, mint: &Pubkey) -> bool {
         self.blocklist.contains(mint)
     }
 }
 
-/// 支持 base58 私钥 或 JSON 数组格式
+/// 鏀寔 base58 绉侀挜 鎴?JSON 鏁扮粍鏍煎紡
 fn parse_keypair(s: &str) -> Result<Keypair> {
-    // 尝试 JSON 数组格式 [1,2,3,...]
+    // 灏濊瘯 JSON 鏁扮粍鏍煎紡 [1,2,3,...]
     if s.starts_with('[') {
         let bytes: Vec<u8> =
             serde_json::from_str(s).context("Failed to parse PRIVATE_KEY as JSON array")?;
         return Keypair::try_from(bytes.as_slice())
             .map_err(|e| anyhow::anyhow!("Invalid keypair bytes: {}", e));
     }
-    // 尝试 base58
+    // 灏濊瘯 base58
     let bytes = bs58::decode(s)
         .into_vec()
         .context("Failed to decode PRIVATE_KEY as base58")?;

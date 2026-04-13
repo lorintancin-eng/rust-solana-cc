@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.39");
+    info!("   Solana 璺熷崟浜ゆ槗绯荤粺 v1.6.40");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -88,9 +88,9 @@ async fn main() -> Result<()> {
     let group_manager = GroupManager::load_or_default(&config);
     let target_wallets = group_manager.all_target_wallets();
 
-    info!("交易钱包: {}", config.pubkey);
+    info!("浜ゆ槗閽卞寘: {}", config.pubkey);
     info!(
-        "组合数: {} | 目标钱包数: {}",
+        "缁勫悎鏁? {} | 鐩爣閽卞寘鏁? {}",
         group_manager.all_groups().len(),
         target_wallets.len(),
     );
@@ -99,6 +99,16 @@ async fn main() -> Result<()> {
         config.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::confirmed(),
     ));
+    let fast_status_rpc_client = config.fast_status_rpc_url.as_ref().map(|url| {
+        Arc::new(RpcClient::new_with_commitment(
+            url.clone(),
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        ))
+    });
+
+    if let Some(url) = &config.fast_status_rpc_url {
+        info!("Fast status RPC enabled: {}", url);
+    }
 
     let balance = rpc_client.get_balance(&config.pubkey)?;
     info!("SOL balance: {:.4}", balance as f64 / 1e9);
@@ -581,6 +591,7 @@ async fn main() -> Result<()> {
                         .needs_candidate_upgrade(&buy_signal.group_id, &buy_signal.token_mint)
                 {
                     spawn_consensus_upgrade_task(
+                        fast_status_rpc_client.clone(),
                         rpc_client.clone(),
                         consensus_engine.clone(),
                         consensus_tx.clone(),
@@ -595,6 +606,7 @@ async fn main() -> Result<()> {
 }
 
 fn spawn_consensus_upgrade_task(
+    fast_status_rpc_client: Option<Arc<RpcClient>>,
     rpc_client: Arc<RpcClient>,
     consensus_engine: Arc<ConsensusEngine>,
     consensus_tx: mpsc::UnboundedSender<ConsensusTrigger>,
@@ -633,10 +645,46 @@ fn spawn_consensus_upgrade_task(
                 return;
             }
 
-            let rpc = rpc_client.clone();
             let sig = signature;
-            let status =
-                tokio::task::spawn_blocking(move || rpc.get_signature_statuses(&[sig])).await;
+            let status = if let Some(fast_rpc) = fast_status_rpc_client.clone() {
+                let fast_result = tokio::task::spawn_blocking({
+                    let rpc = fast_rpc;
+                    move || rpc.get_signature_statuses(&[sig])
+                })
+                .await;
+
+                match fast_result {
+                    Ok(Ok(response)) => Ok(Ok(response)),
+                    Ok(Err(err)) => {
+                        debug!(
+                            "Consensus upgrade fast RPC error: [{}] {} | {}",
+                            signal.group_name, mint_short, err,
+                        );
+                        tokio::task::spawn_blocking({
+                            let rpc = rpc_client.clone();
+                            move || rpc.get_signature_statuses(&[sig])
+                        })
+                        .await
+                    }
+                    Err(err) => {
+                        debug!(
+                            "Consensus upgrade fast RPC task error: [{}] {} | {}",
+                            signal.group_name, mint_short, err,
+                        );
+                        tokio::task::spawn_blocking({
+                            let rpc = rpc_client.clone();
+                            move || rpc.get_signature_statuses(&[sig])
+                        })
+                        .await
+                    }
+                }
+            } else {
+                tokio::task::spawn_blocking({
+                    let rpc = rpc_client.clone();
+                    move || rpc.get_signature_statuses(&[sig])
+                })
+                .await
+            };
 
             match status {
                 Ok(Ok(response)) => {
