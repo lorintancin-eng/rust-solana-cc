@@ -11,7 +11,6 @@ pub struct AppConfig {
     // RPC & gRPC
     pub rpc_url: String,
     pub secondary_rpc_url: Option<String>,
-    pub fast_status_rpc_url: Option<String>,
     /// 浜ゆ槗鐩戝惉娴侀粯璁よ蛋 Shyft RabbitStream pre-exec銆?    /// 鍏煎鏃у彉閲忥細浼樺厛璇诲彇 RABBITSTREAM_URL锛屽叾娆?GRPC_URL銆?    pub grpc_url: String,
     /// 浜ゆ槗鐩戝惉娴?token銆?    /// 鍏煎鏃у彉閲忥細浼樺厛璇诲彇 RABBITSTREAM_TOKEN锛屽叾娆?GRPC_TOKEN銆?    pub grpc_token: Option<String>,
     /// 璐︽埛鐩戞帶鐢ㄧ殑 gRPC URL锛圧abbitStream 涓嶆敮鎸佽处鎴疯闃咃紝闇€瑕佹櫘閫?gRPC锛?    /// 涓嶈缃椂鍥為€€鍒?SHYFT_GRPC_URL / GRPC_ACCOUNT_URL锛涘啀閫€鍒版棫鐨?GRPC_URL
@@ -92,10 +91,6 @@ impl AppConfig {
         Ok(Self {
             rpc_url: env_or("RPC_URL", "https://api.mainnet-beta.solana.com"),
             secondary_rpc_url: std::env::var("SECONDARY_RPC_URL").ok(),
-            fast_status_rpc_url: std::env::var("FAST_STATUS_RPC_URL")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
             grpc_url: first_env(&["RABBITSTREAM_URL", "GRPC_URL"])
                 .unwrap_or_else(|| "https://grpc.triton.one".to_string()),
             grpc_token: first_env(&["RABBITSTREAM_TOKEN", "GRPC_TOKEN"]),

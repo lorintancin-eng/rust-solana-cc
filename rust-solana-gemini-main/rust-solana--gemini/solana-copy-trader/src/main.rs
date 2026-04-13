@@ -95,18 +95,23 @@ async fn main() -> Result<()> {
         target_wallets.len(),
     );
 
+    let fast_status_rpc_url = std::env::var("FAST_STATUS_RPC_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
         config.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::confirmed(),
     ));
-    let fast_status_rpc_client = config.fast_status_rpc_url.as_ref().map(|url| {
+    let fast_status_rpc_client = fast_status_rpc_url.as_ref().map(|url| {
         Arc::new(RpcClient::new_with_commitment(
             url.clone(),
             solana_sdk::commitment_config::CommitmentConfig::confirmed(),
         ))
     });
 
-    if let Some(url) = &config.fast_status_rpc_url {
+    if let Some(url) = &fast_status_rpc_url {
         info!("Fast status RPC enabled: {}", url);
     }
 
