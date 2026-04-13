@@ -85,14 +85,7 @@ impl ConsensusEngine {
                 timeout: Duration::from_secs(signal.consensus_timeout_secs.max(1)),
             });
 
-        if entry.triggered {
-            debug!(
-                "Skip consensus signal: [{}] {} already triggered",
-                signal.group_name,
-                &signal.token_mint.to_string()[..12],
-            );
-            return;
-        }
+        let entry_was_triggered = entry.triggered;
 
         let timeout = entry.timeout;
         entry
@@ -106,12 +99,21 @@ impl ConsensusEngine {
         {
             if should_replace_signal(existing, &signal) {
                 *existing = signal.clone();
-                debug!(
-                    "Upgrade consensus wallet signal: [{}] {}.. -> {}",
-                    signal.group_name,
-                    &signal.wallet.to_string()[..8],
-                    &signal.token_mint.to_string()[..12],
-                );
+                if entry_was_triggered {
+                    debug!(
+                        "Update triggered consensus signal: [{}] {}.. -> {}",
+                        signal.group_name,
+                        &signal.wallet.to_string()[..8],
+                        &signal.token_mint.to_string()[..12],
+                    );
+                } else {
+                    debug!(
+                        "Upgrade consensus wallet signal: [{}] {}.. -> {}",
+                        signal.group_name,
+                        &signal.wallet.to_string()[..8],
+                        &signal.token_mint.to_string()[..12],
+                    );
+                }
             } else {
                 debug!(
                     "Skip duplicate consensus wallet: [{}] {}.. -> {}",
@@ -122,56 +124,38 @@ impl ConsensusEngine {
                 return;
             }
         } else {
+            if entry_was_triggered {
+                debug!(
+                    "Skip new wallet signal for triggered consensus: [{}] {}",
+                    signal.group_name,
+                    &signal.token_mint.to_string()[..12],
+                );
+                return;
+            }
             entry.signals.push(signal.clone());
         }
-        let effective_signals: Vec<&BuySignal> = entry
-            .signals
-            .iter()
-            .filter(|candidate| candidate.counts_for_candidate_consensus())
-            .collect();
-        let confirmed_signals: Vec<&BuySignal> = effective_signals
-            .iter()
-            .copied()
-            .filter(|candidate| candidate.counts_as_confirmed_vote())
-            .collect();
-        let candidate_only_signals: Vec<&BuySignal> = effective_signals
-            .iter()
-            .copied()
-            .filter(|candidate| !candidate.counts_as_confirmed_vote())
-            .collect();
-        let effective_wallets: Vec<Pubkey> = effective_signals
-            .iter()
-            .map(|candidate| candidate.wallet)
-            .collect();
-        let confirmed_wallets: Vec<Pubkey> = confirmed_signals
-            .iter()
-            .map(|candidate| candidate.wallet)
-            .collect();
-        let candidate_wallets: Vec<Pubkey> = candidate_only_signals
-            .iter()
-            .map(|candidate| candidate.wallet)
-            .collect();
-        let total_votes = confirmed_wallets.len() + candidate_wallets.len();
+        let tally = tally_votes(&entry.signals, entry.min_wallets);
+
+        if entry_was_triggered {
+            return;
+        }
 
         info!(
             "Consensus signal: [{}] {} | confirmed={} | candidates={} | total={}/{} | raw={}",
             signal.group_name,
             &signal.token_mint.to_string()[..12],
-            confirmed_wallets.len(),
-            candidate_wallets.len(),
-            total_votes,
+            tally.confirmed_wallets.len(),
+            tally.candidate_wallets.len(),
+            tally.total_votes,
             entry.min_wallets,
             entry.signals.len(),
         );
 
-        let trigger_on_candidates = candidate_wallets.len() >= entry.min_wallets;
-        let trigger_on_mixed = !confirmed_wallets.is_empty() && total_votes >= entry.min_wallets;
-
-        if trigger_on_candidates || trigger_on_mixed {
-            let canonical_pool = if trigger_on_candidates {
-                &effective_signals
+        if tally.should_trigger() {
+            let canonical_pool = if tally.trigger_on_candidates {
+                &tally.effective_signals
             } else {
-                &confirmed_signals
+                &tally.confirmed_signals
             };
             let Some(canonical_signal) = canonical_pool
                 .iter()
@@ -180,7 +164,8 @@ impl ConsensusEngine {
             else {
                 return;
             };
-            let first_signature = effective_signals
+            let first_signature = tally
+                .effective_signals
                 .iter()
                 .min_by_key(|candidate| candidate.detected_at)
                 .map(|candidate| candidate.signature.clone())
@@ -191,7 +176,7 @@ impl ConsensusEngine {
                 group_id: signal.group_id,
                 group_name: signal.group_name,
                 token_mint: signal.token_mint,
-                wallets: effective_wallets,
+                wallets: tally.effective_wallets,
                 first_signature,
                 canonical_signature: canonical_signal.signature.clone(),
                 canonical_wallet: canonical_signal.wallet,
@@ -247,15 +232,43 @@ impl ConsensusEngine {
         };
 
         if let Some(mut entry) = self.signals.get_mut(&key) {
-            if entry.triggered {
-                return false;
-            }
-
             let before = entry.signals.len();
             entry.signals.retain(|candidate| {
                 !(candidate.wallet == *wallet && candidate.signature == signature)
             });
-            return before != entry.signals.len();
+            let after = entry.signals.len();
+            let was_triggered = entry.triggered;
+            let tally = tally_votes(&entry.signals, entry.min_wallets);
+            entry.triggered = tally.should_trigger();
+            if was_triggered && !entry.triggered {
+                info!(
+                    "Consensus retracted: [{}] {} | wallet={}..{} | sig: {}..{}",
+                    group_id,
+                    &mint.to_string()[..12],
+                    &wallet.to_string()[..4],
+                    &wallet.to_string()[wallet.to_string().len() - 4..],
+                    &signature[..8.min(signature.len())],
+                    &signature[signature.len().saturating_sub(4)..],
+                );
+            }
+            return before != after;
+        }
+
+        false
+    }
+
+    pub fn needs_candidate_upgrade(&self, group_id: &str, mint: &Pubkey) -> bool {
+        let key = ConsensusKey {
+            group_id: group_id.to_string(),
+            token_mint: *mint,
+        };
+
+        if let Some(entry) = self.signals.get(&key) {
+            if entry.triggered {
+                return false;
+            }
+            let tally = tally_votes(&entry.signals, entry.min_wallets);
+            return tally.candidate_wallets.len() < entry.min_wallets;
         }
 
         false
@@ -341,4 +354,62 @@ fn should_replace_signal(existing: &BuySignal, incoming: &BuySignal) -> bool {
         || (incoming_score == existing_score
             && !incoming.is_pre_execution
             && existing.is_pre_execution)
+}
+
+struct VoteTally<'a> {
+    effective_signals: Vec<&'a BuySignal>,
+    confirmed_signals: Vec<&'a BuySignal>,
+    candidate_wallets: Vec<Pubkey>,
+    effective_wallets: Vec<Pubkey>,
+    total_votes: usize,
+    trigger_on_candidates: bool,
+    trigger_on_mixed: bool,
+}
+
+impl<'a> VoteTally<'a> {
+    fn should_trigger(&self) -> bool {
+        self.trigger_on_candidates || self.trigger_on_mixed
+    }
+}
+
+fn tally_votes<'a>(signals: &'a [BuySignal], min_wallets: usize) -> VoteTally<'a> {
+    let effective_signals: Vec<&BuySignal> = signals
+        .iter()
+        .filter(|candidate| candidate.counts_for_candidate_consensus())
+        .collect();
+    let confirmed_signals: Vec<&BuySignal> = effective_signals
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.counts_as_confirmed_vote())
+        .collect();
+    let candidate_only_signals: Vec<&BuySignal> = effective_signals
+        .iter()
+        .copied()
+        .filter(|candidate| !candidate.counts_as_confirmed_vote())
+        .collect();
+    let effective_wallets: Vec<Pubkey> = effective_signals
+        .iter()
+        .map(|candidate| candidate.wallet)
+        .collect();
+    let confirmed_wallets: Vec<Pubkey> = confirmed_signals
+        .iter()
+        .map(|candidate| candidate.wallet)
+        .collect();
+    let candidate_wallets: Vec<Pubkey> = candidate_only_signals
+        .iter()
+        .map(|candidate| candidate.wallet)
+        .collect();
+    let total_votes = confirmed_wallets.len() + candidate_wallets.len();
+    let trigger_on_candidates = candidate_wallets.len() >= min_wallets;
+    let trigger_on_mixed = !confirmed_wallets.is_empty() && total_votes >= min_wallets;
+
+    VoteTally {
+        effective_signals,
+        confirmed_signals,
+        candidate_wallets,
+        effective_wallets,
+        total_votes,
+        trigger_on_candidates,
+        trigger_on_mixed,
+    }
 }
