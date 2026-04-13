@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.36");
+    info!("   Solana 跟单交易系统 v1.6.37");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -437,31 +437,6 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        if trade.execution_failed {
-            for group in &entry_groups {
-                if group.consensus_min_wallets > 1
-                    && consensus_engine.reject_signal(
-                        &group.id,
-                        &token_mint,
-                        &trade.source_wallet,
-                        &trade.signature,
-                    )
-                {
-                    info!(
-                        "Consensus candidate rejected: [{}] {} | wallet={}..{} | sig: {}..{}",
-                        group.name,
-                        &token_mint.to_string()[..12],
-                        &trade.source_wallet.to_string()[..4],
-                        &trade.source_wallet.to_string()
-                            [trade.source_wallet.to_string().len() - 4..],
-                        &trade.signature[..8],
-                        &trade.signature[trade.signature.len() - 4..],
-                    );
-                }
-            }
-            continue;
-        }
-
         let prefetched = prefetch_cache.prefetch_token(
             &token_mint,
             &token_program,
@@ -501,6 +476,17 @@ async fn main() -> Result<()> {
             }
 
             if group.consensus_min_wallets <= 1 {
+                if trade.execution_failed {
+                    debug!(
+                        "Skip single-wallet candidate due to landed failure: [{}] {} | sig: {}..{}",
+                        group.name,
+                        &token_mint.to_string()[..12],
+                        &trade.signature[..8],
+                        &trade.signature[trade.signature.len() - 4..],
+                    );
+                    continue;
+                }
+
                 let dedup_key = group_mint_key(&group.id, &token_mint);
                 if mint_dedup.contains_key(&dedup_key) {
                     continue;
@@ -550,6 +536,27 @@ async fn main() -> Result<()> {
                     .await;
                 });
             } else {
+                if trade.execution_failed {
+                    if consensus_engine.reject_signal(
+                        &group.id,
+                        &token_mint,
+                        &trade.source_wallet,
+                        &trade.signature,
+                    ) {
+                        info!(
+                            "Consensus candidate rejected: [{}] {} | wallet={}..{} | sig: {}..{}",
+                            group.name,
+                            &token_mint.to_string()[..12],
+                            &trade.source_wallet.to_string()[..4],
+                            &trade.source_wallet.to_string()
+                                [trade.source_wallet.to_string().len() - 4..],
+                            &trade.signature[..8],
+                            &trade.signature[trade.signature.len() - 4..],
+                        );
+                    }
+                    continue;
+                }
+
                 consensus_engine.submit_signal(
                     BuySignal {
                         group_id: group.id.clone(),
