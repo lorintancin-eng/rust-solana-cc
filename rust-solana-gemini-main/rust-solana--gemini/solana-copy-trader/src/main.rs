@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.35");
+    info!("   Solana 跟单交易系统 v1.6.36");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -416,7 +416,7 @@ async fn main() -> Result<()> {
                 entry_groups.push(group.clone());
             }
 
-            if !trade.is_buy && group.follow_sell_mode() {
+            if !trade.execution_failed && !trade.is_buy && group.follow_sell_mode() {
                 if let Some(position) =
                     auto_sell_manager.get_position_by_group_mint(&group.id, &token_mint)
                 {
@@ -434,6 +434,31 @@ async fn main() -> Result<()> {
         }
 
         if entry_groups.is_empty() {
+            continue;
+        }
+
+        if trade.execution_failed {
+            for group in &entry_groups {
+                if group.consensus_min_wallets > 1
+                    && consensus_engine.reject_signal(
+                        &group.id,
+                        &token_mint,
+                        &trade.source_wallet,
+                        &trade.signature,
+                    )
+                {
+                    info!(
+                        "Consensus candidate rejected: [{}] {} | wallet={}..{} | sig: {}..{}",
+                        group.name,
+                        &token_mint.to_string()[..12],
+                        &trade.source_wallet.to_string()[..4],
+                        &trade.source_wallet.to_string()
+                            [trade.source_wallet.to_string().len() - 4..],
+                        &trade.signature[..8],
+                        &trade.signature[trade.signature.len() - 4..],
+                    );
+                }
+            }
             continue;
         }
 
@@ -532,7 +557,7 @@ async fn main() -> Result<()> {
                         token_mint,
                         wallet: trade.source_wallet,
                         token_program,
-                        detected_at: Instant::now(),
+                        detected_at: trade.detected_at,
                         signature: trade.signature.clone(),
                         consensus_min_wallets: group.consensus_min_wallets,
                         consensus_timeout_secs: group.consensus_timeout_secs,
@@ -540,6 +565,7 @@ async fn main() -> Result<()> {
                         instruction_accounts: trade.instruction_accounts.clone(),
                         sol_amount_lamports: trade.sol_amount_lamports,
                         is_pre_execution: trade.is_pre_execution,
+                        is_confirmed: trade.execution_confirmed,
                     },
                     &consensus_tx,
                 );

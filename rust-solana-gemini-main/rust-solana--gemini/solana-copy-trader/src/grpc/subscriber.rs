@@ -441,6 +441,8 @@ impl GrpcSubscriber {
                     Self::serialize_transaction_from_proto(tx_data).unwrap_or_default();
                 // meta 为空 = 预执行（交易尚未被 leader 执行，可 Backrun）
                 trade.is_pre_execution = meta.is_none();
+                trade.execution_failed = Self::meta_failed(meta);
+                trade.execution_confirmed = meta.is_some() && !trade.execution_failed;
                 self.enrich_trade_from_meta(&mut trade, message, meta, &account_keys);
                 return Ok(Some(trade));
             }
@@ -494,6 +496,8 @@ impl GrpcSubscriber {
                             Self::serialize_transaction_from_proto(tx_data).unwrap_or_default();
                         // inner instructions 来自 meta，所以交易已执行，不可 Backrun
                         trade.is_pre_execution = false;
+                        trade.execution_failed = Self::meta_failed(meta);
+                        trade.execution_confirmed = !trade.execution_failed;
                         self.enrich_trade_from_meta(&mut trade, message, meta, &account_keys);
                         return Ok(Some(trade));
                     }
@@ -561,7 +565,9 @@ impl GrpcSubscriber {
             sol_amount_lamports,
             raw_transaction_bytes: Vec::new(), // 由 parse_transaction 填充
             is_pre_execution: false,           // 由 parse_transaction 根据 meta 设置
-            token_mint: None,                  // 直接调用场景由 main.rs extract_token_info 提取
+            execution_confirmed: false,
+            execution_failed: false,
+            token_mint: None, // 直接调用场景由 main.rs extract_token_info 提取
         }))
     }
 
@@ -660,6 +666,8 @@ impl GrpcSubscriber {
             raw_transaction_bytes: Self::serialize_transaction_from_proto(tx_data)
                 .unwrap_or_default(),
             is_pre_execution: meta.is_none(),
+            execution_confirmed: meta.is_some() && !Self::meta_failed(meta),
+            execution_failed: Self::meta_failed(meta),
             token_mint: Some(mint), // CPI 检测已通过 PDA 验证识别了 mint
         })
     }
@@ -840,6 +848,10 @@ impl GrpcSubscriber {
             TradeType::PumpSwap => u64::from_le_bytes(data[16..24].try_into().unwrap_or([0; 8])),
             _ => 0,
         }
+    }
+
+    fn meta_failed(meta: Option<&yellowstone_grpc_proto::prelude::TransactionStatusMeta>) -> bool {
+        meta.and_then(|status| status.err.as_ref()).is_some()
     }
 
     fn enrich_trade_from_meta(

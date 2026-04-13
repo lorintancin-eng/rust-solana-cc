@@ -26,6 +26,7 @@ pub struct BuySignal {
     pub instruction_accounts: Vec<Pubkey>,
     pub sol_amount_lamports: u64,
     pub is_pre_execution: bool,
+    pub is_confirmed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -123,34 +124,44 @@ impl ConsensusEngine {
         } else {
             entry.signals.push(signal.clone());
         }
-        let eligible_signals: Vec<&BuySignal> = entry
+        let candidate_signals: Vec<&BuySignal> = entry
             .signals
             .iter()
-            .filter(|candidate| candidate.counts_for_consensus())
+            .filter(|candidate| candidate.counts_for_candidate_consensus())
             .collect();
-        let unique_wallets: Vec<Pubkey> = eligible_signals
+        let confirmed_signals: Vec<&BuySignal> = candidate_signals
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.counts_as_confirmed_vote())
+            .collect();
+        let unique_wallets: Vec<Pubkey> = candidate_signals
+            .iter()
+            .map(|candidate| candidate.wallet)
+            .collect();
+        let confirmed_wallets: Vec<Pubkey> = confirmed_signals
             .iter()
             .map(|candidate| candidate.wallet)
             .collect();
 
         info!(
-            "Consensus signal: [{}] {} | {}/{} wallets | candidates={}",
+            "Consensus signal: [{}] {} | confirmed={} | candidates={}/{} wallets | raw={}",
             signal.group_name,
             &signal.token_mint.to_string()[..12],
+            confirmed_wallets.len(),
             unique_wallets.len(),
             entry.min_wallets,
             entry.signals.len(),
         );
 
-        if unique_wallets.len() >= entry.min_wallets {
-            let Some(canonical_signal) = eligible_signals
+        if !confirmed_wallets.is_empty() && unique_wallets.len() >= entry.min_wallets {
+            let Some(canonical_signal) = confirmed_signals
                 .iter()
                 .max_by_key(|candidate| candidate.canonical_score())
                 .map(|candidate| (*candidate).clone())
             else {
                 return;
             };
-            let first_signature = eligible_signals
+            let first_signature = candidate_signals
                 .iter()
                 .min_by_key(|candidate| candidate.detected_at)
                 .map(|candidate| candidate.signature.clone())
@@ -204,6 +215,33 @@ impl ConsensusEngine {
         false
     }
 
+    pub fn reject_signal(
+        &self,
+        group_id: &str,
+        mint: &Pubkey,
+        wallet: &Pubkey,
+        signature: &str,
+    ) -> bool {
+        let key = ConsensusKey {
+            group_id: group_id.to_string(),
+            token_mint: *mint,
+        };
+
+        if let Some(mut entry) = self.signals.get_mut(&key) {
+            if entry.triggered {
+                return false;
+            }
+
+            let before = entry.signals.len();
+            entry.signals.retain(|candidate| {
+                !(candidate.wallet == *wallet && candidate.signature == signature)
+            });
+            return before != entry.signals.len();
+        }
+
+        false
+    }
+
     pub fn start_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
         let signals = self.signals.clone();
         tokio::spawn(async move {
@@ -239,12 +277,19 @@ impl BuySignal {
         self.instruction_data.len() >= 24
     }
 
-    pub fn counts_for_consensus(&self) -> bool {
-        !self.is_pre_execution || self.has_target_instruction() || self.sol_amount_lamports > 0
+    pub fn counts_for_candidate_consensus(&self) -> bool {
+        self.is_confirmed || self.has_target_instruction() || self.sol_amount_lamports > 0
+    }
+
+    pub fn counts_as_confirmed_vote(&self) -> bool {
+        self.is_confirmed
     }
 
     fn canonical_score(&self) -> u32 {
         let mut score = 0u32;
+        if self.is_confirmed {
+            score += 16;
+        }
         if self.has_target_instruction() {
             score += 8;
         }
@@ -263,7 +308,12 @@ impl BuySignal {
 
 fn should_replace_signal(existing: &BuySignal, incoming: &BuySignal) -> bool {
     if incoming.signature == existing.signature {
-        return !incoming.is_pre_execution && existing.is_pre_execution;
+        let incoming_score = incoming.canonical_score();
+        let existing_score = existing.canonical_score();
+        return incoming_score > existing_score
+            || (incoming_score == existing_score
+                && !incoming.is_pre_execution
+                && existing.is_pre_execution);
     }
 
     let existing_score = existing.canonical_score();
