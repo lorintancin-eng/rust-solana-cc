@@ -1,4 +1,4 @@
-mod autosell;
+﻿mod autosell;
 mod config;
 mod consensus;
 mod group_stats;
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 鐠虹喎宕熸禍銈嗘缁崵绮?v1.6.41");
+    info!("   Solana 跟单交易系统 v1.6.42");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -89,9 +89,9 @@ async fn main() -> Result<()> {
     let group_manager = GroupManager::load_or_default(&config);
     let target_wallets = group_manager.all_target_wallets();
 
-    info!("娴溿倖妲楅柦鍗炲瘶: {}", config.pubkey);
+    info!("跟单钱包地址: {}", config.pubkey);
     info!(
-        "缂佸嫬鎮庨弫? {} | 閻╊喗鐖ｉ柦鍗炲瘶閺? {}",
+        "已加载 {} 个组合 | 目标钱包数 {}",
         group_manager.all_groups().len(),
         target_wallets.len(),
     );
@@ -1155,3 +1155,4 @@ fn init_logging() {
         .with_ansi(true)
         .init();
 }
+
