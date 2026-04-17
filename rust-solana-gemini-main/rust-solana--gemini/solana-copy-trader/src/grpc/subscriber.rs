@@ -442,7 +442,6 @@ impl GrpcSubscriber {
                 // meta 为空 = 预执行（交易尚未被 leader 执行，可 Backrun）
                 trade.is_pre_execution = meta.is_none();
                 trade.execution_failed = Self::meta_failed(meta);
-                trade.execution_confirmed = meta.is_some() && !trade.execution_failed;
                 self.enrich_trade_from_meta(&mut trade, message, meta, &account_keys);
                 return Ok(Some(trade));
             }
@@ -497,7 +496,6 @@ impl GrpcSubscriber {
                         // inner instructions 来自 meta，所以交易已执行，不可 Backrun
                         trade.is_pre_execution = false;
                         trade.execution_failed = Self::meta_failed(meta);
-                        trade.execution_confirmed = !trade.execution_failed;
                         self.enrich_trade_from_meta(&mut trade, message, meta, &account_keys);
                         return Ok(Some(trade));
                     }
@@ -565,7 +563,6 @@ impl GrpcSubscriber {
             sol_amount_lamports,
             raw_transaction_bytes: Vec::new(), // 由 parse_transaction 填充
             is_pre_execution: false,           // 由 parse_transaction 根据 meta 设置
-            execution_confirmed: false,
             execution_failed: false,
             token_mint: None, // 直接调用场景由 main.rs extract_token_info 提取
         }))
@@ -666,7 +663,6 @@ impl GrpcSubscriber {
             raw_transaction_bytes: Self::serialize_transaction_from_proto(tx_data)
                 .unwrap_or_default(),
             is_pre_execution: meta.is_none(),
-            execution_confirmed: meta.is_some() && !Self::meta_failed(meta),
             execution_failed: Self::meta_failed(meta),
             token_mint: Some(mint), // CPI 检测已通过 PDA 验证识别了 mint
         })

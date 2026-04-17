@@ -1,4 +1,4 @@
-﻿mod autosell;
+mod autosell;
 mod config;
 mod consensus;
 mod group_stats;
@@ -13,7 +13,6 @@ use anyhow::Result;
 use dashmap::DashMap;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
 use spl_associated_token_account::get_associated_token_address;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,7 +80,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.45");
+    info!("   Solana 跟单交易系统 v1.6.46");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -96,25 +95,10 @@ async fn main() -> Result<()> {
         target_wallets.len(),
     );
 
-    let fast_status_rpc_url = std::env::var("FAST_STATUS_RPC_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
         config.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::confirmed(),
     ));
-    let fast_status_rpc_client = fast_status_rpc_url.as_ref().map(|url| {
-        Arc::new(RpcClient::new_with_commitment(
-            url.clone(),
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
-        ))
-    });
-
-    if let Some(url) = &fast_status_rpc_url {
-        info!("Fast status RPC enabled: {}", url);
-    }
 
     let balance = rpc_client.get_balance(&config.pubkey)?;
     info!("SOL balance: {:.4}", balance as f64 / 1e9);
@@ -590,167 +574,13 @@ async fn main() -> Result<()> {
                     instruction_accounts: trade.instruction_accounts.clone(),
                     sol_amount_lamports: trade.sol_amount_lamports,
                     is_pre_execution: trade.is_pre_execution,
-                    is_confirmed: trade.execution_confirmed,
                 };
-                consensus_engine.submit_signal(buy_signal.clone(), &consensus_tx);
-                if !buy_signal.is_confirmed
-                    && !trade.execution_failed
-                    && consensus_engine
-                        .needs_candidate_upgrade(&buy_signal.group_id, &buy_signal.token_mint)
-                {
-                    spawn_consensus_upgrade_task(
-                        fast_status_rpc_client.clone(),
-                        rpc_client.clone(),
-                        consensus_engine.clone(),
-                        consensus_tx.clone(),
-                        buy_signal,
-                    );
-                }
+                consensus_engine.submit_signal(buy_signal, &consensus_tx);
             }
         }
     }
 
     Ok(())
-}
-
-fn spawn_consensus_upgrade_task(
-    fast_status_rpc_client: Option<Arc<RpcClient>>,
-    rpc_client: Arc<RpcClient>,
-    consensus_engine: Arc<ConsensusEngine>,
-    consensus_tx: mpsc::UnboundedSender<ConsensusTrigger>,
-    signal: BuySignal,
-) {
-    tokio::spawn(async move {
-        let signature = match Signature::from_str(&signal.signature) {
-            Ok(signature) => signature,
-            Err(err) => {
-                warn!(
-                    "Consensus upgrade skipped: [{}] {} | invalid sig {} | {}",
-                    signal.group_name,
-                    &signal.token_mint.to_string()[..12],
-                    signal.signature,
-                    err,
-                );
-                return;
-            }
-        };
-
-        let start = Instant::now();
-        let max_wait = Duration::from_secs(signal.consensus_timeout_secs.max(1).min(3));
-        let mint_short = &signal.token_mint.to_string()[..12];
-
-        loop {
-            if start.elapsed() >= max_wait {
-                debug!(
-                    "Consensus upgrade timeout: [{}] {} | wallet={}..{} | sig: {}..{}",
-                    signal.group_name,
-                    mint_short,
-                    &signal.wallet.to_string()[..4],
-                    &signal.wallet.to_string()[signal.wallet.to_string().len() - 4..],
-                    &signal.signature[..8.min(signal.signature.len())],
-                    &signal.signature[signal.signature.len().saturating_sub(4)..],
-                );
-                return;
-            }
-
-            let sig = signature;
-            let status = if let Some(fast_rpc) = fast_status_rpc_client.clone() {
-                let fast_result = tokio::task::spawn_blocking({
-                    let rpc = fast_rpc;
-                    move || rpc.get_signature_statuses(&[sig])
-                })
-                .await;
-
-                match fast_result {
-                    Ok(Ok(response)) => Ok(Ok(response)),
-                    Ok(Err(err)) => {
-                        debug!(
-                            "Consensus upgrade fast RPC error: [{}] {} | {}",
-                            signal.group_name, mint_short, err,
-                        );
-                        tokio::task::spawn_blocking({
-                            let rpc = rpc_client.clone();
-                            move || rpc.get_signature_statuses(&[sig])
-                        })
-                        .await
-                    }
-                    Err(err) => {
-                        debug!(
-                            "Consensus upgrade fast RPC task error: [{}] {} | {}",
-                            signal.group_name, mint_short, err,
-                        );
-                        tokio::task::spawn_blocking({
-                            let rpc = rpc_client.clone();
-                            move || rpc.get_signature_statuses(&[sig])
-                        })
-                        .await
-                    }
-                }
-            } else {
-                tokio::task::spawn_blocking({
-                    let rpc = rpc_client.clone();
-                    move || rpc.get_signature_statuses(&[sig])
-                })
-                .await
-            };
-
-            match status {
-                Ok(Ok(response)) => {
-                    if let Some(Some(sig_status)) = response.value.first() {
-                        if let Some(err) = &sig_status.err {
-                            let removed = consensus_engine.reject_signal(
-                                &signal.group_id,
-                                &signal.token_mint,
-                                &signal.wallet,
-                                &signal.signature,
-                            );
-                            warn!(
-                                "Consensus upgrade failed: [{}] {} | wallet={}..{} | sig: {}..{} | err: {:?} | retracted={}",
-                                signal.group_name,
-                                mint_short,
-                                &signal.wallet.to_string()[..4],
-                                &signal.wallet.to_string()[signal.wallet.to_string().len() - 4..],
-                                &signal.signature[..8.min(signal.signature.len())],
-                                &signal.signature[signal.signature.len().saturating_sub(4)..],
-                                err,
-                                removed,
-                            );
-                            return;
-                        }
-
-                        let mut confirmed_signal = signal.clone();
-                        confirmed_signal.is_confirmed = true;
-                        confirmed_signal.is_pre_execution = false;
-                        consensus_engine.submit_signal(confirmed_signal, &consensus_tx);
-                        info!(
-                            "Consensus candidate upgraded: [{}] {} | wallet={}..{} | sig: {}..{}",
-                            signal.group_name,
-                            mint_short,
-                            &signal.wallet.to_string()[..4],
-                            &signal.wallet.to_string()[signal.wallet.to_string().len() - 4..],
-                            &signal.signature[..8.min(signal.signature.len())],
-                            &signal.signature[signal.signature.len().saturating_sub(4)..],
-                        );
-                        return;
-                    }
-                }
-                Ok(Err(err)) => {
-                    debug!(
-                        "Consensus upgrade status RPC error: [{}] {} | {}",
-                        signal.group_name, mint_short, err,
-                    );
-                }
-                Err(err) => {
-                    debug!(
-                        "Consensus upgrade task error: [{}] {} | {}",
-                        signal.group_name, mint_short, err,
-                    );
-                }
-            }
-
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1155,7 +985,3 @@ fn init_logging() {
         .with_ansi(true)
         .init();
 }
-
-
-
-

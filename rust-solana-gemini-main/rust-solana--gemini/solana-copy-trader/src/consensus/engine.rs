@@ -26,7 +26,6 @@ pub struct BuySignal {
     pub instruction_accounts: Vec<Pubkey>,
     pub sol_amount_lamports: u64,
     pub is_pre_execution: bool,
-    pub is_confirmed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -141,23 +140,17 @@ impl ConsensusEngine {
         }
 
         info!(
-            "Consensus signal: [{}] {} | confirmed={} | candidates={} | total={}/{} | raw={}",
+            "Consensus signal: [{}] {} | candidates={}/{} | raw={}",
             signal.group_name,
             &signal.token_mint.to_string()[..12],
-            tally.confirmed_wallets.len(),
             tally.candidate_wallets.len(),
-            tally.total_votes,
             entry.min_wallets,
             entry.signals.len(),
         );
 
         if tally.should_trigger() {
-            let canonical_pool = if tally.trigger_on_candidates {
-                &tally.effective_signals
-            } else {
-                &tally.confirmed_signals
-            };
-            let Some(canonical_signal) = canonical_pool
+            let Some(canonical_signal) = tally
+                .effective_signals
                 .iter()
                 .max_by_key(|candidate| candidate.canonical_score())
                 .map(|candidate| (*candidate).clone())
@@ -267,23 +260,6 @@ impl ConsensusEngine {
         false
     }
 
-    pub fn needs_candidate_upgrade(&self, group_id: &str, mint: &Pubkey) -> bool {
-        let key = ConsensusKey {
-            group_id: group_id.to_string(),
-            token_mint: *mint,
-        };
-
-        if let Some(entry) = self.signals.get(&key) {
-            if entry.triggered {
-                return false;
-            }
-            let tally = tally_votes(&entry.signals, entry.min_wallets);
-            return tally.candidate_wallets.len() < entry.min_wallets;
-        }
-
-        false
-    }
-
     pub fn start_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
         let signals = self.signals.clone();
         tokio::spawn(async move {
@@ -320,18 +296,11 @@ impl BuySignal {
     }
 
     pub fn counts_for_candidate_consensus(&self) -> bool {
-        self.is_confirmed || self.has_target_instruction() || self.sol_amount_lamports > 0
-    }
-
-    pub fn counts_as_confirmed_vote(&self) -> bool {
-        self.is_confirmed
+        self.has_target_instruction() || self.sol_amount_lamports > 0
     }
 
     fn canonical_score(&self) -> u32 {
         let mut score = 0u32;
-        if self.is_confirmed {
-            score += 16;
-        }
         if self.has_target_instruction() {
             score += 8;
         }
@@ -368,18 +337,14 @@ fn should_replace_signal(existing: &BuySignal, incoming: &BuySignal) -> bool {
 
 struct VoteTally<'a> {
     effective_signals: Vec<&'a BuySignal>,
-    confirmed_signals: Vec<&'a BuySignal>,
-    confirmed_wallets: Vec<Pubkey>,
     candidate_wallets: Vec<Pubkey>,
     effective_wallets: Vec<Pubkey>,
-    total_votes: usize,
-    trigger_on_candidates: bool,
-    trigger_on_mixed: bool,
+    min_wallets: usize,
 }
 
 impl<'a> VoteTally<'a> {
     fn should_trigger(&self) -> bool {
-        self.trigger_on_candidates || self.trigger_on_mixed
+        self.candidate_wallets.len() >= self.min_wallets
     }
 }
 
@@ -388,40 +353,19 @@ fn tally_votes<'a>(signals: &'a [BuySignal], min_wallets: usize) -> VoteTally<'a
         .iter()
         .filter(|candidate| candidate.counts_for_candidate_consensus())
         .collect();
-    let confirmed_signals: Vec<&BuySignal> = effective_signals
-        .iter()
-        .copied()
-        .filter(|candidate| candidate.counts_as_confirmed_vote())
-        .collect();
-    let candidate_only_signals: Vec<&BuySignal> = effective_signals
-        .iter()
-        .copied()
-        .filter(|candidate| !candidate.counts_as_confirmed_vote())
-        .collect();
     let effective_wallets: Vec<Pubkey> = effective_signals
         .iter()
         .map(|candidate| candidate.wallet)
         .collect();
-    let confirmed_wallets: Vec<Pubkey> = confirmed_signals
+    let candidate_wallets: Vec<Pubkey> = effective_signals
         .iter()
         .map(|candidate| candidate.wallet)
         .collect();
-    let candidate_wallets: Vec<Pubkey> = candidate_only_signals
-        .iter()
-        .map(|candidate| candidate.wallet)
-        .collect();
-    let total_votes = confirmed_wallets.len() + candidate_wallets.len();
-    let trigger_on_candidates = candidate_wallets.len() >= min_wallets;
-    let trigger_on_mixed = !confirmed_wallets.is_empty() && total_votes >= min_wallets;
 
     VoteTally {
         effective_signals,
-        confirmed_signals,
-        confirmed_wallets,
         candidate_wallets,
         effective_wallets,
-        total_votes,
-        trigger_on_candidates,
-        trigger_on_mixed,
+        min_wallets,
     }
 }

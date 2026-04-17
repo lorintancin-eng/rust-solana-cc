@@ -45,7 +45,6 @@ pub struct DetectedTrade {
     pub sol_amount_lamports: u64,
     pub raw_transaction_bytes: Vec<u8>,
     pub is_pre_execution: bool,
-    pub execution_confirmed: bool,
     pub execution_failed: bool,
     pub token_mint: Option<Pubkey>,
 }
