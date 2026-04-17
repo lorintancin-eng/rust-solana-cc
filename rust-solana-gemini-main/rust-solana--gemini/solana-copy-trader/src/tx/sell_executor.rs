@@ -26,7 +26,7 @@ const FAST_FIRST_CONFIRM_MS: u64 = 1_500;
 const RETRY_CONFIRM_MS: u64 = 2_500;
 const DEFAULT_CONFIRM_MS: u64 = 3_000;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct SellPathTimings {
     signal_queue: Duration,
     snapshot_load: Duration,
