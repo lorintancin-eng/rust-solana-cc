@@ -254,6 +254,52 @@ impl SellExecutor {
         Ok(sig.to_string())
     }
 
+    async fn try_jupiter_sell_with_confirm(
+        &self,
+        position: &Position,
+        token_amount: u64,
+        confirm_timeout_ms: u64,
+        expected_after_balance: u64,
+    ) -> Result<(String, SellConfirmTrace)> {
+        let sig = self.try_jupiter_sell(position, token_amount).await?;
+        let confirm_trace = self
+            .wait_sell_confirm(position, &sig, confirm_timeout_ms, expected_after_balance)
+            .await;
+        Ok((sig, confirm_trace))
+    }
+
+    async fn should_route_sell_to_jupiter(
+        &self,
+        group_name: &str,
+        token_mint: &Pubkey,
+        snapshot: &SellAccountSnapshot,
+    ) -> bool {
+        match self
+            .pumpfun
+            .is_bonding_curve_migrated(&snapshot.bonding_curve)
+            .await
+        {
+            Ok(true) => {
+                info!(
+                    "Sell routing: [{}] {} migrated to external pool, using Jupiter",
+                    group_name,
+                    &token_mint.to_string()[..12],
+                );
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                warn!(
+                    "Sell routing check failed [{}] {}: {}",
+                    group_name,
+                    &token_mint.to_string()[..12],
+                    err,
+                );
+                false
+            }
+        }
+    }
+
     async fn wait_sell_confirm(
         &self,
         position: &Position,
@@ -428,10 +474,68 @@ impl SellExecutor {
         let mut last_sig = String::new();
         let mut saw_signature_error = false;
         let mut failure_reason = "sell retries exhausted".to_string();
+        let route_via_jupiter = self
+            .should_route_sell_to_jupiter(
+                &signal.group_name,
+                &position_before_sell.token_mint,
+                &snapshot,
+            )
+            .await;
 
         for attempt in 1..=MAX_SELL_RETRIES {
             let confirm_timeout_ms = Self::confirm_timeout_ms(signal.reason, attempt);
             let send_started_at = Instant::now();
+
+            if route_via_jupiter {
+                match self
+                    .try_jupiter_sell_with_confirm(
+                        &position_before_sell,
+                        token_amount,
+                        confirm_timeout_ms,
+                        expected_after_balance,
+                    )
+                    .await
+                {
+                    Ok((sig, confirm_trace)) => {
+                        if confirm_trace.confirmed {
+                            info!(
+                                "Jupiter sell confirmed: [{}] {} | source={} | sig_seen={} | rpc_ata_target={} | cache_ata_target={} | total={}",
+                                signal.group_name,
+                                &position_before_sell.token_mint.to_string()[..12],
+                                confirm_trace.source,
+                                render_optional_latency(confirm_trace.signature_seen),
+                                render_optional_latency(confirm_trace.rpc_ata_target),
+                                render_optional_latency(confirm_trace.cache_ata_target),
+                                format_latency(confirm_trace.total),
+                            );
+                            success = true;
+                            last_sig = sig;
+                            break;
+                        }
+
+                        if confirm_trace.source == "signature_error" {
+                            saw_signature_error = true;
+                            failure_reason = "jupiter sell failed on-chain".to_string();
+                            warn!(
+                                "Jupiter sell aborted after on-chain failure: [{}] {} | sig: {}",
+                                signal.group_name,
+                                &position_before_sell.token_mint.to_string()[..12],
+                                sig,
+                            );
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        failure_reason = format!("jupiter sell failed: {}", err);
+                        warn!("Jupiter sell failed [{}]: {}", signal.group_name, err);
+                    }
+                }
+
+                if saw_signature_error {
+                    break;
+                }
+                continue;
+            }
 
             match self
                 .try_pumpfun_sell(&position_before_sell, token_amount, send_started_at)
@@ -477,6 +581,54 @@ impl SellExecutor {
                     }
 
                     if confirm_trace.source == "signature_error" {
+                        if !aggressive_follow {
+                            match self
+                                .try_jupiter_sell_with_confirm(
+                                    &position_before_sell,
+                                    token_amount,
+                                    confirm_timeout_ms,
+                                    expected_after_balance,
+                                )
+                                .await
+                            {
+                                Ok((fallback_sig, fallback_trace)) => {
+                                    if fallback_trace.confirmed {
+                                        info!(
+                                            "Jupiter sell confirmed after Pumpfun failure: [{}] {} | source={} | sig_seen={} | rpc_ata_target={} | cache_ata_target={} | total={}",
+                                            signal.group_name,
+                                            &position_before_sell.token_mint.to_string()[..12],
+                                            fallback_trace.source,
+                                            render_optional_latency(fallback_trace.signature_seen),
+                                            render_optional_latency(fallback_trace.rpc_ata_target),
+                                            render_optional_latency(fallback_trace.cache_ata_target),
+                                            format_latency(fallback_trace.total),
+                                        );
+                                        success = true;
+                                        last_sig = fallback_sig;
+                                        break;
+                                    }
+
+                                    if fallback_trace.source == "signature_error" {
+                                        saw_signature_error = true;
+                                        failure_reason = "jupiter sell failed on-chain".to_string();
+                                        warn!(
+                                            "Jupiter sell aborted after Pumpfun on-chain failure: [{}] {} | sig: {}",
+                                            signal.group_name,
+                                            &position_before_sell.token_mint.to_string()[..12],
+                                            fallback_sig,
+                                        );
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        "Jupiter sell fallback failed [{}]: {}",
+                                        signal.group_name, err,
+                                    );
+                                }
+                            }
+                        }
+
                         saw_signature_error = true;
                         failure_reason = "sell failed on-chain".to_string();
                         warn!(
@@ -491,34 +643,39 @@ impl SellExecutor {
                 Err(err) => {
                     warn!("Pumpfun sell failed [{}]: {}", signal.group_name, err);
                     if !aggressive_follow {
-                        if let Ok(sig) = self
-                            .try_jupiter_sell(&position_before_sell, token_amount)
+                        match self
+                            .try_jupiter_sell_with_confirm(
+                                &position_before_sell,
+                                token_amount,
+                                confirm_timeout_ms,
+                                expected_after_balance,
+                            )
                             .await
                         {
-                            let confirm_trace = self
-                                .wait_sell_confirm(
-                                    &position_before_sell,
-                                    &sig,
-                                    confirm_timeout_ms,
-                                    expected_after_balance,
-                                )
-                                .await;
-                            if confirm_trace.confirmed {
-                                success = true;
-                                last_sig = sig;
-                                break;
-                            }
+                            Ok((sig, confirm_trace)) => {
+                                if confirm_trace.confirmed {
+                                    success = true;
+                                    last_sig = sig;
+                                    break;
+                                }
 
-                            if confirm_trace.source == "signature_error" {
-                                saw_signature_error = true;
-                                failure_reason = "sell failed on-chain".to_string();
+                                if confirm_trace.source == "signature_error" {
+                                    saw_signature_error = true;
+                                    failure_reason = "jupiter sell failed on-chain".to_string();
+                                    warn!(
+                                        "Jupiter sell aborted after on-chain failure: [{}] {} | sig: {}",
+                                        signal.group_name,
+                                        &position_before_sell.token_mint.to_string()[..12],
+                                        sig,
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(jupiter_err) => {
                                 warn!(
-                                    "Jupiter sell aborted after on-chain failure: [{}] {} | sig: {}",
-                                    signal.group_name,
-                                    &position_before_sell.token_mint.to_string()[..12],
-                                    sig,
+                                    "Jupiter sell fallback failed [{}]: {}",
+                                    signal.group_name, jupiter_err,
                                 );
-                                break;
                             }
                         }
                     }
@@ -634,10 +791,30 @@ impl SellExecutor {
             return;
         }
 
-        match self
-            .try_pumpfun_sell(&position, sell_amount, Instant::now())
-            .await
-        {
+        let route_via_jupiter = match self.resolve_sell_snapshot(&position).await {
+            Ok(snapshot) => {
+                self.should_route_sell_to_jupiter(&position.group.name, mint, &snapshot)
+                    .await
+            }
+            Err(err) => {
+                warn!(
+                    "Partial sell snapshot missing [{}]: {}",
+                    position.group.name, err
+                );
+                false
+            }
+        };
+
+        let sell_result = if route_via_jupiter {
+            self.try_jupiter_sell(&position, sell_amount)
+                .await
+                .map(|sig| (sig, SellPathTimings::default()))
+        } else {
+            self.try_pumpfun_sell(&position, sell_amount, Instant::now())
+                .await
+        };
+
+        match sell_result {
             Ok((sig, _)) => {
                 self.auto_sell
                     .apply_partial_sell(&signal.position_key, sell_amount);
