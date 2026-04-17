@@ -174,6 +174,29 @@ impl PumpfunProcessor {
         self.fetch_and_validate_bonding_curve(bonding_curve).await
     }
 
+    pub async fn is_bonding_curve_migrated(&self, bonding_curve: &Pubkey) -> Result<bool> {
+        let pumpfun_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
+        let bc = *bonding_curve;
+        let rpc = self.rpc_client.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            rpc.get_account_with_commitment(
+                &bc,
+                solana_sdk::commitment_config::CommitmentConfig::processed(),
+            )
+        })
+        .await
+        .context("bonding curve owner check task panicked")?;
+
+        match result {
+            Ok(response) => match response.value {
+                Some(account) => Ok(account.owner != pumpfun_id),
+                None => anyhow::bail!("bonding curve account not found"),
+            },
+            Err(e) => Err(anyhow::anyhow!("RPC get_account failed: {}", e)),
+        }
+    }
+
     /// 从交易的 account keys 中提取 token mint 和 bonding curve 地址
     fn extract_pumpfun_accounts(&self, trade: &DetectedTrade) -> Result<(Pubkey, Pubkey, Pubkey)> {
         // Pump.fun buy/sell 指令的 account 布局:
