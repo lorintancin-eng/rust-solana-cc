@@ -18,7 +18,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellReason, SellSignal};
@@ -42,10 +42,12 @@ use utils::sol_price::SolUsdPrice;
 
 type SignatureCache = Arc<DashMap<String, SignatureSeen>>;
 type GroupMintDedup = Arc<DashMap<String, Instant>>;
+type BondingCurveFetches = Arc<DashMap<Pubkey, Arc<Notify>>>;
 
 const BLOCKHASH_REFRESH_MS: u64 = 120;
 const PREFETCH_WAIT_MS: u64 = 8;
 const BC_CACHE_WAIT_MS: u64 = 40;
+const BUY_EXACT_SOL_IN_WAIT_MS: u64 = 80;
 const BUY_EXECUTOR_PARALLELISM: usize = 4;
 const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
 
@@ -75,12 +77,42 @@ fn format_latency(duration: Duration) -> String {
     }
 }
 
+fn ensure_bonding_curve_fetch(
+    bc_fetches: &BondingCurveFetches,
+    bc_cache: &BondingCurveCache,
+    pumpfun: Arc<PumpfunProcessor>,
+    mint: Pubkey,
+    bonding_curve: Pubkey,
+) {
+    if bc_cache.get(&mint).is_some() {
+        return;
+    }
+
+    let notify = Arc::new(Notify::new());
+    match bc_fetches.entry(mint) {
+        dashmap::mapref::entry::Entry::Occupied(_) => return,
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(notify.clone());
+        }
+    }
+
+    let bc_fetches = bc_fetches.clone();
+    let bc_cache = bc_cache.clone();
+    tokio::spawn(async move {
+        if let Ok(state) = pumpfun.prefetch_bonding_curve(&bonding_curve).await {
+            bc_cache.update(&mint, state);
+        }
+        bc_fetches.remove(&mint);
+        notify.notify_waiters();
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.46");
+    info!("   Solana 跟单交易系统 v1.6.47");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -116,6 +148,7 @@ async fn main() -> Result<()> {
     let bc_cache = BondingCurveCache::new();
     let ata_cache = AtaBalanceCache::new();
     let prefetch_cache = Arc::new(PrefetchCache::new(bc_cache.clone()));
+    let bc_fetches: BondingCurveFetches = Arc::new(DashMap::new());
 
     let tx_sender = Arc::new(TxSender::new(
         config.rpc_url.clone(),
@@ -271,6 +304,7 @@ async fn main() -> Result<()> {
     let exec_mint_dedup = mint_dedup.clone();
     let exec_buy_limiter = buy_exec_limiter.clone();
     let exec_group_manager = group_manager.clone();
+    let exec_bc_fetches = bc_fetches.clone();
     tokio::spawn(async move {
         while let Some(trigger) = consensus_rx.recv().await {
             let dedup_key = group_mint_key(&trigger.group_id, &trigger.token_mint);
@@ -304,6 +338,7 @@ async fn main() -> Result<()> {
             let tg = exec_tg.clone();
             let stats = exec_tg_stats.clone();
             let limiter = exec_buy_limiter.clone();
+            let bc_fetches = exec_bc_fetches.clone();
             let trigger_mint = trigger.token_mint;
             let trigger_wallets = trigger.wallets.clone();
             let trigger_detected_at = trigger.triggered_at;
@@ -325,6 +360,15 @@ async fn main() -> Result<()> {
                     true,
                     &cfg,
                 );
+                if let Some(prefetched) = prefetch.get(&trigger_mint) {
+                    ensure_bonding_curve_fetch(
+                        &bc_fetches,
+                        &bc,
+                        pf.clone(),
+                        trigger_mint,
+                        prefetched.bonding_curve,
+                    );
+                }
                 execute_buy(
                     &group,
                     &trigger_mint,
@@ -341,6 +385,7 @@ async fn main() -> Result<()> {
                     &auto_sell,
                     &prefetch,
                     &bc,
+                    &bc_fetches,
                     &ata,
                     &acct_sub,
                     &tg,
@@ -454,15 +499,13 @@ async fn main() -> Result<()> {
         account_subscriber.track_ata(token_mint, prefetched.user_ata);
 
         if bc_cache.get(&token_mint).is_none() {
-            let pf = pumpfun.clone();
-            let bc = prefetched.bonding_curve;
-            let mint_copy = token_mint;
-            let bc_cache_copy = bc_cache.clone();
-            tokio::spawn(async move {
-                if let Ok(state) = pf.prefetch_bonding_curve(&bc).await {
-                    bc_cache_copy.update(&mint_copy, state);
-                }
-            });
+            ensure_bonding_curve_fetch(
+                &bc_fetches,
+                &bc_cache,
+                pumpfun.clone(),
+                token_mint,
+                prefetched.bonding_curve,
+            );
         }
 
         for group in entry_groups {
@@ -510,6 +553,7 @@ async fn main() -> Result<()> {
                 let tg = tg_notifier.clone();
                 let stats = tg_stats.clone();
                 let limiter = buy_exec_limiter.clone();
+                let bc_fetches = bc_fetches.clone();
                 let trade_wallet = trade.source_wallet;
                 let group_clone = group.clone();
                 let zero_slot_buy_enabled = group_manager.zero_slot_buy_enabled();
@@ -531,6 +575,7 @@ async fn main() -> Result<()> {
                         &auto_sell,
                         &prefetch,
                         &bc,
+                        &bc_fetches,
                         &ata,
                         &acct_sub,
                         &tg,
@@ -600,6 +645,7 @@ async fn execute_buy(
     auto_sell_manager: &Arc<AutoSellManager>,
     prefetch_cache: &Arc<PrefetchCache>,
     bc_cache: &BondingCurveCache,
+    bc_fetches: &BondingCurveFetches,
     ata_cache: &AtaBalanceCache,
     _account_subscriber: &Arc<AccountSubscriber>,
     tg: &TgNotifier,
@@ -628,7 +674,20 @@ async fn execute_buy(
     let buy_lamports = group.buy_lamports();
     let sol_price = sol_usd.get();
     let has_target_instruction = target_instruction_data.len() >= 24;
+    let requires_curve_wait =
+        wallets.len() == 1 && pumpfun.target_instruction_requires_curve(target_instruction_data);
     let mut bc_state = bc_cache.get(mint);
+    if bc_state.is_none() {
+        if let Some(prefetched) = prefetched.as_ref() {
+            ensure_bonding_curve_fetch(
+                bc_fetches,
+                bc_cache,
+                pumpfun.clone(),
+                *mint,
+                prefetched.bonding_curve,
+            );
+        }
+    }
     if bc_state.is_none() {
         let wait_started = Instant::now();
         while wait_started.elapsed() < Duration::from_millis(BC_CACHE_WAIT_MS) {
@@ -640,6 +699,20 @@ async fn execute_buy(
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         timings.bc_wait = wait_started.elapsed();
+    }
+    if bc_state.is_none() && requires_curve_wait {
+        if let Some(notify) = bc_fetches.get(mint).map(|entry| entry.clone()) {
+            let extra_wait_started = Instant::now();
+            let _ = tokio::time::timeout(
+                Duration::from_millis(BUY_EXACT_SOL_IN_WAIT_MS),
+                notify.notified(),
+            )
+            .await;
+            if let Some(state) = bc_cache.get(mint) {
+                bc_state = Some(state);
+            }
+            timings.bc_wait += extra_wait_started.elapsed();
+        }
     }
 
     let quote_build_start = Instant::now();

@@ -958,6 +958,13 @@ impl PumpfunProcessor {
         }
     }
 
+    pub fn target_instruction_requires_curve(&self, target_instruction_data: &[u8]) -> bool {
+        matches!(
+            self.parse_target_buy_instruction(target_instruction_data),
+            Ok(TargetBuyInstruction::BuyExactSolIn { .. })
+        )
+    }
+
     pub fn buy_from_cached_state(
         &self,
         mint: &Pubkey,
