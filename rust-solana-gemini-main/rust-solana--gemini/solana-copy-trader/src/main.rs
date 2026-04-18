@@ -49,7 +49,6 @@ const PREFETCH_WAIT_MS: u64 = 8;
 const BC_CACHE_WAIT_MS: u64 = 40;
 const BUY_EXACT_SOL_IN_WAIT_MS: u64 = 80;
 const BUY_EXECUTOR_PARALLELISM: usize = 4;
-const FAST_SINGLE_WALLET_BUY_PARALLELISM: usize = 16;
 const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone)]
@@ -113,7 +112,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.52");
+    info!("   Solana 跟单交易系统 v1.6.53");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -160,7 +159,6 @@ async fn main() -> Result<()> {
         config.zero_slot_urls.clone(),
     ));
     let buy_exec_limiter = Arc::new(Semaphore::new(BUY_EXECUTOR_PARALLELISM));
-    let fast_single_buy_limiter = Arc::new(Semaphore::new(FAST_SINGLE_WALLET_BUY_PARALLELISM));
     let pumpfun = Arc::new(PumpfunProcessor::new(rpc_client.clone()));
     let consensus_engine = Arc::new(ConsensusEngine::new());
     let _cleanup_task = consensus_engine.start_cleanup_task();
@@ -558,59 +556,77 @@ async fn main() -> Result<()> {
                 }
                 mint_dedup.insert(dedup_key, Instant::now());
 
-                let cfg = config.clone();
-                let rpc = rpc_client.clone();
-                let pf = pumpfun.clone();
-                let bh = blockhash_cache.clone();
-                let sender = tx_sender.clone();
-                let sol = sol_usd.clone();
-                let auto_sell = auto_sell_manager.clone();
-                let prefetch = prefetch_cache.clone();
-                let bc = bc_cache.clone();
-                let ata = ata_cache.clone();
-                let acct_sub = account_subscriber.clone();
-                let tg = tg_notifier.clone();
-                let stats = tg_stats.clone();
-                let limiter = buy_exec_limiter.clone();
-                let fast_limiter = fast_single_buy_limiter.clone();
-                let bc_fetches = bc_fetches.clone();
-                let trade_wallet = trade.source_wallet;
-                let group_clone = group.clone();
                 let zero_slot_buy_enabled = group_manager.zero_slot_buy_enabled();
                 let fast_buy_path = zero_slot_buy_enabled && !config.zero_slot_urls.is_empty();
-                tokio::spawn(async move {
-                    let _permit = if fast_buy_path {
-                        fast_limiter
-                            .acquire_owned()
-                            .await
-                            .expect("fast buy semaphore closed")
-                    } else {
-                        limiter.acquire_owned().await.expect("buy semaphore closed")
-                    };
+                if fast_buy_path {
                     execute_buy(
-                        &group_clone,
+                        &group,
                         &token_mint,
-                        &[trade_wallet],
+                        &[trade.source_wallet],
                         trade.detected_at,
                         zero_slot_buy_enabled,
                         &target_instruction_data,
-                        &cfg,
-                        &rpc,
-                        &pf,
-                        &bh,
-                        &sender,
-                        &sol,
-                        &auto_sell,
-                        &prefetch,
-                        &bc,
+                        &config,
+                        &rpc_client,
+                        &pumpfun,
+                        &blockhash_cache,
+                        &tx_sender,
+                        &sol_usd,
+                        &auto_sell_manager,
+                        &prefetch_cache,
+                        &bc_cache,
                         &bc_fetches,
-                        &ata,
-                        &acct_sub,
-                        &tg,
-                        &stats,
+                        &ata_cache,
+                        &account_subscriber,
+                        &tg_notifier,
+                        &tg_stats,
                     )
                     .await;
-                });
+                } else {
+                    let cfg = config.clone();
+                    let rpc = rpc_client.clone();
+                    let pf = pumpfun.clone();
+                    let bh = blockhash_cache.clone();
+                    let sender = tx_sender.clone();
+                    let sol = sol_usd.clone();
+                    let auto_sell = auto_sell_manager.clone();
+                    let prefetch = prefetch_cache.clone();
+                    let bc = bc_cache.clone();
+                    let ata = ata_cache.clone();
+                    let acct_sub = account_subscriber.clone();
+                    let tg = tg_notifier.clone();
+                    let stats = tg_stats.clone();
+                    let limiter = buy_exec_limiter.clone();
+                    let bc_fetches = bc_fetches.clone();
+                    let trade_wallet = trade.source_wallet;
+                    let group_clone = group.clone();
+                    tokio::spawn(async move {
+                        let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
+                        execute_buy(
+                            &group_clone,
+                            &token_mint,
+                            &[trade_wallet],
+                            trade.detected_at,
+                            zero_slot_buy_enabled,
+                            &target_instruction_data,
+                            &cfg,
+                            &rpc,
+                            &pf,
+                            &bh,
+                            &sender,
+                            &sol,
+                            &auto_sell,
+                            &prefetch,
+                            &bc,
+                            &bc_fetches,
+                            &ata,
+                            &acct_sub,
+                            &tg,
+                            &stats,
+                        )
+                        .await;
+                    });
+                }
             } else {
                 if trade.execution_failed {
                     if consensus_engine.reject_signal(
