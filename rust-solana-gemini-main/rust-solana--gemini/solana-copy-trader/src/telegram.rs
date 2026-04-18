@@ -1194,9 +1194,9 @@ impl TgBot {
                 sol_amount,
                 latency_ms,
             } => format!(
-                "<b>买入已提交</b>\n\n组合: <b>{}</b>\n代币: <code>{}</code>\n金额: {:.4} SOL\n耗时: {}ms",
+                "<b>买入已提交</b>\n\n组合: <b>{}</b>\n代币地址: <code>{}</code>\n金额: {:.4} SOL\n耗时: {}ms",
                 group_name,
-                short_pubkey(&mint),
+                mint,
                 sol_amount,
                 latency_ms,
             ),
@@ -1213,8 +1213,8 @@ impl TgBot {
                 self.performance
                     .record_buy_confirmed(&self.groups, &group_id, &group_name);
                 let text = format!(
-                    "<b>买入确认成功</b>\n\n组合: <b>{}</b>\n代币: {}\n花费: {:.4} SOL\n成本价: {}\n市值: {}",
-                    group_name, token_name, spent_sol, cost_price_usd, mcap_usd
+                    "<b>买入确认成功</b>\n\n组合: <b>{}</b>\n代币: {}\n代币地址: <code>{}</code>\n花费: {:.4} SOL\n成本价: {}\n市值: {}",
+                    group_name, token_name, mint, spent_sol, cost_price_usd, mcap_usd
                 );
                 if let Some(position) = self.auto_sell.get_position_by_group_mint(&group_id, &mint)
                 {
@@ -1235,9 +1235,9 @@ impl TgBot {
                 self.performance
                     .record_buy_failed(&self.groups, &group_id, &group_name);
                 format!(
-                    "<b>买入失败</b>\n\n组合: <b>{}</b>\n代币: <code>{}</code>\n原因: {}",
+                    "<b>买入失败</b>\n\n组合: <b>{}</b>\n代币地址: <code>{}</code>\n原因: {}",
                     group_name,
-                    short_pubkey(&mint),
+                    mint,
                     reason,
                 )
             }
@@ -1270,8 +1270,8 @@ impl TgBot {
                     self.performance.record_closed_trade(&self.groups, record);
                 }
                 format!(
-                    "<b>卖出成功</b>\n\n组合: <b>{}</b>\n代币: {}\n原因: {}\nPnL: {:+.2}%\n<a href=\"https://solscan.io/tx/{}\">查看链上交易</a>",
-                    group_name, token_name, reason, pnl_percent, tx_sig
+                    "<b>卖出成功</b>\n\n组合: <b>{}</b>\n代币: {}\n代币地址: <code>{}</code>\n原因: {}\nPnL: {:+.2}%\n<a href=\"https://solscan.io/tx/{}\">查看链上交易</a>",
+                    group_name, token_name, mint, reason, pnl_percent, tx_sig
                 )
             }
             TgEvent::SellFailed {
@@ -1283,9 +1283,9 @@ impl TgBot {
                 self.performance
                     .record_sell_failed(&self.groups, &group_id, &group_name);
                 format!(
-                    "<b>卖出失败</b>\n\n组合: <b>{}</b>\n代币: <code>{}</code>\n原因: {}",
+                    "<b>卖出失败</b>\n\n组合: <b>{}</b>\n代币地址: <code>{}</code>\n原因: {}",
                     group_name,
-                    short_pubkey(&mint),
+                    mint,
                     reason,
                 )
             }
