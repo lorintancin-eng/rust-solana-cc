@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.49");
+    info!("   Solana 跟单交易系统 v1.6.50");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
 
     info!("跟单钱包地址: {}", config.pubkey);
     info!(
-        "已加载 {} 个组合 | 目标钱包数 {}",
+        "已加�?{} 个组�?| 目标钱包�?{}",
         group_manager.all_groups().len(),
         target_wallets.len(),
     );
@@ -1075,3 +1075,4 @@ fn init_logging() {
         .with_ansi(true)
         .init();
 }
+
