@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.53");
+    info!("   Solana 跟单交易系统 v1.6.54");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -467,6 +467,39 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        let wants_entry_any = matching_groups.iter().any(|group| {
+            if trade.is_buy {
+                group.buy_on_smart_buy()
+            } else {
+                group.buy_on_smart_sell()
+            }
+        });
+
+        if wants_entry_any {
+            let prefetched = prefetch_cache.prefetch_token(
+                &token_mint,
+                &token_program,
+                &trade.instruction_accounts,
+                &trade.source_wallet,
+                &trade.signature,
+                trade_signal_quality(&trade),
+                false,
+                &config,
+            );
+            account_subscriber.track_bonding_curve(token_mint, prefetched.bonding_curve);
+            account_subscriber.track_ata(token_mint, prefetched.user_ata);
+
+            if bc_cache.get(&token_mint).is_none() {
+                ensure_bonding_curve_fetch(
+                    &bc_fetches,
+                    &bc_cache,
+                    pumpfun.clone(),
+                    token_mint,
+                    prefetched.bonding_curve,
+                );
+            }
+        }
+
         let mut entry_groups = Vec::new();
         for group in matching_groups {
             let wants_entry = if trade.is_buy {
@@ -500,29 +533,6 @@ async fn main() -> Result<()> {
 
         if entry_groups.is_empty() {
             continue;
-        }
-
-        let prefetched = prefetch_cache.prefetch_token(
-            &token_mint,
-            &token_program,
-            &trade.instruction_accounts,
-            &trade.source_wallet,
-            &trade.signature,
-            trade_signal_quality(&trade),
-            false,
-            &config,
-        );
-        account_subscriber.track_bonding_curve(token_mint, prefetched.bonding_curve);
-        account_subscriber.track_ata(token_mint, prefetched.user_ata);
-
-        if bc_cache.get(&token_mint).is_none() {
-            ensure_bonding_curve_fetch(
-                &bc_fetches,
-                &bc_cache,
-                pumpfun.clone(),
-                token_mint,
-                prefetched.bonding_curve,
-            );
         }
 
         for group in entry_groups {
