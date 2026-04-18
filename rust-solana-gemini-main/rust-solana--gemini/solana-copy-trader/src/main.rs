@@ -49,6 +49,7 @@ const PREFETCH_WAIT_MS: u64 = 8;
 const BC_CACHE_WAIT_MS: u64 = 40;
 const BUY_EXACT_SOL_IN_WAIT_MS: u64 = 80;
 const BUY_EXECUTOR_PARALLELISM: usize = 4;
+const FAST_SINGLE_WALLET_BUY_PARALLELISM: usize = 16;
 const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone)]
@@ -112,7 +113,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.51");
+    info!("   Solana 跟单交易系统 v1.6.52");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -159,6 +160,7 @@ async fn main() -> Result<()> {
         config.zero_slot_urls.clone(),
     ));
     let buy_exec_limiter = Arc::new(Semaphore::new(BUY_EXECUTOR_PARALLELISM));
+    let fast_single_buy_limiter = Arc::new(Semaphore::new(FAST_SINGLE_WALLET_BUY_PARALLELISM));
     let pumpfun = Arc::new(PumpfunProcessor::new(rpc_client.clone()));
     let consensus_engine = Arc::new(ConsensusEngine::new());
     let _cleanup_task = consensus_engine.start_cleanup_task();
@@ -570,12 +572,21 @@ async fn main() -> Result<()> {
                 let tg = tg_notifier.clone();
                 let stats = tg_stats.clone();
                 let limiter = buy_exec_limiter.clone();
+                let fast_limiter = fast_single_buy_limiter.clone();
                 let bc_fetches = bc_fetches.clone();
                 let trade_wallet = trade.source_wallet;
                 let group_clone = group.clone();
                 let zero_slot_buy_enabled = group_manager.zero_slot_buy_enabled();
+                let fast_buy_path = zero_slot_buy_enabled && !config.zero_slot_urls.is_empty();
                 tokio::spawn(async move {
-                    let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
+                    let _permit = if fast_buy_path {
+                        fast_limiter
+                            .acquire_owned()
+                            .await
+                            .expect("fast buy semaphore closed")
+                    } else {
+                        limiter.acquire_owned().await.expect("buy semaphore closed")
+                    };
                     execute_buy(
                         &group_clone,
                         &token_mint,
@@ -690,6 +701,7 @@ async fn execute_buy(
     let buy_sol = group.buy_sol_amount;
     let buy_lamports = group.buy_lamports();
     let sol_price = sol_usd.get();
+    let zero_slot_only_mode = zero_slot_buy_enabled && !config.zero_slot_urls.is_empty();
     let has_target_instruction = target_instruction_data.len() >= 24;
     let requires_curve_wait =
         wallets.len() == 1 && pumpfun.target_instruction_requires_curve(target_instruction_data);
@@ -816,7 +828,19 @@ async fn execute_buy(
         Ok((mirror, _)) => {
             let (blockhash, _) = blockhash_cache.get_sync();
             let tx_build_start = Instant::now();
-            let tx_result = if config.jito_enabled {
+            let tx_result = if zero_slot_only_mode {
+                let tip_account = tx_sender.random_0slot_tip_account();
+                TxBuilder::build_0slot_transaction(
+                    &mirror,
+                    &config,
+                    &config.keypair,
+                    blockhash,
+                    &tip_account,
+                    base_config.zero_slot_tip_lamports,
+                    &[],
+                )
+                .map(|tx| (tx, true))
+            } else if config.jito_enabled {
                 let tip = tx_sender.random_jito_tip_account();
                 TxBuilder::build_jito_bundle_transaction(
                     &mirror,
@@ -827,53 +851,18 @@ async fn execute_buy(
                     group.tip_buy_lamports,
                     &[],
                 )
+                .map(|tx| (tx, false))
             } else {
                 TxBuilder::build_transaction(&mirror, &config, &config.keypair, blockhash, &[])
+                    .map(|tx| (tx, false))
             };
             timings.tx_build = tx_build_start.elapsed();
 
             match tx_result {
-                Ok(transaction) => {
-                    let zero_slot_tx = if zero_slot_buy_enabled && !config.zero_slot_urls.is_empty()
-                    {
-                        let tip_account = tx_sender.random_0slot_tip_account();
-                        Some(TxBuilder::build_0slot_transaction(
-                            &mirror,
-                            &config,
-                            &config.keypair,
-                            blockhash,
-                            &tip_account,
-                            base_config.zero_slot_tip_lamports,
-                            &[],
-                        ))
-                    } else {
-                        None
-                    };
-
-                    let zero_slot_tx = match zero_slot_tx.transpose() {
-                        Ok(tx) => tx,
-                        Err(err) => {
-                            error!(
-                                "Buy 0slot tx build failed [{}] {}: {}",
-                                group.name,
-                                &mint.to_string()[..12],
-                                err
-                            );
-                            tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
-                            tg.send(TgEvent::BuyFailed {
-                                group_id: group.id.clone(),
-                                group_name: group.name.clone(),
-                                mint: *mint,
-                                reason: format!("0slot tx build failed: {}", err),
-                            });
-                            return;
-                        }
-                    };
-
+                Ok((transaction, is_zero_slot_tx)) => {
                     let send_call_start = Instant::now();
-                    let send_result = if zero_slot_buy_enabled && !config.zero_slot_urls.is_empty()
-                    {
-                        tx_sender.fire_and_forget(&transaction, zero_slot_tx.as_ref())
+                    let send_result = if is_zero_slot_tx {
+                        tx_sender.fire_and_forget(&transaction, None)
                     } else {
                         tx_sender.fire_and_forget_without_0slot(&transaction)
                     };
