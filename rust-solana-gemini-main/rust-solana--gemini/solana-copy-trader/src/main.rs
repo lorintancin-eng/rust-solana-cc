@@ -47,7 +47,8 @@ type BondingCurveFetches = Arc<DashMap<Pubkey, Arc<Notify>>>;
 const BLOCKHASH_REFRESH_MS: u64 = 120;
 const PREFETCH_WAIT_MS: u64 = 8;
 const BC_CACHE_WAIT_MS: u64 = 40;
-const BUY_EXACT_SOL_IN_WAIT_MS: u64 = 80;
+const BUY_EXACT_SOL_IN_WAIT_MS: u64 = 40;
+const BUY_EXACT_SOL_IN_WAIT_ATTEMPTS: usize = 3;
 const BUY_EXECUTOR_PARALLELISM: usize = 4;
 const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
 
@@ -112,7 +113,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.54");
+    info!("   Solana 跟单交易系统 v1.6.55");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -758,13 +759,16 @@ async fn execute_buy(
     if bc_state.is_none() && requires_curve_wait {
         if let Some(notify) = bc_fetches.get(mint).map(|entry| entry.clone()) {
             let extra_wait_started = Instant::now();
-            let _ = tokio::time::timeout(
-                Duration::from_millis(BUY_EXACT_SOL_IN_WAIT_MS),
-                notify.notified(),
-            )
-            .await;
-            if let Some(state) = bc_cache.get(mint) {
-                bc_state = Some(state);
+            for _ in 0..BUY_EXACT_SOL_IN_WAIT_ATTEMPTS {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(BUY_EXACT_SOL_IN_WAIT_MS),
+                    notify.notified(),
+                )
+                .await;
+                if let Some(state) = bc_cache.get(mint) {
+                    bc_state = Some(state);
+                    break;
+                }
             }
             timings.bc_wait += extra_wait_started.elapsed();
         }
