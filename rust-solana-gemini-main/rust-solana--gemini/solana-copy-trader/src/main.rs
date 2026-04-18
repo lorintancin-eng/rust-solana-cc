@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.48");
+    info!("   Solana 跟单交易系统 v1.6.49");
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
@@ -253,15 +253,32 @@ async fn main() -> Result<()> {
         }
     });
 
-    let grpc_sub = GrpcSubscriber::new(
+    let grpc_sub = Arc::new(GrpcSubscriber::new(
         config.grpc_url.clone(),
         config.grpc_token.clone(),
         target_wallets.clone(),
-    );
+    ));
+    let grpc_sync_sub = grpc_sub.clone();
+    let grpc_sync_groups = group_manager.clone();
+    tokio::spawn(async move {
+        let mut sync_interval = tokio::time::interval(Duration::from_millis(200));
+        sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            sync_interval.tick().await;
+            let wallets = grpc_sync_groups.all_target_wallets();
+            if grpc_sync_sub.update_target_wallets(wallets.clone()) {
+                info!(
+                    "Hot-updated monitored wallet set | wallets={}",
+                    wallets.len()
+                );
+            }
+        }
+    });
     let trade_tx_clone = trade_tx.clone();
+    let grpc_stream_sub = grpc_sub.clone();
     tokio::spawn(async move {
         loop {
-            match grpc_sub.subscribe(trade_tx_clone.clone()).await {
+            match grpc_stream_sub.subscribe(trade_tx_clone.clone()).await {
                 Ok(()) => warn!("gRPC trade stream closed, reconnecting"),
                 Err(err) => error!("gRPC trade stream error: {}", err),
             }

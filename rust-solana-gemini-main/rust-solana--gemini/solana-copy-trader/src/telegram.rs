@@ -987,7 +987,10 @@ impl TgBot {
 
         match Pubkey::from_str(raw_wallet) {
             Ok(wallet) => match self.groups.add_wallet(&group.id, wallet) {
-                Ok(()) => self.send_msg("钱包已加入组合，重启订阅后生效。").await,
+                Ok(()) => {
+                    self.send_msg("钱包已加入组合，监控订阅将在几百毫秒内自动更新。")
+                        .await
+                }
                 Err(err) => self.send_msg(&err).await,
             },
             Err(_) => self.send_msg("钱包地址格式无效。").await,
@@ -1007,7 +1010,10 @@ impl TgBot {
 
         match Pubkey::from_str(raw_wallet) {
             Ok(wallet) => match self.groups.remove_wallet(&group.id, &wallet) {
-                Ok(()) => self.send_msg("钱包已移出组合，重启订阅后生效。").await,
+                Ok(()) => {
+                    self.send_msg("钱包已移出组合，监控订阅将在几百毫秒内自动更新。")
+                        .await
+                }
                 Err(err) => self.send_msg(&err).await,
             },
             Err(_) => self.send_msg("钱包地址格式无效。").await,

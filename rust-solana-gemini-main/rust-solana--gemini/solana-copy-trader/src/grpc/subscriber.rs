@@ -3,8 +3,9 @@ use futures::StreamExt;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tonic::transport::ClientTlsConfig;
 use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
@@ -48,7 +49,8 @@ const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 pub struct GrpcSubscriber {
     grpc_url: String,
     grpc_token: Option<String>,
-    target_wallets: Vec<Pubkey>,
+    target_wallets: Arc<RwLock<Vec<Pubkey>>>,
+    subscription_notify: Arc<Notify>,
 }
 
 impl GrpcSubscriber {
@@ -56,8 +58,31 @@ impl GrpcSubscriber {
         Self {
             grpc_url,
             grpc_token,
-            target_wallets,
+            target_wallets: Arc::new(RwLock::new(Self::normalize_wallets(target_wallets))),
+            subscription_notify: Arc::new(Notify::new()),
         }
+    }
+
+    fn normalize_wallets(mut wallets: Vec<Pubkey>) -> Vec<Pubkey> {
+        wallets.sort_by_key(|wallet| wallet.to_string());
+        wallets.dedup();
+        wallets
+    }
+
+    pub fn current_target_wallets(&self) -> Vec<Pubkey> {
+        self.target_wallets.read().unwrap().clone()
+    }
+
+    pub fn update_target_wallets(&self, wallets: Vec<Pubkey>) -> bool {
+        let normalized = Self::normalize_wallets(wallets);
+        let mut current = self.target_wallets.write().unwrap();
+        if *current == normalized {
+            return false;
+        }
+        *current = normalized;
+        drop(current);
+        self.subscription_notify.notify_waiters();
+        true
     }
 
     // ================================================================
@@ -67,33 +92,32 @@ impl GrpcSubscriber {
     /// 启动 gRPC 订阅，将检测到的目标钱包 DEX 交易发送到 channel
     /// 连接断开后返回 Err，由调用方 (main.rs) 负责重连
     pub async fn subscribe(&self, tx_sender: mpsc::UnboundedSender<DetectedTrade>) -> Result<()> {
+        while self.current_target_wallets().is_empty() {
+            self.subscription_notify.notified().await;
+        }
+
+        let initial_wallets = self.current_target_wallets();
         info!(
             "Connecting to Shyft RabbitStream pre-exec at {} for {} target wallets",
             self.grpc_url,
-            self.target_wallets.len()
+            initial_wallets.len()
         );
 
-        // ============================================
-        // Shyft gRPC 连接
-        // 必须带 TLS + x-token 认证
-        // 参考: https://docs.shyft.to/solana-yellowstone-grpc/docs
-        // ============================================
         let mut client = GeyserGrpcClient::build_from_shared(self.grpc_url.clone())?
             .x_token(self.grpc_token.clone())?
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(60))
             .tls_config(ClientTlsConfig::new().with_native_roots())?
-            .max_decoding_message_size(64 * 1024 * 1024) // 64MB
+            .max_decoding_message_size(64 * 1024 * 1024)
             .connect()
             .await
             .context("Failed to connect to gRPC")?;
 
         info!("Shyft RabbitStream connected successfully");
 
-        // 构建订阅请求
-        let subscribe_request = self.build_subscribe_request();
+        let subscribe_request = Self::build_subscribe_request(&initial_wallets);
 
-        debug!("发送订阅请求...");
+        debug!("Sending gRPC subscription request...");
         let (mut subscribe_tx, mut stream) = client
             .subscribe_with_request(Some(subscribe_request))
             .await
@@ -101,12 +125,9 @@ impl GrpcSubscriber {
 
         info!("RabbitStream subscription active, listening for target wallet transactions...");
 
-        // 发送 ping 保持连接活跃
         let ping_task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await;
-                // 通过 subscribe_tx 发送 ping（如果支持）
-                // RabbitStream 可能需要 keepalive
             }
         });
 
@@ -114,118 +135,150 @@ impl GrpcSubscriber {
         let mut total_matched: u64 = 0;
         let mut diagnosed = false;
         let start_time = Instant::now();
+        let mut last_wallets = initial_wallets;
+        let mut resub_interval = tokio::time::interval(Duration::from_millis(200));
+        resub_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // ============================================
-        // 主接收循环
-        // ============================================
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(update) => {
-                    let recv_time = Instant::now();
+        loop {
+            tokio::select! {
+                msg = stream.next() => {
+                    let Some(msg) = msg else {
+                        break;
+                    };
 
-                    match update.update_oneof {
-                        Some(UpdateOneof::Transaction(tx_update)) => {
-                            total_received += 1;
+                    match msg {
+                        Ok(update) => {
+                            let recv_time = Instant::now();
 
-                            // 每 100 笔交易输出统计
-                            if total_received % 100 == 0 {
-                                let elapsed = start_time.elapsed().as_secs().max(1);
-                                debug!(
-                                    "Stats: received={}, matched={}, uptime={}s, rate={:.1}/s",
-                                    total_received,
-                                    total_matched,
-                                    elapsed,
-                                    total_received as f64 / elapsed as f64,
-                                );
-                            }
+                            match update.update_oneof {
+                                Some(UpdateOneof::Transaction(tx_update)) => {
+                                    total_received += 1;
 
-                            if let Some(ref tx_info) = tx_update.transaction {
-                                // meta 在 SubscribeUpdateTransactionInfo 层，不在 Transaction 层
-                                let meta = tx_info.meta.as_ref();
-                                let slot = tx_update.slot;
-
-                                // 首次诊断（只打印一次）: 判断 RabbitStream 是否真正预执行
-                                if !diagnosed {
-                                    diagnosed = true;
-                                    if meta.is_some() {
-                                        warn!(
-                                            "RabbitStream 诊断: meta 存在 → Processed 级别（非预执行）| slot={}",
-                                            slot,
-                                        );
-                                    } else {
-                                        info!(
-                                            "RabbitStream 诊断: meta 为空 → 预执行级别 | slot={}",
-                                            slot,
+                                    if total_received % 100 == 0 {
+                                        let elapsed = start_time.elapsed().as_secs().max(1);
+                                        debug!(
+                                            "Stats: received={}, matched={}, uptime={}s, rate={:.1}/s",
+                                            total_received,
+                                            total_matched,
+                                            elapsed,
+                                            total_received as f64 / elapsed as f64,
                                         );
                                     }
-                                }
 
-                                if let Some(ref tx_data) = tx_info.transaction {
-                                    let message = tx_data.message.as_ref();
+                                    if let Some(ref tx_info) = tx_update.transaction {
+                                        let meta = tx_info.meta.as_ref();
+                                        let slot = tx_update.slot;
 
-                                    match self.parse_transaction(
-                                        tx_info, tx_data, message, meta, recv_time,
-                                    ) {
-                                        Ok(Some(trade)) => {
-                                            total_matched += 1;
-                                            let parse_latency = recv_time.elapsed();
-
-                                            info!(
-                                                "DETECTED: {} {} | wallet: {}..{} | mint: {} | sol: {:.4} | parse={}us | sig: {}..{}",
-                                                trade.trade_type,
-                                                if trade.is_buy { "BUY" } else { "SELL" },
-                                                &trade.source_wallet.to_string()[..4],
-                                                &trade.source_wallet.to_string()
-                                                    [trade.source_wallet.to_string().len() - 4..],
-                                                if trade.instruction_accounts.len() > 2 {
-                                                    trade.instruction_accounts[2].to_string()
-                                                } else {
-                                                    format!("{}..{}", &trade.signature[..6], &trade.signature[trade.signature.len()-4..])
-                                                },
-                                                trade.sol_amount_lamports as f64 / 1e9,
-                                                parse_latency.as_micros(),
-                                                &trade.signature[..8],
-                                                &trade.signature[trade.signature.len()-4..],
-                                            );
-
-                                            if tx_sender.send(trade).is_err() {
-                                                error!("Trade channel closed, exiting subscriber");
-                                                return Ok(());
+                                        if !diagnosed {
+                                            diagnosed = true;
+                                            if meta.is_some() {
+                                                warn!(
+                                                    "RabbitStream diagnostics: meta present -> processed-level stream | slot={}",
+                                                    slot,
+                                                );
+                                            } else {
+                                                info!(
+                                                    "RabbitStream diagnostics: meta absent -> pre-exec stream | slot={}",
+                                                    slot,
+                                                );
                                             }
                                         }
-                                        Ok(None) => {
-                                            // 不是 DEX swap 交易，跳过
-                                        }
-                                        Err(e) => {
-                                            debug!("Parse error (non-fatal): {}", e);
+
+                                        if let Some(ref tx_data) = tx_info.transaction {
+                                            let message = tx_data.message.as_ref();
+
+                                            match self.parse_transaction(tx_info, tx_data, message, meta, recv_time) {
+                                                Ok(Some(trade)) => {
+                                                    total_matched += 1;
+                                                    let parse_latency = recv_time.elapsed();
+
+                                                    info!(
+                                                        "DETECTED: {} {} | wallet: {}..{} | mint: {} | sol: {:.4} | parse={}us | sig: {}..{}",
+                                                        trade.trade_type,
+                                                        if trade.is_buy { "BUY" } else { "SELL" },
+                                                        &trade.source_wallet.to_string()[..4],
+                                                        &trade.source_wallet.to_string()[trade.source_wallet.to_string().len() - 4..],
+                                                        if trade.instruction_accounts.len() > 2 {
+                                                            trade.instruction_accounts[2].to_string()
+                                                        } else {
+                                                            format!("{}..{}", &trade.signature[..6], &trade.signature[trade.signature.len()-4..])
+                                                        },
+                                                        trade.sol_amount_lamports as f64 / 1e9,
+                                                        parse_latency.as_micros(),
+                                                        &trade.signature[..8],
+                                                        &trade.signature[trade.signature.len()-4..],
+                                                    );
+
+                                                    if tx_sender.send(trade).is_err() {
+                                                        error!("Trade channel closed, exiting subscriber");
+                                                        return Ok(());
+                                                    }
+                                                }
+                                                Ok(None) => {}
+                                                Err(e) => {
+                                                    debug!("Parse error (non-fatal): {}", e);
+                                                }
+                                            }
                                         }
                                     }
                                 }
+                                Some(UpdateOneof::Ping(_)) => {
+                                    debug!("gRPC keepalive ping");
+                                }
+                                Some(UpdateOneof::Pong(_)) => {
+                                    debug!("gRPC pong");
+                                }
+                                Some(other) => {
+                                    debug!(
+                                        "gRPC other update type: {:?}",
+                                        std::mem::discriminant(&other)
+                                    );
+                                }
+                                None => {
+                                    debug!("gRPC empty update");
+                                }
                             }
                         }
-                        Some(UpdateOneof::Ping(_)) => {
-                            debug!("gRPC keepalive ping");
-                        }
-                        Some(UpdateOneof::Pong(_)) => {
-                            debug!("gRPC pong");
-                        }
-                        Some(other) => {
-                            debug!(
-                                "gRPC other update type: {:?}",
-                                std::mem::discriminant(&other)
+                        Err(e) => {
+                            error!(
+                                "gRPC stream error after {} messages ({} matched): {}",
+                                total_received, total_matched, e
                             );
-                        }
-                        None => {
-                            debug!("gRPC empty update");
+                            return Err(e.into());
                         }
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "gRPC stream error after {} messages ({} matched): {}",
-                        total_received, total_matched, e
-                    );
-                    return Err(e.into());
+                _ = resub_interval.tick() => {
+                    let current_wallets = self.current_target_wallets();
+                    if current_wallets != last_wallets {
+                        info!(
+                            "Updating RabbitStream wallet subscription: {} -> {} wallets",
+                            last_wallets.len(),
+                            current_wallets.len()
+                        );
+                        let new_request = Self::build_subscribe_request(&current_wallets);
+                        if let Err(e) = subscribe_tx.send(new_request).await {
+                            error!("Failed to update gRPC wallet subscription: {}", e);
+                        } else {
+                            last_wallets = current_wallets;
+                        }
+                    }
+                }
+                _ = self.subscription_notify.notified() => {
+                    let current_wallets = self.current_target_wallets();
+                    if current_wallets != last_wallets {
+                        info!(
+                            "Updating RabbitStream wallet subscription: {} -> {} wallets",
+                            last_wallets.len(),
+                            current_wallets.len()
+                        );
+                        let new_request = Self::build_subscribe_request(&current_wallets);
+                        if let Err(e) = subscribe_tx.send(new_request).await {
+                            error!("Failed to update gRPC wallet subscription: {}", e);
+                        } else {
+                            last_wallets = current_wallets;
+                        }
+                    }
                 }
             }
         }
@@ -233,7 +286,7 @@ impl GrpcSubscriber {
         ping_task.abort();
         let elapsed = start_time.elapsed();
         warn!(
-            "gRPC stream ended after {} messages ({} matched) | 持续: {:.1}s",
+            "gRPC stream ended after {} messages ({} matched) | uptime: {:.1}s",
             total_received,
             total_matched,
             elapsed.as_secs_f64()
@@ -241,19 +294,8 @@ impl GrpcSubscriber {
         Ok(())
     }
 
-    // ================================================================
-    // 订阅请求构建
-    // ================================================================
-
-    /// 构建 YellowStone gRPC SubscribeRequest
-    ///
-    /// 过滤条件:
-    ///   - account_include = 目标钱包地址列表
-    ///   - vote = false (排除投票交易)
-    ///   - failed = None (不过滤，兼容 RabbitStream 预执行推送)
-    ///   - commitment = None (RabbitStream 不支持 commitment 过滤)
-    fn build_subscribe_request(&self) -> SubscribeRequest {
-        let account_keys: Vec<String> = self.target_wallets.iter().map(|w| w.to_string()).collect();
+    fn build_subscribe_request(target_wallets: &[Pubkey]) -> SubscribeRequest {
+        let account_keys: Vec<String> = target_wallets.iter().map(|w| w.to_string()).collect();
 
         info!(
             "Subscribing to {} wallets: [{}]",
@@ -356,6 +398,7 @@ impl GrpcSubscriber {
         recv_time: Instant,
     ) -> Result<Option<DetectedTrade>> {
         let message = message.context("Missing transaction message")?;
+        let target_wallets = self.current_target_wallets();
 
         // 提取目标交易的原始字节（用于构建 Jito Backrun Bundle）
         // 延迟到匹配成功后再序列化（避免非匹配交易的序列化开销）
@@ -410,7 +453,7 @@ impl GrpcSubscriber {
         // 识别哪个目标钱包参与了这笔交易
         let source_wallet = match account_keys
             .iter()
-            .find(|k| self.target_wallets.contains(k))
+            .find(|k| target_wallets.contains(k))
             .copied()
         {
             Some(w) => w,
@@ -586,6 +629,7 @@ impl GrpcSubscriber {
     ) -> Option<DetectedTrade> {
         let pumpfun_pubkey = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
         let wsol_mint = Pubkey::from_str(WSOL_MINT).ok()?;
+        let target_wallets = self.current_target_wallets();
 
         // 在 account_keys 中寻找 mint：
         // Pump.fun bonding curve PDA = find_program_address([b"bonding-curve", mint], pumpfun_program)
@@ -612,7 +656,7 @@ impl GrpcSubscriber {
                 continue;
             }
             // 跳过目标钱包自己
-            if self.target_wallets.contains(candidate) {
+            if target_wallets.contains(candidate) {
                 continue;
             }
 
@@ -813,7 +857,8 @@ impl GrpcSubscriber {
         let wsol_mint = Pubkey::from_str(WSOL_MINT).unwrap();
 
         // 检查是否匹配任何目标钱包的 WSOL ATA
-        for wallet in &self.target_wallets {
+        let target_wallets = self.current_target_wallets();
+        for wallet in &target_wallets {
             let wsol_ata =
                 spl_associated_token_account::get_associated_token_address(wallet, &wsol_mint);
             if source_account == wsol_ata {
