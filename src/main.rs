@@ -50,6 +50,7 @@ const BC_CACHE_WAIT_MS: u64 = 40;
 const BUY_EXACT_SOL_IN_WAIT_MS: u64 = 40;
 const BUY_EXACT_SOL_IN_WAIT_ATTEMPTS: usize = 3;
 const BUY_EXECUTOR_PARALLELISM: usize = 8;
+const WRAPPER_BUY_EXECUTOR_PARALLELISM: usize = 2;
 const BUY_EXECUTOR_QUEUE_TIMEOUT_MS: u64 = 25;
 const GROUP_MINT_DEDUP_SUCCESS_MS: u64 = 2500;
 const GROUP_MINT_DEDUP_STALE_SECS: u64 = 30;
@@ -356,6 +357,7 @@ async fn main() -> Result<()> {
         config.zero_slot_urls.clone(),
     ));
     let buy_exec_limiter = Arc::new(Semaphore::new(BUY_EXECUTOR_PARALLELISM));
+    let wrapper_buy_exec_limiter = Arc::new(Semaphore::new(WRAPPER_BUY_EXECUTOR_PARALLELISM));
     let pumpfun = Arc::new(PumpfunProcessor::new(rpc_client.clone()));
     let consensus_engine = Arc::new(ConsensusEngine::new());
     let _cleanup_task = consensus_engine.start_cleanup_task();
@@ -525,6 +527,7 @@ async fn main() -> Result<()> {
     let exec_tg_stats = tg_stats.clone();
     let exec_mint_dedup = mint_dedup.clone();
     let exec_buy_limiter = buy_exec_limiter.clone();
+    let exec_wrapper_buy_limiter = wrapper_buy_exec_limiter.clone();
     let exec_group_manager = group_manager.clone();
     let exec_bc_fetches = bc_fetches.clone();
     tokio::spawn(async move {
@@ -553,7 +556,11 @@ async fn main() -> Result<()> {
             let acct_sub = exec_acct_sub.clone();
             let tg = exec_tg.clone();
             let stats = exec_tg_stats.clone();
-            let limiter = exec_buy_limiter.clone();
+            let limiter = if trigger.canonical_trade_origin.is_wrapper_cpi() {
+                exec_wrapper_buy_limiter.clone()
+            } else {
+                exec_buy_limiter.clone()
+            };
             let bc_fetches = exec_bc_fetches.clone();
             let mint_dedup = exec_mint_dedup.clone();
             let trigger_mint = trigger.token_mint;
@@ -748,6 +755,11 @@ async fn main() -> Result<()> {
                 }
 
                 let zero_slot_buy_enabled = group_manager.zero_slot_buy_enabled();
+                let limiter = if trade.trade_origin.is_wrapper_cpi() {
+                    wrapper_buy_exec_limiter.clone()
+                } else {
+                    buy_exec_limiter.clone()
+                };
                 spawn_buy_execution(
                     group.clone(),
                     token_mint,
@@ -769,7 +781,7 @@ async fn main() -> Result<()> {
                     account_subscriber.clone(),
                     tg_notifier.clone(),
                     tg_stats.clone(),
-                    buy_exec_limiter.clone(),
+                    limiter,
                     mint_dedup.clone(),
                 );
             } else {
@@ -808,6 +820,7 @@ async fn main() -> Result<()> {
                     instruction_accounts: trade.instruction_accounts.clone(),
                     sol_amount_lamports: trade.sol_amount_lamports,
                     is_pre_execution: trade.is_pre_execution,
+                    trade_origin: trade.trade_origin,
                 };
                 consensus_engine.submit_signal(buy_signal, &consensus_tx);
             }
@@ -911,31 +924,47 @@ async fn execute_buy(
     let quote_build_start = Instant::now();
     let buy_result: Result<(processor::MirrorInstruction, u64), anyhow::Error> =
         if let Some(ref pf) = prefetched {
-            if pf.mirror_accounts.is_empty() {
-                Err(anyhow::anyhow!("missing mirror accounts"))
-            } else if let Some(bc_state) = bc_state.clone() {
+            if let Some(bc_state) = bc_state.clone() {
                 let token_amount = bc_state.sol_to_token_quote(buy_lamports);
-                pumpfun
-                    .buy_from_cached_state(
+                if pf.mirror_accounts.is_empty() {
+                    pumpfun
+                        .buy_standard_from_cached_state(
+                            mint,
+                            &pf.user_ata,
+                            &pf.token_program,
+                            &bc_state,
+                            &config,
+                        )
+                        .map(|mirror| (mirror, token_amount))
+                } else {
+                    pumpfun
+                        .buy_from_cached_state(
+                            mint,
+                            &pf.user_ata,
+                            &pf.token_program,
+                            &pf.source_wallet,
+                            &pf.mirror_accounts,
+                            &bc_state,
+                            &config,
+                        )
+                        .map(|mirror| (mirror, token_amount))
+                }
+            } else if has_target_instruction {
+                if pf.mirror_accounts.is_empty() {
+                    Err(anyhow::anyhow!(
+                        "missing bc cache for native wrapper path"
+                    ))
+                } else {
+                    pumpfun.buy_from_target_instruction(
                         mint,
                         &pf.user_ata,
                         &pf.token_program,
                         &pf.source_wallet,
                         &pf.mirror_accounts,
-                        &bc_state,
+                        target_instruction_data,
                         &config,
                     )
-                    .map(|mirror| (mirror, token_amount))
-            } else if has_target_instruction {
-                pumpfun.buy_from_target_instruction(
-                    mint,
-                    &pf.user_ata,
-                    &pf.token_program,
-                    &pf.source_wallet,
-                    &pf.mirror_accounts,
-                    target_instruction_data,
-                    &config,
-                )
+                }
             } else {
                 Err(anyhow::anyhow!("missing bc cache and target instruction"))
             }
@@ -1206,7 +1235,9 @@ fn group_mint_key(group_id: &str, mint: &Pubkey) -> String {
 
 fn extract_token_info(trade: &DetectedTrade) -> Option<(Pubkey, Pubkey)> {
     if let Some(mint) = trade.token_mint {
-        let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok()?;
+        let token_program = trade
+            .token_program
+            .or_else(|| Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok())?;
         return Some((mint, token_program));
     }
 

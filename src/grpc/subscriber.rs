@@ -14,7 +14,7 @@ use yellowstone_grpc_proto::geyser::{
 };
 use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
 
-use crate::processor::{DetectedTrade, TradeType};
+use crate::processor::{DetectedTrade, TradeOrigin, TradeType};
 
 // ============================================
 // 已知 DEX Program IDs
@@ -44,6 +44,7 @@ const CPMM_SWAP_BASE_OUTPUT: [u8; 8] = [55, 217, 98, 86, 163, 74, 180, 173];
 
 // WSOL Mint
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 /// gRPC 订阅器，监听目标钱包的交易
 pub struct GrpcSubscriber {
@@ -592,11 +593,13 @@ impl GrpcSubscriber {
         } else {
             0
         };
+        let token_program = Self::extract_token_program(&trade_type, &instruction_accounts);
 
         Ok(Some(DetectedTrade {
             signature: signature.to_string(),
             source_wallet,
             trade_type,
+            trade_origin: TradeOrigin::Direct,
             is_buy,
             program_id: *program_id,
             instruction_data: data.to_vec(),
@@ -608,6 +611,7 @@ impl GrpcSubscriber {
             is_pre_execution: false,           // 由 parse_transaction 根据 meta 设置
             execution_failed: false,
             token_mint: None, // 直接调用场景由 main.rs extract_token_info 提取
+            token_program,
         }))
     }
 
@@ -629,6 +633,8 @@ impl GrpcSubscriber {
     ) -> Option<DetectedTrade> {
         let pumpfun_pubkey = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
         let wsol_mint = Pubkey::from_str(WSOL_MINT).ok()?;
+        let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok()?;
+        let token_2022 = Pubkey::from_str(TOKEN_2022_PROGRAM).ok()?;
         let target_wallets = self.current_target_wallets();
 
         // 在 account_keys 中寻找 mint：
@@ -639,7 +645,8 @@ impl GrpcSubscriber {
             pumpfun_pubkey,
             wsol_mint,
             solana_sdk::system_program::id(),
-            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok()?,
+            token_program,
+            token_2022,
             Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").ok()?,
             Pubkey::from_str("SysvarRent111111111111111111111111111111111").ok()?,
             Pubkey::from_str("11111111111111111111111111111111").ok()?,
@@ -672,6 +679,15 @@ impl GrpcSubscriber {
         }
 
         let mint = found_mint?;
+        let (bonding_curve, _) =
+            Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &pumpfun_pubkey);
+        let detected_token_program = Self::detect_pumpfun_token_program(
+            account_keys,
+            &mint,
+            &bonding_curve,
+            &token_program,
+            &token_2022,
+        );
 
         // 判断 buy/sell：检查目标钱包的 WSOL ATA 是否在 account_keys 中
         let wsol_ata =
@@ -681,14 +697,13 @@ impl GrpcSubscriber {
         // 构建 instruction_accounts（从 account_keys 中提取 Pump.fun 相关账户）
         // CPI 场景下无法精确还原 instruction 的 account 顺序
         // 用完整 account_keys 传递给后续处理器
-        let instruction_accounts = account_keys.to_vec();
-
         info!(
-            "CPI DETECTED: Pump.fun {} via wrapper | wallet: {}..{} | mint: {} | sig: {}..{}",
+            "CPI DETECTED: Pump.fun {} via wrapper | wallet: {}..{} | mint: {} | tp: {} | sig: {}..{}",
             if is_buy { "BUY" } else { "SELL" },
             &source_wallet.to_string()[..4],
             &source_wallet.to_string()[source_wallet.to_string().len() - 4..],
             mint,
+            &detected_token_program.to_string()[..12],
             &signature[..8],
             &signature[signature.len() - 4..],
         );
@@ -697,10 +712,11 @@ impl GrpcSubscriber {
             signature: signature.to_string(),
             source_wallet,
             trade_type: TradeType::Pumpfun,
+            trade_origin: TradeOrigin::WrapperCpi,
             is_buy,
             program_id: pumpfun_pubkey,
             instruction_data: Vec::new(), // CPI 场景无法提取 Pump.fun 指令数据
-            instruction_accounts,
+            instruction_accounts: Vec::new(),
             all_account_keys: account_keys.to_vec(),
             detected_at: recv_time,
             sol_amount_lamports: 0, // CPI 场景无法提取 SOL 金额
@@ -709,7 +725,49 @@ impl GrpcSubscriber {
             is_pre_execution: meta.is_none(),
             execution_failed: Self::meta_failed(meta),
             token_mint: Some(mint), // CPI 检测已通过 PDA 验证识别了 mint
+            token_program: Some(detected_token_program),
         })
+    }
+
+    fn extract_token_program(trade_type: &TradeType, instruction_accounts: &[Pubkey]) -> Option<Pubkey> {
+        match trade_type {
+            TradeType::Pumpfun => instruction_accounts.get(8).copied(),
+            _ => None,
+        }
+    }
+
+    fn detect_pumpfun_token_program(
+        account_keys: &[Pubkey],
+        mint: &Pubkey,
+        bonding_curve: &Pubkey,
+        token_program: &Pubkey,
+        token_2022: &Pubkey,
+    ) -> Pubkey {
+        let associated_legacy =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                bonding_curve,
+                mint,
+                token_program,
+            );
+        if account_keys.contains(&associated_legacy) {
+            return *token_program;
+        }
+
+        let associated_2022 =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                bonding_curve,
+                mint,
+                token_2022,
+            );
+        if account_keys.contains(&associated_2022) {
+            return *token_2022;
+        }
+
+        if account_keys.contains(token_2022) && !account_keys.contains(token_program) {
+            return *token_2022;
+        }
+
+        *token_program
     }
 
     // ================================================================

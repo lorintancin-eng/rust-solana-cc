@@ -31,11 +31,37 @@ impl fmt::Display for TradeType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TradeOrigin {
+    Direct,
+    WrapperCpi,
+}
+
+impl TradeOrigin {
+    pub fn uses_mirror_accounts(self) -> bool {
+        matches!(self, Self::Direct)
+    }
+
+    pub fn is_wrapper_cpi(self) -> bool {
+        matches!(self, Self::WrapperCpi)
+    }
+}
+
+impl fmt::Display for TradeOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TradeOrigin::Direct => write!(f, "direct"),
+            TradeOrigin::WrapperCpi => write!(f, "wrapper_cpi"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DetectedTrade {
     pub signature: String,
     pub source_wallet: Pubkey,
     pub trade_type: TradeType,
+    pub trade_origin: TradeOrigin,
     pub is_buy: bool,
     pub program_id: Pubkey,
     pub instruction_data: Vec<u8>,
@@ -47,6 +73,7 @@ pub struct DetectedTrade {
     pub is_pre_execution: bool,
     pub execution_failed: bool,
     pub token_mint: Option<Pubkey>,
+    pub token_program: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone)]

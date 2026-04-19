@@ -170,43 +170,48 @@ impl SellExecutor {
         let snapshot = self.resolve_sell_snapshot(position).await?;
         timings.snapshot_load = snapshot_load_start.elapsed();
 
-        let bc_lookup_start = Instant::now();
-        let bc_state = if let Some(state) = self.bc_cache.get(&position.token_mint) {
-            state
-        } else {
-            self.pumpfun
-                .prefetch_bonding_curve(&snapshot.bonding_curve)
-                .await?
-        };
-        timings.bc_lookup = bc_lookup_start.elapsed();
-
         let quote_build_start = Instant::now();
-        let expected_sol = bc_state.token_to_sol_quote(token_amount);
-        let min_sol_output =
-            expected_sol.saturating_sub(expected_sol * position.group.sell_slippage_bps / 10_000);
-        timings.quote_build = quote_build_start.elapsed();
+        let mirror = if snapshot.mirror_accounts.is_empty() {
+            self.pumpfun
+                .sell_standard(&position.token_mint, token_amount, &group_config, None)
+                .await?
+        } else {
+            let bc_lookup_start = Instant::now();
+            let bc_state = if let Some(state) = self.bc_cache.get(&position.token_mint) {
+                state
+            } else {
+                self.pumpfun
+                    .prefetch_bonding_curve(&snapshot.bonding_curve)
+                    .await?
+            };
+            timings.bc_lookup = bc_lookup_start.elapsed();
 
-        let creator = bc_state
-            .creator
-            .ok_or_else(|| anyhow::anyhow!("BC state missing creator"))?;
-        let sell_ix = self.pumpfun.build_sell_instruction_from_mirror(
-            &self.config.pubkey,
-            &snapshot.user_ata,
-            &snapshot.mirror_accounts,
-            token_amount,
-            min_sol_output,
-            &snapshot.token_program,
-            &creator,
-            bc_state.is_cashback,
-        );
+            let expected_sol = bc_state.token_to_sol_quote(token_amount);
+            let min_sol_output = expected_sol
+                .saturating_sub(expected_sol * position.group.sell_slippage_bps / 10_000);
+            let creator = bc_state
+                .creator
+                .ok_or_else(|| anyhow::anyhow!("BC state missing creator"))?;
+            let sell_ix = self.pumpfun.build_sell_instruction_from_mirror(
+                &self.config.pubkey,
+                &snapshot.user_ata,
+                &snapshot.mirror_accounts,
+                token_amount,
+                min_sol_output,
+                &snapshot.token_program,
+                &creator,
+                bc_state.is_cashback,
+            );
 
-        let mirror = crate::processor::MirrorInstruction {
-            swap_instructions: vec![sell_ix],
-            pre_instructions: vec![],
-            post_instructions: vec![],
-            token_mint: position.token_mint,
-            sol_amount: expected_sol,
+            crate::processor::MirrorInstruction {
+                swap_instructions: vec![sell_ix],
+                pre_instructions: vec![],
+                post_instructions: vec![],
+                token_mint: position.token_mint,
+                sol_amount: expected_sol,
+            }
         };
+        timings.quote_build = quote_build_start.elapsed();
 
         let (blockhash, _) = self.blockhash_cache.get_sync();
         let tx_build_start = Instant::now();

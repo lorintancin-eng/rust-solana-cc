@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::processor::TradeOrigin;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConsensusKey {
     group_id: String,
@@ -26,6 +28,7 @@ pub struct BuySignal {
     pub instruction_accounts: Vec<Pubkey>,
     pub sol_amount_lamports: u64,
     pub is_pre_execution: bool,
+    pub trade_origin: TradeOrigin,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +43,7 @@ pub struct ConsensusTrigger {
     pub canonical_token_program: Pubkey,
     pub canonical_instruction_data: Vec<u8>,
     pub canonical_instruction_accounts: Vec<Pubkey>,
+    pub canonical_trade_origin: TradeOrigin,
     pub triggered_at: Instant,
 }
 
@@ -169,6 +173,7 @@ impl ConsensusEngine {
             let canonical_token_program = canonical_signal.token_program;
             let canonical_instruction_data = canonical_signal.instruction_data.clone();
             let canonical_instruction_accounts = canonical_signal.instruction_accounts.clone();
+            let canonical_trade_origin = canonical_signal.trade_origin;
 
             drop(tally);
 
@@ -184,6 +189,7 @@ impl ConsensusEngine {
                 canonical_token_program,
                 canonical_instruction_data,
                 canonical_instruction_accounts,
+                canonical_trade_origin,
                 triggered_at: Instant::now(),
             };
 
@@ -296,7 +302,9 @@ impl BuySignal {
     }
 
     pub fn counts_for_candidate_consensus(&self) -> bool {
-        self.has_target_instruction() || self.sol_amount_lamports > 0
+        self.has_target_instruction()
+            || self.sol_amount_lamports > 0
+            || self.trade_origin.is_wrapper_cpi()
     }
 
     fn canonical_score(&self) -> u32 {

@@ -1,33 +1,41 @@
 # Session Summary
 
 ## Current Goal
-- Adjust GitHub Actions Linux packaging so the downloadable artifact contains the raw executable directly instead of a `.tar.gz` archive.
+- Add wrapper-wallet copy support without regressing the existing direct Pump.fun fast path.
 
 ## Current Progress
-- Updated `.github/workflows/build-copy-trader-linux.yml`.
-- GitHub Actions now:
-  - builds `copy-trader` on Ubuntu
-  - copies the release binary into `dist/copy-trader`
-  - uploads that raw binary directly as the artifact payload
-- Artifact name changed to `copy-trader-linux`.
-- Downloaded artifact contents now contain `copy-trader` directly, so VPS flow no longer needs `tar -xzf`.
-- Bumped crate version from `1.6.57` to `1.6.58`.
-- Per user instruction, no local edit-level compile/build checks were run; final validation remains GitHub Actions Linux.
+- Created and pushed rollback tag:
+  - `rollback/pre-wrapper-native-buy-1.6.58`
+  - points to commit `dd0d1a1`
+- Implemented wrapper-side buy isolation:
+  - direct Pump.fun instructions still use the existing mirror-account fast path
+  - wrapper CPI pre-exec signals now stop writing fake `mirror_accounts`
+  - wrapper signals now carry inferred `token_program`
+  - wrapper buys fall back to a native Pump.fun account builder using `mint + token_program + bonding curve state + PDA derivation`
+- Added wrapper execution isolation:
+  - direct buy executor concurrency remains `8`
+  - wrapper buy executor concurrency is separated and limited to `2`
+- Added sell fallback for wrapper-opened positions:
+  - if a position has no real `mirror_accounts`, autosell now routes through `sell_standard(...)`
+- Bumped crate version from `1.6.58` to `1.6.59`
+- Per user instruction, no local edit-level compile/build checks were run
 
 ## Files Changed
-- `.github/workflows/build-copy-trader-linux.yml`
 - `Cargo.toml`
 - `Cargo.lock`
 - `SESSION_SUMMARY.md`
+- `src/processor/mod.rs`
+- `src/grpc/subscriber.rs`
+- `src/consensus/engine.rs`
+- `src/processor/pumpfun.rs`
+- `src/main.rs`
+- `src/tx/sell_executor.rs`
 
 ## CI / GitHub Actions Status
 - Workflow: `.github/workflows/build-copy-trader-linux.yml`
 - Trigger: push to `main`
 - Build environment: Ubuntu
-- Build flow:
-  - `cargo build --locked --release --bin copy-trader`
-  - copy binary to `dist/copy-trader`
-  - upload artifact `copy-trader-linux`
+- Validation source of truth: GitHub Actions Linux build only
 
 ## Artifact / Package Naming
 - Executable name: `copy-trader`
@@ -46,12 +54,12 @@ nohup /home/ubuntu/rust_project/copy-trader > /home/ubuntu/rust_project/copy-tra
 ```
 
 ## Remaining Work
-- Push the workflow change to `main`.
-- Wait for the new GitHub Actions Linux build to finish.
-- After that, VPS can use the raw-binary artifact directly.
+- Commit current wrapper-support changes
+- Push to `main`
+- Wait for GitHub Actions Linux build result
 
 ## Exact Next Step For Next Thread
-- Read `AGENTS.md`.
-- Read this `SESSION_SUMMARY.md`.
-- Check the latest successful `Build Copy Trader Linux` run on `main`.
-- Download artifact `copy-trader-linux` and verify VPS update flow.
+- Read `AGENTS.md`
+- Read this `SESSION_SUMMARY.md`
+- Check the latest `main` commit and Linux Actions run
+- If build is green, download artifact `copy-trader-linux` on VPS and restart manually

@@ -29,6 +29,16 @@ const PUMP_FEE_CONFIG_PDA: &str = "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt"
 
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
+const MAYHEM_FEE_RECIPIENTS: [&str; 8] = [
+    "GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS",
+    "4budycTjhs9fD6xw62VBducVTNgMgJJ5BgtKq7mAZwn6",
+    "8SBKzEQU4nLSzcwF4a74F2iaUDQyTfjGndn6qUWBnrpR",
+    "4UQeTP1T39KZ9Sfxzo3WR5skgsaP6NZa87BAkuazLEKH",
+    "8sNeir4QsLsJdYpc9RZacohhK1Y5FLU3nC5LXgYB4aa6",
+    "Fh9HmeLNUMVCvejxCtCL2DbYaRyBFVJ5xrWkLnMH6fdk",
+    "463MEnMeGyJekNZFQSTUABBEbLnvMTALbT6ZmsxAbAdq",
+    "6AUH3WEHucYZyC61hqpqYUWVto5qA5hjHuNQ32GNnNxA",
+];
 
 // PumpSwap (AMM for migrated tokens) - 2025-01 update
 // After bonding curve completes, tokens migrate to PumpSwap for DEX trading
@@ -71,6 +81,7 @@ pub struct BondingCurveState {
     pub token_total_supply: u64,
     pub complete: bool,
     pub creator: Option<Pubkey>,
+    pub is_mayhem_mode: bool,
     pub is_cashback: bool,
 }
 
@@ -96,6 +107,11 @@ impl BondingCurveState {
         } else {
             None
         };
+        let is_mayhem_mode = if data.len() > 81 {
+            data[81] != 0
+        } else {
+            false
+        };
         let is_cashback = if data.len() > 82 {
             data[82] != 0
         } else {
@@ -110,6 +126,7 @@ impl BondingCurveState {
             token_total_supply: u64::from_le_bytes(data[40..48].try_into()?),
             complete: data[48] != 0,
             creator,
+            is_mayhem_mode,
             is_cashback,
         })
     }
@@ -164,6 +181,81 @@ pub struct PumpfunProcessor {
 impl PumpfunProcessor {
     pub fn new(rpc_client: Arc<RpcClient>) -> Self {
         Self { rpc_client }
+    }
+
+    fn select_fee_recipient(&self, curve_state: &BondingCurveState) -> Result<Pubkey> {
+        if curve_state.is_mayhem_mode {
+            return Pubkey::from_str(MAYHEM_FEE_RECIPIENTS[0])
+                .map_err(|err| anyhow::anyhow!("invalid mayhem fee recipient: {}", err));
+        }
+
+        Pubkey::from_str(PUMPFUN_FEE_RECIPIENT)
+            .map_err(|err| anyhow::anyhow!("invalid pump fee recipient: {}", err))
+    }
+
+    fn build_buy_instruction_standard(
+        &self,
+        user: &Pubkey,
+        mint: &Pubkey,
+        user_ata: &Pubkey,
+        token_program_id: &Pubkey,
+        curve_state: &BondingCurveState,
+        token_amount: u64,
+        max_sol_cost: u64,
+    ) -> Result<Instruction> {
+        let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
+        let fee_recipient = self.select_fee_recipient(curve_state)?;
+        let creator = curve_state
+            .creator
+            .ok_or_else(|| anyhow::anyhow!("bonding curve missing creator"))?;
+        let (bonding_curve, _) =
+            Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &program_id);
+        let associated_bonding_curve =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &bonding_curve,
+                mint,
+                token_program_id,
+            );
+        let creator_vault =
+            Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &program_id).0;
+        let global_volume_accumulator =
+            Pubkey::find_program_address(&[b"global_volume_accumulator"], &program_id).0;
+        let user_volume_accumulator =
+            Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &program_id)
+                .0;
+        let bonding_curve_v2 =
+            Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &program_id).0;
+
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&BUY_DISCRIMINATOR);
+        data.extend_from_slice(&token_amount.to_le_bytes());
+        data.extend_from_slice(&max_sol_cost.to_le_bytes());
+
+        let accounts = vec![
+            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false),
+            AccountMeta::new(fee_recipient, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(bonding_curve, false),
+            AccountMeta::new(associated_bonding_curve, false),
+            AccountMeta::new(*user_ata, false),
+            AccountMeta::new(*user, true),
+            AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new_readonly(*token_program_id, false),
+            AccountMeta::new(creator_vault, false),
+            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(), false),
+            AccountMeta::new_readonly(program_id, false),
+            AccountMeta::new_readonly(global_volume_accumulator, false),
+            AccountMeta::new(user_volume_accumulator, false),
+            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(), false),
+            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(), false),
+            AccountMeta::new_readonly(bonding_curve_v2, false),
+        ];
+
+        Ok(Instruction {
+            program_id,
+            accounts,
+            data,
+        })
     }
 
     /// 预取 bonding curve 状态（后台调用，结果写入缓存）
@@ -909,6 +1001,55 @@ impl PumpfunProcessor {
         }
 
         Ok(())
+    }
+
+    pub fn buy_standard_from_cached_state(
+        &self,
+        mint: &Pubkey,
+        user_ata: &Pubkey,
+        token_program_id: &Pubkey,
+        curve_state: &BondingCurveState,
+        config: &AppConfig,
+    ) -> Result<MirrorInstruction> {
+        if curve_state.complete {
+            anyhow::bail!("bonding curve 宸插畬鎴愶紙宸茶縼绉诲鐩橈級");
+        }
+
+        let sol_amount = config.buy_lamports();
+        let token_amount = curve_state.sol_to_token_quote(sol_amount);
+        self.validate_buy_amount(token_amount, Some(curve_state))?;
+        let max_sol_cost = sol_amount + (sol_amount * config.slippage_bps / 10_000);
+
+        debug!(
+            "鎶ヤ环(鏍囧噯): {} SOL 鈫?{} tokens | mode=native",
+            config.buy_sol_amount,
+            token_amount,
+        );
+
+        let buy_ix = self.build_buy_instruction_standard(
+            &config.pubkey,
+            mint,
+            user_ata,
+            token_program_id,
+            curve_state,
+            token_amount,
+            max_sol_cost,
+        )?;
+
+        let create_ata_ix = create_associated_token_account_idempotent(
+            &config.pubkey,
+            &config.pubkey,
+            mint,
+            token_program_id,
+        );
+
+        Ok(MirrorInstruction {
+            swap_instructions: vec![buy_ix],
+            pre_instructions: vec![create_ata_ix],
+            post_instructions: vec![],
+            token_mint: *mint,
+            sol_amount,
+        })
     }
 
     fn parse_target_buy_instruction(
