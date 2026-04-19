@@ -10,6 +10,7 @@
   - all source files under `src/`
 - Confirmed the main entrypoint is `src/main.rs`.
 - Confirmed the production binary name is `copy-trader`.
+- Added a dedicated Mermaid runtime sequence document: `PROJECT_SEQUENCE.md`.
 - Completed walkthrough of:
   - gRPC trade subscription and parsing
   - group management and consensus triggering
@@ -19,6 +20,7 @@
   - Telegram control plane and performance reporting
 
 ## Files Changed
+- `PROJECT_SEQUENCE.md`
 - `SESSION_SUMMARY.md`
 
 ## CI / GitHub Actions Status
@@ -57,9 +59,9 @@ nohup ./copy-trader > copy-trader.log 2>&1 &
 ## Remaining Work
 - The "understand the whole project" goal is complete for this session.
 - Optional next work:
-  - produce a full sequence diagram
   - inspect and fix multi-DEX wiring gaps
   - inspect why position recovery loading is not wired into startup
+  - turn the sequence document into a stricter module call graph
 
 ## Important Findings
 - The live buy path is optimized most deeply for Pump.fun.
@@ -72,6 +74,6 @@ nohup ./copy-trader > copy-trader.log 2>&1 &
 - Read `AGENTS.md`.
 - Read this `SESSION_SUMMARY.md`.
 - Then continue with one of:
-  - "draw the full runtime sequence"
   - "fix non-Pump.fun DEX wiring"
   - "wire position recovery into startup"
+  - "convert PROJECT_SEQUENCE.md into a stricter call graph"
