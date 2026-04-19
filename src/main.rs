@@ -41,7 +41,7 @@ use tx::{
 use utils::sol_price::SolUsdPrice;
 
 type SignatureCache = Arc<DashMap<String, SignatureSeen>>;
-type GroupMintDedup = Arc<DashMap<String, Instant>>;
+type GroupMintDedup = Arc<DashMap<String, GroupMintClaim>>;
 type BondingCurveFetches = Arc<DashMap<Pubkey, Arc<Notify>>>;
 
 const BLOCKHASH_REFRESH_MS: u64 = 120;
@@ -49,7 +49,10 @@ const PREFETCH_WAIT_MS: u64 = 8;
 const BC_CACHE_WAIT_MS: u64 = 40;
 const BUY_EXACT_SOL_IN_WAIT_MS: u64 = 40;
 const BUY_EXACT_SOL_IN_WAIT_ATTEMPTS: usize = 3;
-const BUY_EXECUTOR_PARALLELISM: usize = 4;
+const BUY_EXECUTOR_PARALLELISM: usize = 8;
+const BUY_EXECUTOR_QUEUE_TIMEOUT_MS: u64 = 25;
+const GROUP_MINT_DEDUP_SUCCESS_MS: u64 = 2500;
+const GROUP_MINT_DEDUP_STALE_SECS: u64 = 30;
 const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -58,6 +61,13 @@ struct SignatureSeen {
     pre_seen: bool,
     landed_seen: bool,
     last_seen: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct GroupMintClaim {
+    in_flight: bool,
+    cooldown_until: Option<Instant>,
+    last_touched: Instant,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -77,6 +87,57 @@ fn format_latency(duration: Duration) -> String {
     } else {
         format!("{}us", duration.as_micros())
     }
+}
+
+fn try_start_group_mint(dedup: &GroupMintDedup, key: &str) -> bool {
+    let now = Instant::now();
+    match dedup.entry(key.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            let claim = entry.get_mut();
+            let cooling_down = claim
+                .cooldown_until
+                .map(|until| until > now)
+                .unwrap_or(false);
+            claim.last_touched = now;
+            if claim.in_flight || cooling_down {
+                return false;
+            }
+            claim.in_flight = true;
+            claim.cooldown_until = None;
+            true
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(GroupMintClaim {
+                in_flight: true,
+                cooldown_until: None,
+                last_touched: now,
+            });
+            true
+        }
+    }
+}
+
+fn finish_group_mint(dedup: &GroupMintDedup, key: &str, submitted: bool) {
+    if submitted {
+        if let Some(mut claim) = dedup.get_mut(key) {
+            let now = Instant::now();
+            claim.in_flight = false;
+            claim.cooldown_until = Some(now + Duration::from_millis(GROUP_MINT_DEDUP_SUCCESS_MS));
+            claim.last_touched = now;
+        }
+    } else {
+        dedup.remove(key);
+    }
+}
+
+fn keep_group_mint_claim(claim: &GroupMintClaim) -> bool {
+    if claim.in_flight {
+        return claim.last_touched.elapsed() < Duration::from_secs(GROUP_MINT_DEDUP_STALE_SECS);
+    }
+    claim
+        .cooldown_until
+        .map(|until| until > Instant::now())
+        .unwrap_or(false)
 }
 
 fn ensure_bonding_curve_fetch(
@@ -106,6 +167,140 @@ fn ensure_bonding_curve_fetch(
         }
         bc_fetches.remove(&mint);
         notify.notify_waiters();
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn warm_buy_caches(
+    prefetch_cache: &Arc<PrefetchCache>,
+    account_subscriber: Option<&Arc<AccountSubscriber>>,
+    bc_fetches: &BondingCurveFetches,
+    bc_cache: &BondingCurveCache,
+    pumpfun: &Arc<PumpfunProcessor>,
+    config: &AppConfig,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+    instruction_accounts: &[Pubkey],
+    source_wallet: &Pubkey,
+    signature: &str,
+    quality_score: u32,
+    force_replace: bool,
+) {
+    let prefetched = prefetch_cache.prefetch_token(
+        mint,
+        token_program,
+        instruction_accounts,
+        source_wallet,
+        signature,
+        quality_score,
+        force_replace,
+        config,
+    );
+
+    if let Some(subscriber) = account_subscriber {
+        subscriber.track_bonding_curve(*mint, prefetched.bonding_curve);
+        subscriber.track_ata(*mint, prefetched.user_ata);
+    }
+
+    if bc_cache.get(mint).is_none() {
+        ensure_bonding_curve_fetch(
+            bc_fetches,
+            bc_cache,
+            pumpfun.clone(),
+            *mint,
+            prefetched.bonding_curve,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_buy_execution(
+    group: CopyGroup,
+    mint: Pubkey,
+    wallets: Vec<Pubkey>,
+    detected_at: Instant,
+    zero_slot_buy_enabled: bool,
+    target_instruction_data: Vec<u8>,
+    config: AppConfig,
+    rpc_client: Arc<RpcClient>,
+    pumpfun: Arc<PumpfunProcessor>,
+    blockhash_cache: blockhash::BlockhashCache,
+    tx_sender: Arc<TxSender>,
+    sol_usd: SolUsdPrice,
+    auto_sell_manager: Arc<AutoSellManager>,
+    prefetch_cache: Arc<PrefetchCache>,
+    bc_cache: BondingCurveCache,
+    bc_fetches: BondingCurveFetches,
+    ata_cache: AtaBalanceCache,
+    account_subscriber: Arc<AccountSubscriber>,
+    tg: TgNotifier,
+    tg_stats: Arc<TgStats>,
+    buy_exec_limiter: Arc<Semaphore>,
+    mint_dedup: GroupMintDedup,
+) {
+    let dedup_key = group_mint_key(&group.id, &mint);
+    tokio::spawn(async move {
+        let permit = match tokio::time::timeout(
+            Duration::from_millis(BUY_EXECUTOR_QUEUE_TIMEOUT_MS),
+            buy_exec_limiter.acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                warn!(
+                    "Buy executor closed [{}] {}",
+                    group.name,
+                    &mint.to_string()[..12],
+                );
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    "Buy queue timeout [{}] {} | waited={}ms",
+                    group.name,
+                    &mint.to_string()[..12],
+                    BUY_EXECUTOR_QUEUE_TIMEOUT_MS,
+                );
+                return;
+            }
+        };
+        let _permit = permit;
+
+        if !try_start_group_mint(&mint_dedup, &dedup_key) {
+            debug!(
+                "Buy dedup active [{}] {}",
+                group.name,
+                &mint.to_string()[..12],
+            );
+            return;
+        }
+
+        let submitted = execute_buy(
+            &group,
+            &mint,
+            &wallets,
+            detected_at,
+            zero_slot_buy_enabled,
+            &target_instruction_data,
+            &config,
+            &rpc_client,
+            &pumpfun,
+            &blockhash_cache,
+            &tx_sender,
+            &sol_usd,
+            &auto_sell_manager,
+            &prefetch_cache,
+            &bc_cache,
+            &bc_fetches,
+            &ata_cache,
+            &account_subscriber,
+            &tg,
+            &tg_stats,
+        )
+        .await;
+
+        finish_group_mint(&mint_dedup, &dedup_key, submitted);
     });
 }
 
@@ -247,6 +442,14 @@ async fn main() -> Result<()> {
         }
     });
 
+    let mint_dedup_clone = mint_dedup.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            mint_dedup_clone.retain(|_, value| keep_group_mint_claim(value));
+        }
+    });
+
     let prefetch_clone = prefetch_cache.clone();
     tokio::spawn(async move {
         loop {
@@ -326,12 +529,6 @@ async fn main() -> Result<()> {
     let exec_bc_fetches = bc_fetches.clone();
     tokio::spawn(async move {
         while let Some(trigger) = consensus_rx.recv().await {
-            let dedup_key = group_mint_key(&trigger.group_id, &trigger.token_mint);
-            if exec_mint_dedup.contains_key(&dedup_key) {
-                continue;
-            }
-            exec_mint_dedup.insert(dedup_key, Instant::now());
-
             exec_tg.send(TgEvent::ConsensusReached {
                 group_name: trigger.group_name.clone(),
                 mint: trigger.token_mint,
@@ -358,6 +555,7 @@ async fn main() -> Result<()> {
             let stats = exec_tg_stats.clone();
             let limiter = exec_buy_limiter.clone();
             let bc_fetches = exec_bc_fetches.clone();
+            let mint_dedup = exec_mint_dedup.clone();
             let trigger_mint = trigger.token_mint;
             let trigger_wallets = trigger.wallets.clone();
             let trigger_detected_at = trigger.triggered_at;
@@ -367,51 +565,45 @@ async fn main() -> Result<()> {
             let canonical_token_program = trigger.canonical_token_program;
             let canonical_instruction_accounts = trigger.canonical_instruction_accounts.clone();
             let canonical_instruction_data = trigger.canonical_instruction_data.clone();
-            tokio::spawn(async move {
-                let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
-                prefetch.prefetch_token(
-                    &trigger_mint,
-                    &canonical_token_program,
-                    &canonical_instruction_accounts,
-                    &canonical_wallet,
-                    &canonical_signature,
-                    1_000,
-                    true,
-                    &cfg,
-                );
-                if let Some(prefetched) = prefetch.get(&trigger_mint) {
-                    ensure_bonding_curve_fetch(
-                        &bc_fetches,
-                        &bc,
-                        pf.clone(),
-                        trigger_mint,
-                        prefetched.bonding_curve,
-                    );
-                }
-                execute_buy(
-                    &group,
-                    &trigger_mint,
-                    &trigger_wallets,
-                    trigger_detected_at,
-                    zero_slot_buy_enabled,
-                    &canonical_instruction_data,
-                    &cfg,
-                    &rpc,
-                    &pf,
-                    &bh,
-                    &sender,
-                    &sol,
-                    &auto_sell,
-                    &prefetch,
-                    &bc,
-                    &bc_fetches,
-                    &ata,
-                    &acct_sub,
-                    &tg,
-                    &stats,
-                )
-                .await;
-            });
+            warm_buy_caches(
+                &prefetch,
+                Some(&acct_sub),
+                &bc_fetches,
+                &bc,
+                &pf,
+                &cfg,
+                &trigger_mint,
+                &canonical_token_program,
+                &canonical_instruction_accounts,
+                &canonical_wallet,
+                &canonical_signature,
+                1_000,
+                true,
+            );
+            spawn_buy_execution(
+                group,
+                trigger_mint,
+                trigger_wallets,
+                trigger_detected_at,
+                zero_slot_buy_enabled,
+                canonical_instruction_data,
+                cfg,
+                rpc,
+                pf,
+                bh,
+                sender,
+                sol,
+                auto_sell,
+                prefetch,
+                bc,
+                bc_fetches,
+                ata,
+                acct_sub,
+                tg,
+                stats,
+                limiter,
+                mint_dedup,
+            );
         }
     });
 
@@ -478,7 +670,13 @@ async fn main() -> Result<()> {
         });
 
         if wants_entry_any {
-            let prefetched = prefetch_cache.prefetch_token(
+            warm_buy_caches(
+                &prefetch_cache,
+                Some(&account_subscriber),
+                &bc_fetches,
+                &bc_cache,
+                &pumpfun,
+                &config,
                 &token_mint,
                 &token_program,
                 &trade.instruction_accounts,
@@ -486,20 +684,7 @@ async fn main() -> Result<()> {
                 &trade.signature,
                 trade_signal_quality(&trade),
                 false,
-                &config,
             );
-            account_subscriber.track_bonding_curve(token_mint, prefetched.bonding_curve);
-            account_subscriber.track_ata(token_mint, prefetched.user_ata);
-
-            if bc_cache.get(&token_mint).is_none() {
-                ensure_bonding_curve_fetch(
-                    &bc_fetches,
-                    &bc_cache,
-                    pumpfun.clone(),
-                    token_mint,
-                    prefetched.bonding_curve,
-                );
-            }
         }
 
         let mut entry_groups = Vec::new();
@@ -562,83 +747,31 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let dedup_key = group_mint_key(&group.id, &token_mint);
-                if mint_dedup.contains_key(&dedup_key) {
-                    continue;
-                }
-                mint_dedup.insert(dedup_key, Instant::now());
-
                 let zero_slot_buy_enabled = group_manager.zero_slot_buy_enabled();
-                let fast_buy_path = zero_slot_buy_enabled && !config.zero_slot_urls.is_empty();
-                if fast_buy_path {
-                    execute_buy(
-                        &group,
-                        &token_mint,
-                        &[trade.source_wallet],
-                        trade.detected_at,
-                        zero_slot_buy_enabled,
-                        &target_instruction_data,
-                        &config,
-                        &rpc_client,
-                        &pumpfun,
-                        &blockhash_cache,
-                        &tx_sender,
-                        &sol_usd,
-                        &auto_sell_manager,
-                        &prefetch_cache,
-                        &bc_cache,
-                        &bc_fetches,
-                        &ata_cache,
-                        &account_subscriber,
-                        &tg_notifier,
-                        &tg_stats,
-                    )
-                    .await;
-                } else {
-                    let cfg = config.clone();
-                    let rpc = rpc_client.clone();
-                    let pf = pumpfun.clone();
-                    let bh = blockhash_cache.clone();
-                    let sender = tx_sender.clone();
-                    let sol = sol_usd.clone();
-                    let auto_sell = auto_sell_manager.clone();
-                    let prefetch = prefetch_cache.clone();
-                    let bc = bc_cache.clone();
-                    let ata = ata_cache.clone();
-                    let acct_sub = account_subscriber.clone();
-                    let tg = tg_notifier.clone();
-                    let stats = tg_stats.clone();
-                    let limiter = buy_exec_limiter.clone();
-                    let bc_fetches = bc_fetches.clone();
-                    let trade_wallet = trade.source_wallet;
-                    let group_clone = group.clone();
-                    tokio::spawn(async move {
-                        let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
-                        execute_buy(
-                            &group_clone,
-                            &token_mint,
-                            &[trade_wallet],
-                            trade.detected_at,
-                            zero_slot_buy_enabled,
-                            &target_instruction_data,
-                            &cfg,
-                            &rpc,
-                            &pf,
-                            &bh,
-                            &sender,
-                            &sol,
-                            &auto_sell,
-                            &prefetch,
-                            &bc,
-                            &bc_fetches,
-                            &ata,
-                            &acct_sub,
-                            &tg,
-                            &stats,
-                        )
-                        .await;
-                    });
-                }
+                spawn_buy_execution(
+                    group.clone(),
+                    token_mint,
+                    vec![trade.source_wallet],
+                    trade.detected_at,
+                    zero_slot_buy_enabled,
+                    target_instruction_data,
+                    config.clone(),
+                    rpc_client.clone(),
+                    pumpfun.clone(),
+                    blockhash_cache.clone(),
+                    tx_sender.clone(),
+                    sol_usd.clone(),
+                    auto_sell_manager.clone(),
+                    prefetch_cache.clone(),
+                    bc_cache.clone(),
+                    bc_fetches.clone(),
+                    ata_cache.clone(),
+                    account_subscriber.clone(),
+                    tg_notifier.clone(),
+                    tg_stats.clone(),
+                    buy_exec_limiter.clone(),
+                    mint_dedup.clone(),
+                );
             } else {
                 if trade.execution_failed {
                     if consensus_engine.reject_signal(
@@ -706,7 +839,7 @@ async fn execute_buy(
     _account_subscriber: &Arc<AccountSubscriber>,
     tg: &TgNotifier,
     tg_stats: &Arc<TgStats>,
-) {
+) -> bool {
     let start = Instant::now();
     let detect_to_exec = detected_at.elapsed();
     let mut timings = BuyPathTimings {
@@ -961,6 +1094,7 @@ async fn execute_buy(
                                     tg.clone(),
                                 );
                             }
+                            true
                         }
                         Err(err) => {
                             error!(
@@ -976,6 +1110,7 @@ async fn execute_buy(
                                 mint: *mint,
                                 reason: err.to_string(),
                             });
+                            false
                         }
                     }
                 }
@@ -993,6 +1128,7 @@ async fn execute_buy(
                         mint: *mint,
                         reason: format!("buy tx build failed: {}", err),
                     });
+                    false
                 }
             }
         }
@@ -1003,6 +1139,7 @@ async fn execute_buy(
                 &mint.to_string()[..12],
                 err
             );
+            false
         }
     }
 }
