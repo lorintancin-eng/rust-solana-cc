@@ -11,7 +11,7 @@ permissions:
 
 env:
   BINARY_NAME: copy-trader
-  PACKAGE_NAME: copy-trader-linux-x86_64.tar.gz
+  ARTIFACT_NAME: copy-trader-linux
 
 jobs:
   build-linux:
@@ -35,17 +35,16 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --bin ${{ env.BINARY_NAME }}
 
-      - name: Package Linux artifact
+      - name: Prepare Linux binary artifact
         run: |
           mkdir -p dist
           cp "target/release/${{ env.BINARY_NAME }}" "dist/${{ env.BINARY_NAME }}"
           chmod +x "dist/${{ env.BINARY_NAME }}"
-          tar -C dist -czf "${{ env.PACKAGE_NAME }}" "${{ env.BINARY_NAME }}"
 
       - name: Upload Linux binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: copy-trader-linux-x86_64
-          path: ${{ env.PACKAGE_NAME }}
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/${{ env.BINARY_NAME }}
           if-no-files-found: error
           retention-days: 7

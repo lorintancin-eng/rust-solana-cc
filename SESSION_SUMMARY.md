@@ -1,64 +1,57 @@
 # Session Summary
 
 ## Current Goal
-- Improve buy-path responsiveness without relying on local Windows compile as production validation.
-- Current task:
-  - trigger bonding-curve prefetch earlier
-  - reduce buy-queue buildup by adjusting concurrency and dedup timing
+- Adjust GitHub Actions Linux packaging so the downloadable artifact contains the raw executable directly instead of a `.tar.gz` archive.
 
 ## Current Progress
-- Updated buy scheduling in `src/main.rs`.
-- Moved buy-path cache warming into a shared helper so `prefetch + bonding curve fetch` starts before the buy executor waits on the semaphore.
-- Applied the same early warm-up to consensus-triggered buys.
-- Reworked group/mint dedup from a plain timestamp map into an in-flight/cooldown gate:
-  - dedup now starts when execution actually begins
-  - failed/skipped attempts no longer poison later signals indefinitely
-  - successful sends keep only a short cooldown window
-- Raised buy executor parallelism from `4` to `8`.
-- Added a short queue timeout so stale queued buys are dropped instead of waiting too long.
-- Bumped crate version from `1.6.56` to `1.6.57`.
-- Per user instruction, do not run local edit-level compile checks going forward; final build truth remains GitHub Actions Linux.
+- Updated `.github/workflows/build-copy-trader-linux.yml`.
+- GitHub Actions now:
+  - builds `copy-trader` on Ubuntu
+  - copies the release binary into `dist/copy-trader`
+  - uploads that raw binary directly as the artifact payload
+- Artifact name changed to `copy-trader-linux`.
+- Downloaded artifact contents now contain `copy-trader` directly, so VPS flow no longer needs `tar -xzf`.
+- Bumped crate version from `1.6.57` to `1.6.58`.
+- Per user instruction, no local edit-level compile/build checks were run; final validation remains GitHub Actions Linux.
 
 ## Files Changed
+- `.github/workflows/build-copy-trader-linux.yml`
 - `Cargo.toml`
 - `Cargo.lock`
-- `src/main.rs`
+- `SESSION_SUMMARY.md`
 
 ## CI / GitHub Actions Status
-- Current workflow file: `.github/workflows/build-copy-trader-linux.yml`
+- Workflow: `.github/workflows/build-copy-trader-linux.yml`
 - Trigger: push to `main`
 - Build environment: Ubuntu
 - Build flow:
   - `cargo build --locked --release --bin copy-trader`
-  - package as `copy-trader-linux-x86_64.tar.gz`
-  - upload artifact `copy-trader-linux-x86_64`
+  - copy binary to `dist/copy-trader`
+  - upload artifact `copy-trader-linux`
 
 ## Artifact / Package Naming
 - Executable name: `copy-trader`
-- Archive name: `copy-trader-linux-x86_64.tar.gz`
-- Executable inside archive: `copy-trader`
+- Artifact name: `copy-trader-linux`
+- Downloaded contents: raw executable `copy-trader`
 
 ## Manual VPS Run Steps
 ```bash
+rm -rf /tmp/build && mkdir -p /tmp/build
 gh run list --repo lorintancin-eng/rust-solana-cc --workflow "Build Copy Trader Linux" --branch main --limit 5
-gh run download <RUN_ID> --repo lorintancin-eng/rust-solana-cc --name copy-trader-linux-x86_64
-tar -xzf copy-trader-linux-x86_64.tar.gz
-chmod +x copy-trader
+gh run download <RUN_ID> --repo lorintancin-eng/rust-solana-cc --name copy-trader-linux -D /tmp/build
+chmod +x /tmp/build/copy-trader
+cp /tmp/build/copy-trader /home/ubuntu/rust_project/copy-trader
 pkill -f copy-trader || true
-nohup ./copy-trader > copy-trader.log 2>&1 &
+nohup /home/ubuntu/rust_project/copy-trader > /home/ubuntu/rust_project/copy-trader.log 2>&1 &
 ```
 
 ## Remaining Work
-- Push current changes to `main`.
-- Wait for GitHub Actions Linux build result.
-- If needed next:
-  - make wrapper-specific pre-exec handling safer
-  - continue reducing `bc_wait` for special Pump.fun instruction variants
+- Push the workflow change to `main`.
+- Wait for the new GitHub Actions Linux build to finish.
+- After that, VPS can use the raw-binary artifact directly.
 
 ## Exact Next Step For Next Thread
 - Read `AGENTS.md`.
 - Read this `SESSION_SUMMARY.md`.
-- Check the latest GitHub Actions run for `main`.
-- Continue either:
-  - wrapper/Axiom compatibility work
-  - more buy-path latency reduction
+- Check the latest successful `Build Copy Trader Linux` run on `main`.
+- Download artifact `copy-trader-linux` and verify VPS update flow.
