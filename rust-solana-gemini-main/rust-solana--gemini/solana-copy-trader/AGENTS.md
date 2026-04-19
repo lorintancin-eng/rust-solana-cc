@@ -4,7 +4,7 @@
 
 This AGENTS.md applies to this Rust project directory and everything under it.
 
-This directory is the real Rust project root because it contains:
+This directory is the actual Rust project root because it contains:
 - Cargo.toml
 - Cargo.lock
 - src/
@@ -19,31 +19,35 @@ The expected production executable name is:
 
 `copy-trader`
 
-The repository workflow is GitHub-first.
-Code changes should be made in GitHub, pushed to `main`, and Linux build artifacts should be produced by GitHub Actions.
+The working model for this project is local-project-first:
 
-I will manually download and run the built artifact on the VPS.
-Do not add automatic server deployment unless I explicitly request it.
+- Codex works directly on the local project files
+- final code changes are pushed to GitHub `main`
+- GitHub Actions builds the Linux artifact
+- I manually download, extract, and run the artifact on the VPS
+- automatic deployment is not part of the workflow
 
 ## Default workflow
 
 Always follow this workflow unless I explicitly say otherwise:
 
 1. Read this `AGENTS.md` first
-2. Inspect the relevant project files before making changes
-3. Make code changes in this Rust project
-4. Push the final changes to the `main` branch
-5. Let GitHub Actions automatically build the Linux artifact
-6. Ensure the built Linux executable is named `copy-trader`
-7. I will manually download the artifact on the VPS
-8. I will manually extract, run, or restart it on the VPS
-
-Do not switch to a different workflow by default.
+2. Inspect the relevant local project files before making changes
+3. Make code changes in the local Rust project
+4. Keep changes ready for Git operations from the local repository
+5. Push the final changes to GitHub `main`
+6. Let GitHub Actions automatically build the Linux artifact
+7. Ensure the built Linux executable is named `copy-trader`
+8. I will manually download the artifact on the VPS
+9. I will manually extract, run, or restart it on the VPS
+10. Do not add automatic deployment
 
 ## Environment constraints
 
 - Local development machine: Windows
-- Source control and working source of truth: GitHub
+- Working project location: local repository on my machine
+- Source control remote: GitHub
+- Final target branch: `main`
 - Target runtime environment: Linux VPS
 - Project language: Rust
 - Production artifact target: Linux
@@ -55,20 +59,28 @@ Important constraints:
 - Do not assume Windows-built binaries are usable on the Linux VPS
 - Treat GitHub Actions Linux builds as the main build source of truth
 - Keep runtime instructions compatible with a headless Linux VPS
-- Prefer Linux shell commands that can be run over SSH
-- Avoid Windows-specific assumptions in paths, shell commands, or deployment instructions
+- Prefer Linux shell commands for VPS instructions
+- Avoid Windows-specific assumptions in deployment instructions
+- Local Windows checks are optional unless explicitly needed
 
-## GitHub workflow rules
+## Local project rules
 
-When working on this project:
+When working in this repository:
 
-- Prefer direct repository changes intended for GitHub
-- The final target branch is `main`
+- Modify the local project files directly
+- Inspect current files before making broad changes
 - Keep changes focused and minimal
 - If a change is risky or broad, say so clearly before doing it
+- Keep the project ready for Git commit and push
 - Do not rename the production binary unless I explicitly request it
 - Do not rename the artifact away from `copy-trader` unless I explicitly request it
-- If CI/build files need to be created or updated, do that as part of the task
+
+## Git and branch rules
+
+- Final target branch is `main`
+- Prepare changes so they can be pushed cleanly to `main`
+- If there are Git conflicts, risky diffs, or unrelated local changes, mention them clearly
+- Do not invent an alternative branching workflow unless I explicitly ask for one
 
 ## Rust project rules
 
@@ -77,11 +89,26 @@ Unless the repository clearly requires something else:
 - Use stable Rust
 - Prefer `cargo fmt`
 - Prefer `cargo clippy --all-targets --all-features -- -D warnings` when reasonable
-- Use `cargo build --release` for production builds
+- Use `cargo build --release` for production builds in CI
 - Keep dependencies minimal
 - Avoid unnecessary refactors
 - Preserve the existing crate structure unless there is a strong reason to change it
 - Prefer small, reviewable changes over large rewrites
+
+## Validation policy
+
+Validation priority for this project is:
+
+1. source inspection
+2. focused local edits
+3. optional local checks when useful
+4. GitHub Actions Linux build result as final build truth
+
+Important:
+
+- Do not treat a lack of successful Windows local compilation as proof the production change is invalid
+- Do not claim a production build is verified just because local edits look correct
+- Final build confidence should be based on GitHub Actions Linux results
 
 ## Build output requirements
 
@@ -132,6 +159,7 @@ Do not add:
 - SSH deployment steps in CI
 - remote restart hooks
 - deployment secrets for server access
+- server-side automation for rollout
 
 Unless I explicitly request those later.
 
@@ -179,13 +207,14 @@ After finishing a task, always provide:
 3. Any Cargo or dependency changes
 4. Any GitHub Actions or CI changes
 5. Confirmation of the expected artifact name
-6. Exact manual VPS steps to:
+6. Confirmation that final push target is `main`
+7. Exact manual VPS steps to:
    - download the artifact
    - extract it
    - make it executable if needed
    - run or restart it
-7. Rollback steps
-8. Any risks, assumptions, or follow-up checks
+8. Rollback steps
+9. Any risks, assumptions, or follow-up checks
 
 Always include concrete commands where possible.
 
@@ -224,6 +253,7 @@ Do not:
 - silently change build targets, toolchains, or artifact names
 - make large unrelated refactors during a focused task
 - claim the build is deploy-ready without considering Linux artifact generation
+- confuse local editing workflow with server deployment workflow
 
 ## Preferred response style
 
@@ -253,6 +283,7 @@ When finishing work, prefer using this structure:
 ### CI / GitHub Actions
 - what changed in CI
 - what artifact is expected
+- push target: `main`
 
 ### Artifact
 - executable name: `copy-trader`
