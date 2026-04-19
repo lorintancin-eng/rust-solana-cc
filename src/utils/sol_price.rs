@@ -4,6 +4,7 @@ use std::time::Duration;
 use tracing::{info, warn, debug};
 
 const COINGECKO_URL: &str = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+const USER_AGENT: &str = concat!("copy-trader/", env!("CARGO_PKG_VERSION"));
 
 /// SOL/USD 实时汇率（CoinGecko 免费 API + 本地缓存）
 #[derive(Clone)]
@@ -72,7 +73,7 @@ impl SolUsdPrice {
         let resp = match client
             .get(COINGECKO_URL)
             .header("Accept", "application/json")
-            .header("User-Agent", "solana-copy-trader/1.0")
+            .header("User-Agent", USER_AGENT)
             .send()
             .await
         {

@@ -1,0 +1,51 @@
+name: Build Copy Trader Linux
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BINARY_NAME: copy-trader
+  PACKAGE_NAME: copy-trader-linux-x86_64.tar.gz
+
+jobs:
+  build-linux:
+    name: Build Linux Artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --locked --release --bin ${{ env.BINARY_NAME }}
+
+      - name: Package Linux artifact
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ env.BINARY_NAME }}" "dist/${{ env.BINARY_NAME }}"
+          chmod +x "dist/${{ env.BINARY_NAME }}"
+          tar -C dist -czf "${{ env.PACKAGE_NAME }}" "${{ env.BINARY_NAME }}"
+
+      - name: Upload Linux binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: copy-trader-linux-x86_64
+          path: ${{ env.PACKAGE_NAME }}
+          if-no-files-found: error
+          retention-days: 7

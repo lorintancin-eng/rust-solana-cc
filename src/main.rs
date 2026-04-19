@@ -51,6 +51,7 @@ const BUY_EXACT_SOL_IN_WAIT_MS: u64 = 40;
 const BUY_EXACT_SOL_IN_WAIT_ATTEMPTS: usize = 3;
 const BUY_EXECUTOR_PARALLELISM: usize = 4;
 const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone)]
 struct SignatureSeen {
@@ -113,7 +114,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.55");
+    info!("   Solana 跟单交易系统 v{}", APP_VERSION);
     info!("   RabbitStream pre-exec + Group Copy Trading");
     info!("==============================================");
 
