@@ -54,6 +54,8 @@ const WRAPPER_BUY_EXECUTOR_PARALLELISM: usize = 2;
 const BUY_EXECUTOR_QUEUE_TIMEOUT_MS: u64 = 25;
 const GROUP_MINT_DEDUP_SUCCESS_MS: u64 = 2500;
 const GROUP_MINT_DEDUP_STALE_SECS: u64 = 30;
+const ACCOUNT_CANDIDATE_CLEANUP_INTERVAL_SECS: u64 = 15;
+const ACCOUNT_CANDIDATE_TTL_SECS: u64 = 120;
 const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -457,6 +459,28 @@ async fn main() -> Result<()> {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             prefetch_clone.cleanup(300);
+        }
+    });
+
+    let candidate_cleanup_sub = account_subscriber.clone();
+    let candidate_cleanup_auto_sell = auto_sell_manager.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(
+                ACCOUNT_CANDIDATE_CLEANUP_INTERVAL_SECS,
+            ))
+            .await;
+            let active_mints = candidate_cleanup_auto_sell.get_open_position_mints();
+            let pruned = candidate_cleanup_sub.prune_stale_candidate_mints(
+                &active_mints,
+                Duration::from_secs(ACCOUNT_CANDIDATE_TTL_SECS),
+            );
+            if pruned > 0 {
+                debug!(
+                    "Pruned {} stale candidate mints from account subscriber",
+                    pruned
+                );
+            }
         }
     });
 

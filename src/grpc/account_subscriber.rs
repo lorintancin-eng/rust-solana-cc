@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tonic::transport::ClientTlsConfig;
 use tracing::{debug, error, info, warn};
@@ -114,6 +114,7 @@ pub struct AccountSubscriber {
     grpc_token: Option<String>,
     bonding_curve_to_mint: Arc<DashMap<Pubkey, Pubkey>>,
     ata_to_mint: Arc<DashMap<Pubkey, Pubkey>>,
+    mint_last_touched: Arc<DashMap<Pubkey, Instant>>,
     subscribed_accounts: Arc<DashMap<Pubkey, AccountType>>,
     subscription_notify: Arc<Notify>,
     bc_cache: BondingCurveCache,
@@ -138,6 +139,7 @@ impl AccountSubscriber {
             grpc_token,
             bonding_curve_to_mint: Arc::new(DashMap::new()),
             ata_to_mint: Arc::new(DashMap::new()),
+            mint_last_touched: Arc::new(DashMap::new()),
             subscribed_accounts: Arc::new(DashMap::new()),
             subscription_notify: Arc::new(Notify::new()),
             bc_cache,
@@ -148,6 +150,7 @@ impl AccountSubscriber {
     /// 添加 bonding curve 账户到订阅列表
     pub fn track_bonding_curve(&self, mint: Pubkey, bonding_curve: Pubkey) {
         self.bonding_curve_to_mint.insert(bonding_curve, mint);
+        self.mint_last_touched.insert(mint, Instant::now());
         self.subscribed_accounts
             .insert(bonding_curve, AccountType::BondingCurve);
         debug!(
@@ -161,6 +164,7 @@ impl AccountSubscriber {
     /// 添加 ATA 账户到订阅列表（用于确认买入是否成功）
     pub fn track_ata(&self, mint: Pubkey, ata_address: Pubkey) {
         self.ata_to_mint.insert(ata_address, mint);
+        self.mint_last_touched.insert(mint, Instant::now());
         self.subscribed_accounts
             .insert(ata_address, AccountType::Ata);
         debug!(
@@ -199,6 +203,8 @@ impl AccountSubscriber {
 
         // 移除缓存
         self.bc_cache.remove(mint);
+        self.ata_cache.remove(mint);
+        self.mint_last_touched.remove(mint);
 
         debug!(
             "Untracked all accounts for mint: {}",
@@ -207,6 +213,31 @@ impl AccountSubscriber {
     }
 
     /// 获取当前所有订阅的账户地址
+    pub fn prune_stale_candidate_mints(
+        &self,
+        active_mints: &HashSet<Pubkey>,
+        max_idle: Duration,
+    ) -> usize {
+        let stale_mints: Vec<Pubkey> = self
+            .mint_last_touched
+            .iter()
+            .filter_map(|entry| {
+                let mint = *entry.key();
+                if active_mints.contains(&mint) || entry.value().elapsed() < max_idle {
+                    None
+                } else {
+                    Some(mint)
+                }
+            })
+            .collect();
+
+        for mint in &stale_mints {
+            self.untrack_mint(mint);
+        }
+
+        stale_mints.len()
+    }
+
     fn get_subscribed_addresses(&self) -> Vec<String> {
         self.subscribed_accounts
             .iter()
@@ -234,6 +265,7 @@ impl AccountSubscriber {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(10))
             .tls_config(ClientTlsConfig::new().with_native_roots())?
+            .max_decoding_message_size(64 * 1024 * 1024)
             .connect()
             .await
             .context("Account subscriber: failed to connect gRPC")?;

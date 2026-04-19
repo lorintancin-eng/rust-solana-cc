@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -191,6 +192,14 @@ impl AutoSellManager {
 
     pub fn position_count(&self) -> usize {
         self.positions.len()
+    }
+
+    pub fn get_open_position_mints(&self) -> HashSet<Pubkey> {
+        self.positions
+            .iter()
+            .filter(|entry| !matches!(entry.state, PositionState::Closed | PositionState::Failed))
+            .map(|entry| entry.key().token_mint)
+            .collect()
     }
 
     pub fn get_active_positions(&self) -> Vec<Position> {
