@@ -16,6 +16,12 @@ use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
 
 use crate::processor::pumpfun::BondingCurveState;
 
+const ACCOUNT_GRPC_CONNECT_TIMEOUT_SECS: u64 = 10;
+const ACCOUNT_GRPC_STREAM_TIMEOUT_SECS: u64 = 60;
+const ACCOUNT_GRPC_HTTP2_KEEPALIVE_SECS: u64 = 15;
+const ACCOUNT_GRPC_KEEPALIVE_TIMEOUT_SECS: u64 = 5;
+const ACCOUNT_GRPC_TCP_KEEPALIVE_SECS: u64 = 30;
+
 // ============================================
 // 账户变化事件
 // ============================================
@@ -262,8 +268,19 @@ impl AccountSubscriber {
 
         let mut client = GeyserGrpcClient::build_from_shared(self.grpc_url.clone())?
             .x_token(self.grpc_token.clone())?
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(ACCOUNT_GRPC_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(ACCOUNT_GRPC_STREAM_TIMEOUT_SECS))
+            .http2_keep_alive_interval(Duration::from_secs(
+                ACCOUNT_GRPC_HTTP2_KEEPALIVE_SECS,
+            ))
+            .keep_alive_timeout(Duration::from_secs(
+                ACCOUNT_GRPC_KEEPALIVE_TIMEOUT_SECS,
+            ))
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(Duration::from_secs(
+                ACCOUNT_GRPC_TCP_KEEPALIVE_SECS,
+            )))
+            .tcp_nodelay(true)
             .tls_config(ClientTlsConfig::new().with_native_roots())?
             .max_decoding_message_size(64 * 1024 * 1024)
             .connect()
@@ -296,7 +313,11 @@ impl AccountSubscriber {
                             }
                         }
                         Some(Err(e)) => {
-                            error!("Account subscriber stream error: {}", e);
+                            error!(
+                                "Account subscriber stream error (tracked_accounts={}): {}",
+                                last_subscribed_count,
+                                e
+                            );
                             return Err(e.into());
                         }
                         None => {

@@ -1,30 +1,27 @@
 # Session Summary
 
 ## Current Goal
-- Keep the Pump.fun mirror fast path for safe direct buys.
-- Detect unsafe direct mirror account layouts and fall back to native Pump.fun account construction.
-- Prevent direct buys from failing on-chain with Pump.fun `ConstraintSeeds (2006)` errors such as `user_volume_accumulator`.
+- Reduce recurring gRPC account-stream disconnects such as:
+  - `status: Internal, message: "h2 protocol error: error reading a body from connection"`
+- Keep the account subscriber stable enough for continuous bonding-curve / ATA monitoring.
 
 ## Current Progress
-- Added canonical Pump.fun buy-account derivation in `src/processor/pumpfun.rs`.
-- Added direct mirror account validation:
-  - exact account-count check for direct mirror buys
-  - full canonical account comparison when bonding-curve state is cached
-  - partial fixed-slot validation when only the target instruction is available
-- Updated buy routing in `src/main.rs`:
-  - safe direct mirror buys keep using the existing mirror fast path
-  - unsafe direct mirror buys fall back to `buy_standard_from_cached_state(...)` when bonding-curve cache exists
-  - unsafe direct mirror buys are rejected when there is no bonding-curve cache to build a safe native instruction
-- Propagated `TradeOrigin` into `execute_buy()` so only direct Pump.fun mirror buys are gated by the new safety check.
-- Bumped crate version from `1.6.60` to `1.6.61`.
+- Updated `src/grpc/account_subscriber.rs` transport settings for long-lived Yellowstone account streams:
+  - request timeout raised from `10s` to `60s`
+  - enabled HTTP/2 keepalive interval
+  - enabled keepalive timeout handling
+  - enabled keepalive while idle
+  - enabled TCP keepalive
+  - enabled `tcp_nodelay`
+- Added more informative account-stream error logging with the current tracked-account count.
+- Bumped crate version from `1.6.61` to `1.6.62`.
 - Per user instruction, no local edit-level compile/build checks were run.
 
 ## Files Changed
 - `Cargo.toml`
 - `Cargo.lock`
 - `SESSION_SUMMARY.md`
-- `src/main.rs`
-- `src/processor/pumpfun.rs`
+- `src/grpc/account_subscriber.rs`
 
 ## CI / GitHub Actions Status
 - Workflow: `.github/workflows/build-copy-trader-linux.yml`
@@ -49,12 +46,13 @@ nohup /home/ubuntu/rust_project/copy-trader > /home/ubuntu/rust_project/copy-tra
 ```
 
 ## Remaining Work
-- Commit the direct mirror safety / native fallback changes
+- Commit the account-stream keepalive changes
 - Push to `main`
 - Check the latest GitHub Actions Linux build result
+- Observe whether account-stream disconnect frequency drops in production
 
 ## Exact Next Step For Next Thread
 - Read `AGENTS.md`
 - Read this `SESSION_SUMMARY.md`
 - Check the latest `main` commit and Linux Actions run
-- If the Linux build is green, download artifact `copy-trader-linux` on VPS and restart manually
+- If the Linux build is green, deploy artifact `copy-trader-linux` on VPS and watch account-stream logs for reconnect frequency
