@@ -1,27 +1,31 @@
 # Session Summary
 
 ## Current Goal
-- Reduce recurring gRPC account-stream disconnects such as:
-  - `status: Internal, message: "h2 protocol error: error reading a body from connection"`
-- Keep the account subscriber stable enough for continuous bonding-curve / ATA monitoring.
+- Fix direct Pump.fun pre-exec copy trades that use ALT and were being skipped with warnings like:
+  - `unsafe direct mirror without bonding curve cache: unexpected direct mirror account count: expected 17, got 10`
+- Keep the existing safe direct mirror fast path unchanged for normal trades.
 
 ## Current Progress
-- Updated `src/grpc/account_subscriber.rs` transport settings for long-lived Yellowstone account streams:
-  - request timeout raised from `10s` to `60s`
-  - enabled HTTP/2 keepalive interval
-  - enabled keepalive timeout handling
-  - enabled keepalive while idle
-  - enabled TCP keepalive
-  - enabled `tcp_nodelay`
-- Added more informative account-stream error logging with the current tracked-account count.
-- Bumped crate version from `1.6.61` to `1.6.62`.
+- Patched `src/grpc/subscriber.rs` so direct Pump.fun parsing now:
+  - derives `token_mint` from the original instruction slot positions instead of flattened partial accounts
+  - derives `token_program` from slot `8` when available, otherwise infers it from Pump.fun PDA relationships
+  - only keeps `instruction_accounts` for direct mirror use when all instruction accounts are fully resolved
+  - stops passing ALT-truncated partial account lists downstream as if they were valid mirror accounts
+- Patched `src/main.rs` buy routing so rare direct/native fallback cases now do one targeted synchronous bonding-curve fetch when:
+  - there is target instruction data
+  - bonding-curve cache is still missing
+  - and there is no safe usable direct mirror path
+- Patched `src/processor/pumpfun.rs` to prefer `trade.token_mint` / `trade.token_program` over blind `instruction_accounts[2]` / `[8]` fallback.
+- Bumped crate version from `1.6.62` to `1.6.63`.
 - Per user instruction, no local edit-level compile/build checks were run.
 
 ## Files Changed
 - `Cargo.toml`
 - `Cargo.lock`
 - `SESSION_SUMMARY.md`
-- `src/grpc/account_subscriber.rs`
+- `src/grpc/subscriber.rs`
+- `src/main.rs`
+- `src/processor/pumpfun.rs`
 
 ## CI / GitHub Actions Status
 - Workflow: `.github/workflows/build-copy-trader-linux.yml`
@@ -46,13 +50,17 @@ nohup /home/ubuntu/rust_project/copy-trader > /home/ubuntu/rust_project/copy-tra
 ```
 
 ## Remaining Work
-- Commit the account-stream keepalive changes
+- Commit the ALT-truncated direct Pump.fun fix
 - Push to `main`
 - Check the latest GitHub Actions Linux build result
-- Observe whether account-stream disconnect frequency drops in production
+- Deploy the new `copy-trader-linux` artifact on VPS and observe:
+  - whether wallet `84pGSJPRm7RcTMxWhsE4B7DWnjGxae6R8WRnYKZfPPiH` stops missing direct ALT pre-exec buys
+  - whether new warnings shift from skipped trades to successful native fallback submissions
 
 ## Exact Next Step For Next Thread
 - Read `AGENTS.md`
 - Read this `SESSION_SUMMARY.md`
 - Check the latest `main` commit and Linux Actions run
-- If the Linux build is green, deploy artifact `copy-trader-linux` on VPS and watch account-stream logs for reconnect frequency
+- If the Linux build is green, deploy artifact `copy-trader-linux` on VPS and watch:
+  - buy logs for `84pG...`
+  - whether `unexpected direct mirror account count: expected 17, got 10` disappears

@@ -199,11 +199,16 @@ impl GrpcSubscriber {
                                                         if trade.is_buy { "BUY" } else { "SELL" },
                                                         &trade.source_wallet.to_string()[..4],
                                                         &trade.source_wallet.to_string()[trade.source_wallet.to_string().len() - 4..],
-                                                        if trade.instruction_accounts.len() > 2 {
-                                                            trade.instruction_accounts[2].to_string()
-                                                        } else {
-                                                            format!("{}..{}", &trade.signature[..6], &trade.signature[trade.signature.len()-4..])
-                                                        },
+                                                        trade
+                                                            .token_mint
+                                                            .map(|mint| mint.to_string())
+                                                            .unwrap_or_else(|| {
+                                                                format!(
+                                                                    "{}..{}",
+                                                                    &trade.signature[..6],
+                                                                    &trade.signature[trade.signature.len() - 4..]
+                                                                )
+                                                            }),
                                                         trade.sol_amount_lamports as f64 / 1e9,
                                                         parse_latency.as_micros(),
                                                         &trade.signature[..8],
@@ -583,19 +588,36 @@ impl GrpcSubscriber {
         let is_buy = self.detect_buy_or_sell(data, &trade_type, account_indices, all_account_keys);
 
         // 提取指令涉及的 account keys（用于后续 processor 重建指令）
-        let instruction_accounts: Vec<Pubkey> = account_indices
+        let instruction_account_slots: Vec<Option<Pubkey>> = account_indices
             .iter()
-            .filter_map(|&idx| all_account_keys.get(idx as usize).copied())
+            .map(|&idx| all_account_keys.get(idx as usize).copied())
             .collect();
+        let instruction_accounts: Vec<Pubkey> = if instruction_account_slots
+            .iter()
+            .all(|account| account.is_some())
+        {
+            instruction_account_slots
+                .iter()
+                .filter_map(|account| *account)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let sol_amount_lamports = if is_buy {
             Self::extract_buy_lamports(&trade_type, data)
         } else {
             0
         };
-        let token_program = Self::extract_token_program(&trade_type, &instruction_accounts);
+        let token_mint = Self::extract_token_mint(&trade_type, &instruction_account_slots);
+        let token_program = Self::extract_token_program(
+            &trade_type,
+            &instruction_account_slots,
+            all_account_keys,
+            token_mint.as_ref(),
+        );
 
-        Ok(Some(DetectedTrade {
+        let mut trade = DetectedTrade {
             signature: signature.to_string(),
             source_wallet,
             trade_type,
@@ -612,7 +634,10 @@ impl GrpcSubscriber {
             execution_failed: false,
             token_mint: None, // 直接调用场景由 main.rs extract_token_info 提取
             token_program,
-        }))
+        };
+        trade.token_mint = token_mint;
+
+        Ok(Some(trade))
     }
 
     // ================================================================
@@ -729,9 +754,46 @@ impl GrpcSubscriber {
         })
     }
 
-    fn extract_token_program(trade_type: &TradeType, instruction_accounts: &[Pubkey]) -> Option<Pubkey> {
+    fn extract_token_mint(
+        trade_type: &TradeType,
+        instruction_account_slots: &[Option<Pubkey>],
+    ) -> Option<Pubkey> {
         match trade_type {
-            TradeType::Pumpfun => instruction_accounts.get(8).copied(),
+            TradeType::Pumpfun => instruction_account_slots.get(2).copied().flatten(),
+            _ => None,
+        }
+    }
+
+    fn extract_token_program(
+        trade_type: &TradeType,
+        instruction_account_slots: &[Option<Pubkey>],
+        all_account_keys: &[Pubkey],
+        token_mint: Option<&Pubkey>,
+    ) -> Option<Pubkey> {
+        match trade_type {
+            TradeType::Pumpfun => {
+                if let Some(token_program) =
+                    instruction_account_slots.get(8).copied().flatten()
+                {
+                    return Some(token_program);
+                }
+
+                let mint = token_mint.copied()?;
+                let bonding_curve = instruction_account_slots.get(3).copied().flatten()?;
+                let token_program = Pubkey::from_str(
+                    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                )
+                .ok()?;
+                let token_2022 = Pubkey::from_str(TOKEN_2022_PROGRAM).ok()?;
+
+                Some(Self::detect_pumpfun_token_program(
+                    all_account_keys,
+                    &mint,
+                    &bonding_curve,
+                    &token_program,
+                    &token_2022,
+                ))
+            }
             _ => None,
         }
     }

@@ -950,6 +950,54 @@ async fn execute_buy(
         }
     }
 
+    if bc_state.is_none() && has_target_instruction {
+        if let Some(prefetched) = prefetched.as_ref() {
+            let mut sync_fetch_reason = None;
+            let should_sync_fetch =
+                if prefetched.mirror_accounts.is_empty() || !trade_origin.uses_mirror_accounts() {
+                    sync_fetch_reason = Some("native path requires bonding curve cache".to_string());
+                    true
+                } else {
+                    match pumpfun.validate_direct_mirror_buy_accounts(
+                        mint,
+                        &prefetched.user_ata,
+                        &prefetched.token_program,
+                        &prefetched.source_wallet,
+                        &prefetched.mirror_accounts,
+                        None,
+                        &config,
+                    ) {
+                        Ok(()) => false,
+                        Err(err) => {
+                            sync_fetch_reason =
+                                Some(format!("unsafe direct mirror without cache: {}", err));
+                            true
+                        }
+                    }
+                };
+
+            if should_sync_fetch {
+                let sync_fetch_started = Instant::now();
+                match pumpfun.prefetch_bonding_curve(&prefetched.bonding_curve).await {
+                    Ok(state) => {
+                        bc_cache.update(mint, state.clone());
+                        bc_state = Some(state);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Bonding curve sync fetch failed [{}] {} | reason={} | error={}",
+                            group.name,
+                            &mint.to_string()[..12],
+                            sync_fetch_reason.as_deref().unwrap_or("unknown"),
+                            err
+                        );
+                    }
+                }
+                timings.bc_sync_fetch = sync_fetch_started.elapsed();
+            }
+        }
+    }
+
     let quote_build_start = Instant::now();
     let buy_result: Result<(processor::MirrorInstruction, u64), anyhow::Error> =
         if let Some(ref pf) = prefetched {

@@ -1444,16 +1444,14 @@ impl TradeProcessor for PumpfunProcessor {
         trade: &DetectedTrade,
         config: &AppConfig,
     ) -> Result<MirrorInstruction> {
-        let mint = if trade.instruction_accounts.len() >= 3 {
-            trade.instruction_accounts[2]
-        } else {
-            anyhow::bail!("Pumpfun instruction too few accounts");
-        };
-        let token_prog = if trade.instruction_accounts.len() > 8 {
-            trade.instruction_accounts[8]
-        } else {
-            Pubkey::from_str(TOKEN_PROGRAM).unwrap()
-        };
+        let mint = trade
+            .token_mint
+            .or_else(|| trade.instruction_accounts.get(2).copied())
+            .ok_or_else(|| anyhow::anyhow!("Pumpfun instruction missing token mint"))?;
+        let token_prog = trade
+            .token_program
+            .or_else(|| trade.instruction_accounts.get(8).copied())
+            .unwrap_or_else(|| Pubkey::from_str(TOKEN_PROGRAM).unwrap());
         let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
             &config.pubkey,
             &mint,
