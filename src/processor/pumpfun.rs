@@ -56,6 +56,25 @@ const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 const INIT_UVA_DISCRIMINATOR: [u8; 8] = [94, 6, 202, 115, 255, 96, 232, 183];
 // extend discriminator (扩展旧格式 bonding curve)
 const EXTEND_DISCRIMINATOR: [u8; 8] = [234, 102, 194, 203, 150, 72, 62, 229];
+const PUMPFUN_BUY_ACCOUNT_LABELS: [&str; 17] = [
+    "global",
+    "fee_recipient",
+    "mint",
+    "bonding_curve",
+    "associated_bonding_curve",
+    "user_ata",
+    "user",
+    "system_program",
+    "token_program",
+    "creator_vault",
+    "event_authority",
+    "program",
+    "global_volume_accumulator",
+    "user_volume_accumulator",
+    "fee_config",
+    "fee_program",
+    "bonding_curve_v2",
+];
 
 /// Pump.fun 标准总供应量: 10 亿 tokens
 pub const PUMP_TOTAL_SUPPLY: f64 = 1_000_000_000.0;
@@ -174,6 +193,23 @@ fn max_pump_raw_supply() -> u64 {
     (PUMP_TOTAL_SUPPLY as u64) * 1_000_000
 }
 
+fn first_pubkey_mismatch(
+    actual: &[Pubkey],
+    expected: &[Pubkey],
+) -> Option<(usize, Pubkey, Pubkey)> {
+    actual
+        .iter()
+        .zip(expected.iter())
+        .enumerate()
+        .find_map(|(index, (actual_key, expected_key))| {
+            if actual_key != expected_key {
+                Some((index, *actual_key, *expected_key))
+            } else {
+                None
+            }
+        })
+}
+
 pub struct PumpfunProcessor {
     rpc_client: Arc<RpcClient>,
 }
@@ -193,16 +229,14 @@ impl PumpfunProcessor {
             .map_err(|err| anyhow::anyhow!("invalid pump fee recipient: {}", err))
     }
 
-    fn build_buy_instruction_standard(
+    fn build_buy_account_keys_standard(
         &self,
         user: &Pubkey,
         mint: &Pubkey,
         user_ata: &Pubkey,
         token_program_id: &Pubkey,
         curve_state: &BondingCurveState,
-        token_amount: u64,
-        max_sol_cost: u64,
-    ) -> Result<Instruction> {
+    ) -> Result<[Pubkey; 17]> {
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
         let fee_recipient = self.select_fee_recipient(curve_state)?;
         let creator = curve_state
@@ -226,29 +260,162 @@ impl PumpfunProcessor {
         let bonding_curve_v2 =
             Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &program_id).0;
 
+        Ok([
+            Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(),
+            fee_recipient,
+            *mint,
+            bonding_curve,
+            associated_bonding_curve,
+            *user_ata,
+            *user,
+            system_program::id(),
+            *token_program_id,
+            creator_vault,
+            Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(),
+            program_id,
+            global_volume_accumulator,
+            user_volume_accumulator,
+            Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(),
+            Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(),
+            bonding_curve_v2,
+        ])
+    }
+
+    pub fn validate_direct_mirror_buy_accounts(
+        &self,
+        mint: &Pubkey,
+        user_ata: &Pubkey,
+        token_program_id: &Pubkey,
+        source_wallet: &Pubkey,
+        mirror_accounts: &[Pubkey],
+        curve_state: Option<&BondingCurveState>,
+        config: &AppConfig,
+    ) -> Result<()> {
+        if mirror_accounts.len() != PUMPFUN_BUY_ACCOUNT_LABELS.len() {
+            anyhow::bail!(
+                "unexpected direct mirror account count: expected {}, got {}",
+                PUMPFUN_BUY_ACCOUNT_LABELS.len(),
+                mirror_accounts.len()
+            );
+        }
+
+        let replaced =
+            Self::replace_user_pdas(mirror_accounts, source_wallet, &config.pubkey, user_ata);
+
+        if let Some(curve_state) = curve_state {
+            let expected = self.build_buy_account_keys_standard(
+                &config.pubkey,
+                mint,
+                user_ata,
+                token_program_id,
+                curve_state,
+            )?;
+
+            if let Some((index, actual, expected_key)) =
+                first_pubkey_mismatch(&replaced, &expected)
+            {
+                anyhow::bail!(
+                    "{} mismatch at [{}]: expected {}, got {}",
+                    PUMPFUN_BUY_ACCOUNT_LABELS[index],
+                    index,
+                    expected_key,
+                    actual
+                );
+            }
+
+            return Ok(());
+        }
+
+        let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
+        let (bonding_curve, _) =
+            Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &program_id);
+        let associated_bonding_curve =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &bonding_curve,
+                mint,
+                token_program_id,
+            );
+        let global_volume_accumulator =
+            Pubkey::find_program_address(&[b"global_volume_accumulator"], &program_id).0;
+        let user_volume_accumulator = Pubkey::find_program_address(
+            &[b"user_volume_accumulator", config.pubkey.as_ref()],
+            &program_id,
+        )
+        .0;
+        let bonding_curve_v2 =
+            Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &program_id).0;
+
+        let partial_expectations = [
+            (0usize, Pubkey::from_str(PUMPFUN_GLOBAL).unwrap()),
+            (2usize, *mint),
+            (3usize, bonding_curve),
+            (4usize, associated_bonding_curve),
+            (5usize, *user_ata),
+            (6usize, config.pubkey),
+            (7usize, system_program::id()),
+            (8usize, *token_program_id),
+            (10usize, Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap()),
+            (11usize, program_id),
+            (12usize, global_volume_accumulator),
+            (13usize, user_volume_accumulator),
+            (14usize, Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap()),
+            (15usize, Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap()),
+            (16usize, bonding_curve_v2),
+        ];
+
+        for (index, expected_key) in partial_expectations {
+            let actual = replaced[index];
+            if actual != expected_key {
+                anyhow::bail!(
+                    "{} mismatch at [{}]: expected {}, got {}",
+                    PUMPFUN_BUY_ACCOUNT_LABELS[index],
+                    index,
+                    expected_key,
+                    actual
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_buy_instruction_standard(
+        &self,
+        user: &Pubkey,
+        mint: &Pubkey,
+        user_ata: &Pubkey,
+        token_program_id: &Pubkey,
+        curve_state: &BondingCurveState,
+        token_amount: u64,
+        max_sol_cost: u64,
+    ) -> Result<Instruction> {
+        let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
+        let account_keys =
+            self.build_buy_account_keys_standard(user, mint, user_ata, token_program_id, curve_state)?;
+
         let mut data = Vec::with_capacity(24);
         data.extend_from_slice(&BUY_DISCRIMINATOR);
         data.extend_from_slice(&token_amount.to_le_bytes());
         data.extend_from_slice(&max_sol_cost.to_le_bytes());
 
         let accounts = vec![
-            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false),
-            AccountMeta::new(fee_recipient, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new(bonding_curve, false),
-            AccountMeta::new(associated_bonding_curve, false),
-            AccountMeta::new(*user_ata, false),
-            AccountMeta::new(*user, true),
-            AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(*token_program_id, false),
-            AccountMeta::new(creator_vault, false),
-            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(), false),
+            AccountMeta::new_readonly(account_keys[0], false),
+            AccountMeta::new(account_keys[1], false),
+            AccountMeta::new_readonly(account_keys[2], false),
+            AccountMeta::new(account_keys[3], false),
+            AccountMeta::new(account_keys[4], false),
+            AccountMeta::new(account_keys[5], false),
+            AccountMeta::new(account_keys[6], true),
+            AccountMeta::new_readonly(account_keys[7], false),
+            AccountMeta::new_readonly(account_keys[8], false),
+            AccountMeta::new(account_keys[9], false),
+            AccountMeta::new_readonly(account_keys[10], false),
             AccountMeta::new_readonly(program_id, false),
-            AccountMeta::new_readonly(global_volume_accumulator, false),
-            AccountMeta::new(user_volume_accumulator, false),
-            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(), false),
-            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(), false),
-            AccountMeta::new_readonly(bonding_curve_v2, false),
+            AccountMeta::new_readonly(account_keys[12], false),
+            AccountMeta::new(account_keys[13], false),
+            AccountMeta::new_readonly(account_keys[14], false),
+            AccountMeta::new_readonly(account_keys[15], false),
+            AccountMeta::new_readonly(account_keys[16], false),
         ];
 
         Ok(Instruction {

@@ -29,7 +29,7 @@ use groups::{CopyGroup, GroupManager, ENTRY_MODE_SMART_BUY};
 use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache, GrpcSubscriber};
 use processor::prefetch::PrefetchCache;
 use processor::pumpfun::PumpfunProcessor;
-use processor::DetectedTrade;
+use processor::{DetectedTrade, TradeOrigin};
 use telegram::{TgBot, TgEvent, TgNotifier, TgStats};
 use tx::{
     blockhash,
@@ -221,6 +221,7 @@ fn spawn_buy_execution(
     group: CopyGroup,
     mint: Pubkey,
     wallets: Vec<Pubkey>,
+    trade_origin: TradeOrigin,
     detected_at: Instant,
     zero_slot_buy_enabled: bool,
     target_instruction_data: Vec<u8>,
@@ -283,6 +284,7 @@ fn spawn_buy_execution(
             &group,
             &mint,
             &wallets,
+            trade_origin,
             detected_at,
             zero_slot_buy_enabled,
             &target_instruction_data,
@@ -615,6 +617,7 @@ async fn main() -> Result<()> {
                 group,
                 trigger_mint,
                 trigger_wallets,
+                trigger.canonical_trade_origin,
                 trigger_detected_at,
                 zero_slot_buy_enabled,
                 canonical_instruction_data,
@@ -788,6 +791,7 @@ async fn main() -> Result<()> {
                     group.clone(),
                     token_mint,
                     vec![trade.source_wallet],
+                    trade.trade_origin,
                     trade.detected_at,
                     zero_slot_buy_enabled,
                     target_instruction_data,
@@ -859,6 +863,7 @@ async fn execute_buy(
     group: &CopyGroup,
     mint: &Pubkey,
     wallets: &[Pubkey],
+    trade_origin: TradeOrigin,
     detected_at: Instant,
     zero_slot_buy_enabled: bool,
     target_instruction_data: &[u8],
@@ -950,7 +955,7 @@ async fn execute_buy(
         if let Some(ref pf) = prefetched {
             if let Some(bc_state) = bc_state.clone() {
                 let token_amount = bc_state.sol_to_token_quote(buy_lamports);
-                if pf.mirror_accounts.is_empty() {
+                if pf.mirror_accounts.is_empty() || !trade_origin.uses_mirror_accounts() {
                     pumpfun
                         .buy_standard_from_cached_state(
                             mint,
@@ -961,33 +966,72 @@ async fn execute_buy(
                         )
                         .map(|mirror| (mirror, token_amount))
                 } else {
-                    pumpfun
-                        .buy_from_cached_state(
-                            mint,
-                            &pf.user_ata,
-                            &pf.token_program,
-                            &pf.source_wallet,
-                            &pf.mirror_accounts,
-                            &bc_state,
-                            &config,
-                        )
-                        .map(|mirror| (mirror, token_amount))
-                }
-            } else if has_target_instruction {
-                if pf.mirror_accounts.is_empty() {
-                    Err(anyhow::anyhow!(
-                        "missing bc cache for native wrapper path"
-                    ))
-                } else {
-                    pumpfun.buy_from_target_instruction(
+                    match pumpfun.validate_direct_mirror_buy_accounts(
                         mint,
                         &pf.user_ata,
                         &pf.token_program,
                         &pf.source_wallet,
                         &pf.mirror_accounts,
-                        target_instruction_data,
+                        Some(&bc_state),
                         &config,
-                    )
+                    ) {
+                        Ok(()) => pumpfun
+                            .buy_from_cached_state(
+                                mint,
+                                &pf.user_ata,
+                                &pf.token_program,
+                                &pf.source_wallet,
+                                &pf.mirror_accounts,
+                                &bc_state,
+                                &config,
+                            )
+                            .map(|mirror| (mirror, token_amount)),
+                        Err(err) => {
+                            warn!(
+                                "Unsafe Pump.fun direct mirror [{}] {} | fallback=native | reason={}",
+                                group.name,
+                                &mint.to_string()[..12],
+                                err
+                            );
+                            pumpfun
+                                .buy_standard_from_cached_state(
+                                    mint,
+                                    &pf.user_ata,
+                                    &pf.token_program,
+                                    &bc_state,
+                                    &config,
+                                )
+                                .map(|mirror| (mirror, token_amount))
+                        }
+                    }
+                }
+            } else if has_target_instruction {
+                if pf.mirror_accounts.is_empty() || !trade_origin.uses_mirror_accounts() {
+                    Err(anyhow::anyhow!("missing bc cache for native buy path"))
+                } else {
+                    match pumpfun.validate_direct_mirror_buy_accounts(
+                        mint,
+                        &pf.user_ata,
+                        &pf.token_program,
+                        &pf.source_wallet,
+                        &pf.mirror_accounts,
+                        None,
+                        &config,
+                    ) {
+                        Ok(()) => pumpfun.buy_from_target_instruction(
+                            mint,
+                            &pf.user_ata,
+                            &pf.token_program,
+                            &pf.source_wallet,
+                            &pf.mirror_accounts,
+                            target_instruction_data,
+                            &config,
+                        ),
+                        Err(err) => Err(anyhow::anyhow!(
+                            "unsafe direct mirror without bonding curve cache: {}",
+                            err
+                        )),
+                    }
                 }
             } else {
                 Err(anyhow::anyhow!("missing bc cache and target instruction"))
