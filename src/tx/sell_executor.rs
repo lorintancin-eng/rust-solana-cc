@@ -443,11 +443,32 @@ impl SellExecutor {
             .ata_cache
             .get(&position_before_sell.token_mint)
             .unwrap_or_else(|| self.get_token_balance_rpc(&snapshot.user_ata));
-        let token_amount = if position_before_sell.token_amount > 0 {
+        let full_token_amount = if position_before_sell.token_amount > 0 {
             position_before_sell.token_amount.min(current_ata_balance)
         } else {
             current_ata_balance
         };
+
+        // SellSignal.sell_ratio < 1.0 时按比例卖（trailing/TP/migration 部分卖路径）
+        // 至少卖 1 个 raw token 单位，避免 ratio 太小被四舍五入到 0
+        let token_amount = if signal.sell_ratio < 1.0 && full_token_amount > 1 {
+            let raw = (full_token_amount as f64 * signal.sell_ratio.clamp(0.0, 1.0)) as u64;
+            raw.max(1).min(full_token_amount)
+        } else {
+            full_token_amount
+        };
+
+        if token_amount > 0 && token_amount < full_token_amount {
+            info!(
+                "Partial sell [{}] {} | reason={} | ratio={:.2} | tokens={}/{}",
+                signal.group_name,
+                &position_before_sell.token_mint.to_string()[..12],
+                signal.reason,
+                signal.sell_ratio,
+                token_amount,
+                full_token_amount,
+            );
+        }
 
         if token_amount == 0 {
             let zero_balance_skips = self
@@ -784,6 +805,7 @@ impl SellExecutor {
             reason: SellReason::Manual,
             current_price: position.current_price,
             pnl_percent: position.pnl_percent(),
+            sell_ratio: 1.0,
         };
 
         if percent >= 100 {

@@ -1,6 +1,7 @@
 mod autosell;
 mod config;
 mod consensus;
+mod filter;
 mod group_stats;
 mod groups;
 mod grpc;
@@ -25,6 +26,7 @@ use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellReason, SellS
 use config::AppConfig;
 use consensus::engine::{BuySignal, ConsensusTrigger};
 use consensus::ConsensusEngine;
+use filter::{EntryFilters, FilterOutcome};
 use groups::{CopyGroup, GroupManager, ENTRY_MODE_SMART_BUY};
 use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache, GrpcSubscriber};
 use processor::prefetch::PrefetchCache;
@@ -351,6 +353,9 @@ async fn main() -> Result<()> {
     let ata_cache = AtaBalanceCache::new();
     let prefetch_cache = Arc::new(PrefetchCache::new(bc_cache.clone()));
     let bc_fetches: BondingCurveFetches = Arc::new(DashMap::new());
+
+    // 2ev 反向跟单：进场过滤器（仅 SMART_SELL 路径生效，对 SMART_BUY 透明）
+    let entry_filters = EntryFilters::new(bc_cache.clone(), sol_usd.clone());
 
     let tx_sender = Arc::new(TxSender::new(
         config.rpc_url.clone(),
@@ -730,7 +735,29 @@ async fn main() -> Result<()> {
             };
 
             if wants_entry {
-                entry_groups.push(group.clone());
+                // 反向跟单（SMART_SELL）路径：执行 2ev 策略 5 条进场过滤
+                // SMART_BUY 路径保持原行为不过滤，避免影响现有跟单组
+                let filter_pass = if !trade.is_buy && group.buy_on_smart_sell() {
+                    match entry_filters.evaluate(&group, &token_mint, &trade.source_wallet) {
+                        FilterOutcome::Pass => true,
+                        FilterOutcome::Reject(reason) => {
+                            info!(
+                                "Entry filter rejected [{}] {} | wallet={} | {}",
+                                group.name,
+                                &token_mint.to_string()[..12],
+                                &trade.source_wallet.to_string()[..8],
+                                reason,
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+
+                if filter_pass {
+                    entry_groups.push(group.clone());
+                }
             }
 
             if !trade.execution_failed && !trade.is_buy && group.follow_sell_mode() {
@@ -746,6 +773,7 @@ async fn main() -> Result<()> {
                             reason: SellReason::FollowSell,
                             current_price: position.current_price,
                             pnl_percent: position.pnl_percent(),
+                            sell_ratio: 1.0,
                         });
                     }
                 }

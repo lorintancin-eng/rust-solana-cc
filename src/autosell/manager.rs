@@ -13,6 +13,7 @@ use super::persistence;
 use super::position::{Position, PositionKey, PositionState, SellReason, SellSignal};
 use crate::config::AppConfig;
 use crate::grpc::{AccountUpdate, BondingCurveCache};
+use crate::processor::pumpfun::BondingCurveState;
 use crate::utils::sol_price::SolUsdPrice;
 
 const MAX_AUTO_SELL_SIGNAL_ATTEMPTS: u32 = 5;
@@ -274,12 +275,20 @@ impl AutoSellManager {
                                 };
 
                                 let current_price = bc_update.state.price_sol();
-                                if current_price <= 0.0 {
-                                    continue;
+                                if current_price > 0.0 {
+                                    pos.update_price(current_price);
                                 }
 
-                                pos.update_price(current_price);
-                                Self::check_exit_conditions(&pos)
+                                // Migration 优先：bonding curve 完成迁移时立即触发卖出
+                                if let Some(signal) =
+                                    Self::check_migration_exit(&pos, &bc_update.state)
+                                {
+                                    Some(signal)
+                                } else if current_price > 0.0 {
+                                    Self::check_exit_conditions(&pos)
+                                } else {
+                                    None
+                                }
                             };
 
                             if let Some(signal) = signal {
@@ -446,7 +455,9 @@ impl AutoSellManager {
                         };
 
                         let max_hold = pos.group.max_hold_seconds;
-                        if max_hold > 0
+                        // MaxLifetime 早期短路：disable_floor_sell=true 时跳过（2ev 策略"非迁移永不卖"）
+                        if !pos.group.disable_floor_sell
+                            && max_hold > 0
                             && pos.held_seconds() >= max_hold
                             && pos.can_sell()
                             && !pos.max_sell_attempts_reached(MAX_AUTO_SELL_SIGNAL_ATTEMPTS)
@@ -457,13 +468,19 @@ impl AutoSellManager {
                                 reason: SellReason::MaxLifetime,
                                 current_price: pos.current_price,
                                 pnl_percent: pos.pnl_percent(),
+                                sell_ratio: 1.0,
                             })
                         } else if let Some(bc_state) = bc_cache.get(&pos.token_mint) {
                             let price = bc_state.price_sol();
                             if price > 0.0 {
                                 pos.update_price(price);
                             }
-                            Self::check_exit_conditions(&pos)
+                            // Migration 优先于其他出场条件
+                            if let Some(signal) = Self::check_migration_exit(&pos, &bc_state) {
+                                Some(signal)
+                            } else {
+                                Self::check_exit_conditions(&pos)
+                            }
                         } else {
                             None
                         }
@@ -495,11 +512,15 @@ impl AutoSellManager {
         })
     }
 
+    /// 出场条件检查（不含 migration —— migration 由 check_migration_exit 单独处理）
     fn check_exit_conditions(pos: &Position) -> Option<SellSignal> {
         let pnl = pos.pnl_percent();
         let key = pos.key();
+        let floor_disabled = pos.group.disable_floor_sell;
 
-        if pos.group.max_hold_seconds > 0
+        // MaxLifetime：disable_floor_sell=true 时跳过（2ev 策略"非迁移永不卖"）
+        if !floor_disabled
+            && pos.group.max_hold_seconds > 0
             && pos.held_seconds() >= pos.group.max_hold_seconds
             && pos.can_sell()
             && !pos.max_sell_attempts_reached(MAX_AUTO_SELL_SIGNAL_ATTEMPTS)
@@ -510,6 +531,7 @@ impl AutoSellManager {
                 reason: SellReason::MaxLifetime,
                 current_price: pos.current_price,
                 pnl_percent: pnl,
+                sell_ratio: 1.0,
             });
         }
 
@@ -517,16 +539,22 @@ impl AutoSellManager {
             return None;
         }
 
-        if pos.can_check_stop_loss() && pnl <= -pos.group.stop_loss_percent {
+        // StopLoss：disable_floor_sell=true 时跳过
+        if !floor_disabled
+            && pos.can_check_stop_loss()
+            && pnl <= -pos.group.stop_loss_percent
+        {
             return Some(SellSignal {
                 position_key: key,
                 group_name: pos.group.name.clone(),
                 reason: SellReason::StopLoss,
                 current_price: pos.current_price,
                 pnl_percent: pnl,
+                sell_ratio: 1.0,
             });
         }
 
+        // TakeProfit：使用 take_profit_partial_ratio（默认 1.0 = 全卖）
         if pos.can_check_take_profit() && pnl >= pos.group.take_profit_percent {
             return Some(SellSignal {
                 position_key: key,
@@ -534,9 +562,11 @@ impl AutoSellManager {
                 reason: SellReason::TakeProfit,
                 current_price: pos.current_price,
                 pnl_percent: pnl,
+                sell_ratio: pos.group.take_profit_sell_ratio(),
             });
         }
 
+        // TrailingStop：使用 trailing_partial_sell_ratio（默认 1.0 = 全卖）
         if pos.can_check_take_profit()
             && pos.group.trailing_stop_percent > 0.0
             && pos.highest_price > 0.0
@@ -549,9 +579,32 @@ impl AutoSellManager {
                 reason: SellReason::TrailingStop,
                 current_price: pos.current_price,
                 pnl_percent: pnl,
+                sell_ratio: pos.group.trailing_sell_ratio(),
             });
         }
 
         None
+    }
+
+    /// Migration 出场检测：bonding curve `complete` 字段为 true 且组启用了 migration_exit
+    /// 与 check_exit_conditions 平级，由调用方在拥有 BondingCurveState 时调用
+    fn check_migration_exit(pos: &Position, bc_state: &BondingCurveState) -> Option<SellSignal> {
+        if !pos.group.migration_exit_enabled || !bc_state.complete {
+            return None;
+        }
+        if !pos.can_sell() {
+            return None;
+        }
+        if pos.max_sell_attempts_reached(MAX_AUTO_SELL_SIGNAL_ATTEMPTS) {
+            return None;
+        }
+        Some(SellSignal {
+            position_key: pos.key(),
+            group_name: pos.group.name.clone(),
+            reason: SellReason::MigrationCompleted,
+            current_price: pos.current_price,
+            pnl_percent: pos.pnl_percent(),
+            sell_ratio: pos.group.migration_sell_ratio(),
+        })
     }
 }

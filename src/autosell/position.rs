@@ -373,6 +373,8 @@ pub enum SellReason {
     Manual,
     /// 跟聪明钱卖出（目标钱包卖出同一代币时触发）
     FollowSell,
+    /// Pump.fun bonding curve 完成迁移到 PumpSwap/外部 DEX
+    MigrationCompleted,
 }
 
 impl std::fmt::Display for SellReason {
@@ -384,6 +386,7 @@ impl std::fmt::Display for SellReason {
             SellReason::MaxLifetime => write!(f, "MAX_LIFETIME"),
             SellReason::Manual => write!(f, "MANUAL"),
             SellReason::FollowSell => write!(f, "FOLLOW_SELL"),
+            SellReason::MigrationCompleted => write!(f, "MIGRATION_COMPLETED"),
         }
     }
 }
@@ -396,4 +399,26 @@ pub struct SellSignal {
     pub reason: SellReason,
     pub current_price: f64,
     pub pnl_percent: f64,
+    /// 卖出占比 (0.0, 1.0]；1.0 = 全卖（默认行为），<1.0 触发部分卖路径
+    pub sell_ratio: f64,
+}
+
+impl SellSignal {
+    /// 全卖信号（保持旧的默认行为）
+    pub fn full(
+        position_key: PositionKey,
+        group_name: String,
+        reason: SellReason,
+        current_price: f64,
+        pnl_percent: f64,
+    ) -> Self {
+        Self {
+            position_key,
+            group_name,
+            reason,
+            current_price,
+            pnl_percent,
+            sell_ratio: 1.0,
+        }
+    }
 }
