@@ -648,8 +648,20 @@ impl PumpfunProcessor {
             .collect()
     }
 
-    /// 构建 Pump.fun buy 指令
-    /// 使用目标钱包的账户列表，自动检测并替换所有用户特定的账户
+    /// 构建 Pump.fun BUY 指令（输出固定 18 slot，pump.fun 2026.05 IDL）
+    ///
+    /// `mirror_accounts` 可能来自三种来源的 target trade，长度不同：
+    ///   - **新版 BUY**（target_钱包 BUY）：18 个，本函数直接转写
+    ///   - **旧版 BUY**（pre-2026.05）：17 个，缺 creator_authority
+    ///   - **SELL**（反向跟单触发，2ev 卖时我们买）：16 个，layout 与 BUY 不同
+    ///     - SELL: slot 7=system, 8=creator_vault, 9=token_program, 10=event_auth,
+    ///             11=program, 12=fee_config, 13=fee_program, 14=buyback, 15=creator_authority
+    ///     - BUY:  slot 7=system, 8=token_program, 9=creator_vault, 10=event_auth,
+    ///             11=program, 12=global_vol, 13=user_vol, 14=fee_config, 15=fee_program,
+    ///             16=buyback, 17=creator_authority
+    ///
+    /// 不论 source，输出始终是 18-slot BUY layout；自推 global_volume_acc 和
+    /// user_volume_acc（pump.fun 程序按 PDA 校验，我们必须用自己的 user）。
     fn build_buy_instruction_from_mirror(
         &self,
         user: &Pubkey,
@@ -666,22 +678,88 @@ impl PumpfunProcessor {
         data.extend_from_slice(&token_amount.to_le_bytes());
         data.extend_from_slice(&max_sol_cost.to_le_bytes());
 
-        // 替换所有用户特定的账户
+        // 替换用户特定的 PDA（user_volume_accumulator 等）+ slot 5/6 user/ata
         let replaced = Self::replace_user_pdas(mirror_accounts, source_wallet, user, user_ata);
+        let n = replaced.len();
 
-        let accounts: Vec<AccountMeta> = replaced
-            .iter()
-            .enumerate()
-            .map(|(i, acct)| {
-                match i {
-                    6 => AccountMeta::new(*acct, true), // signer
-                    // writable: fee(1), bc(3), abc(4), ata(5), user(6), creator_vault(9),
-                    // user_volume_acc(13), buyback_fee_recipient(16), creator_authority(17)
-                    1 | 3 | 4 | 5 | 9 | 13 | 16 | 17 => AccountMeta::new(*acct, false),
-                    _ => AccountMeta::new_readonly(*acct, false),
-                }
-            })
-            .collect();
+        // 共享字段（SELL / BUY layout slot 0..=4 一致）
+        let global = replaced.get(0).copied().unwrap_or_default();
+        let fee_recipient = replaced.get(1).copied().unwrap_or_default();
+        let mint = replaced.get(2).copied().unwrap_or_default();
+        let bonding_curve = replaced.get(3).copied().unwrap_or_default();
+        let associated_bc = replaced.get(4).copied().unwrap_or_default();
+
+        // user_ata (slot 5) 和 user (slot 6) 已被 replace_user_pdas 替换为我们自己的
+
+        // 按 mirror 长度提取关键字段
+        let (creator_vault, token_program_id, buyback, creator_authority) = match n {
+            // 新版 BUY (18): slot 8=token_program, 9=creator_vault, 16=buyback, 17=creator_authority
+            n if n >= 18 => (
+                replaced[9],
+                replaced[8],
+                replaced[16],
+                replaced[17],
+            ),
+            // 旧版 BUY (17): 同上但无 creator_authority → 必失败但保守占位
+            17 => (
+                replaced[9],
+                replaced[8],
+                Pubkey::from_str(PUMP_BUYBACK_FEE_RECIPIENT).unwrap(),
+                Pubkey::default(),
+            ),
+            // SELL (16): slot 8=creator_vault, 9=token_program, 14=buyback, 15=creator_authority
+            16 => (
+                replaced[8],
+                replaced[9],
+                replaced[14],
+                replaced[15],
+            ),
+            // 其它异常长度：用占位（链上会拒绝，但不 panic）
+            _ => (
+                Pubkey::default(),
+                Pubkey::default(),
+                Pubkey::from_str(PUMP_BUYBACK_FEE_RECIPIENT).unwrap(),
+                Pubkey::default(),
+            ),
+        };
+
+        // 自推导 user 相关 PDA（pump.fun 校验 PDA seeds，必须用我们的 user）
+        let global_volume_accumulator =
+            Pubkey::find_program_address(&[b"global_volume_accumulator"], &program_id).0;
+        let user_volume_accumulator =
+            Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &program_id)
+                .0;
+
+        // 标准 18-slot BUY layout
+        let accounts = vec![
+            AccountMeta::new_readonly(global, false),                                       // 0  global
+            AccountMeta::new(fee_recipient, false),                                          // 1  fee_recipient
+            AccountMeta::new_readonly(mint, false),                                          // 2  mint
+            AccountMeta::new(bonding_curve, false),                                          // 3  bonding_curve
+            AccountMeta::new(associated_bc, false),                                          // 4  associated_bc
+            AccountMeta::new(*user_ata, false),                                              // 5  user_ata
+            AccountMeta::new(*user, true),                                                   // 6  user (signer)
+            AccountMeta::new_readonly(system_program::id(), false),                          // 7  system_program
+            AccountMeta::new_readonly(token_program_id, false),                              // 8  token_program
+            AccountMeta::new(creator_vault, false),                                          // 9  creator_vault
+            AccountMeta::new_readonly(
+                Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(),
+                false,
+            ),                                                                               // 10 event_authority
+            AccountMeta::new_readonly(program_id, false),                                    // 11 program
+            AccountMeta::new(global_volume_accumulator, false),                              // 12 global_volume_acc
+            AccountMeta::new(user_volume_accumulator, false),                                // 13 user_volume_acc
+            AccountMeta::new_readonly(
+                Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(),
+                false,
+            ),                                                                               // 14 fee_config
+            AccountMeta::new_readonly(
+                Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(),
+                false,
+            ),                                                                               // 15 fee_program
+            AccountMeta::new(buyback, false),                                                // 16 buyback_fee_recipient
+            AccountMeta::new(creator_authority, false),                                      // 17 creator_authority
+        ];
 
         Instruction {
             program_id,
