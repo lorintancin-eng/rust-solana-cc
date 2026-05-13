@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 use super::persistence;
 use super::position::{Position, PositionKey, PositionState, SellReason, SellSignal};
 use crate::config::AppConfig;
+use crate::dev_index::DevIndex;
 use crate::grpc::{AccountUpdate, BondingCurveCache};
 use crate::processor::pumpfun::BondingCurveState;
 use crate::utils::sol_price::SolUsdPrice;
@@ -24,6 +25,9 @@ pub struct AutoSellManager {
     bc_cache: BondingCurveCache,
     rpc_client: Arc<RpcClient>,
     sol_usd: SolUsdPrice,
+    /// Optional dev profile index — when present, bonding curve `complete=true`
+    /// transitions trigger `DevIndex.record_migration(mint)` to feed condition ③.
+    dev_index: Option<Arc<DevIndex>>,
 }
 
 impl AutoSellManager {
@@ -39,7 +43,14 @@ impl AutoSellManager {
             bc_cache,
             rpc_client,
             sol_usd,
+            dev_index: None,
         }
+    }
+
+    /// Inject dev profile index. Called from main.rs at startup before
+    /// start_grpc_monitor so migrations are recorded automatically.
+    pub fn set_dev_index(&mut self, dev_index: Arc<DevIndex>) {
+        self.dev_index = Some(dev_index);
     }
 
     fn save(&self) {
@@ -253,6 +264,7 @@ impl AutoSellManager {
         let positions = self.positions.clone();
         let sol_usd = self.sol_usd.clone();
         let bc_cache = self.bc_cache.clone();
+        let dev_index = self.dev_index.clone();
 
         tokio::spawn(async move {
             info!("Auto-sell monitor started (group-aware)");
@@ -261,6 +273,22 @@ impl AutoSellManager {
                 match update {
                     AccountUpdate::BondingCurve(bc_update) => {
                         let mint = bc_update.mint;
+
+                        // 反馈给 dev_index：
+                        //   (1) creator 已知 → 记录 dev created（幂等）
+                        //   (2) complete=true → 记录 dev migrated（幂等）
+                        if let Some(idx) = &dev_index {
+                            if let Some(creator) = bc_update.state.creator {
+                                if let Err(e) = idx.record_creation(creator, mint) {
+                                    debug!("dev_index.record_creation: {}", e);
+                                }
+                            }
+                            if bc_update.state.complete {
+                                if let Err(e) = idx.record_migration(mint) {
+                                    debug!("dev_index.record_migration: {}", e);
+                                }
+                            }
+                        }
                         let keys: Vec<PositionKey> = positions
                             .iter()
                             .filter(|entry| entry.key().token_mint == mint)

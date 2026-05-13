@@ -1,6 +1,6 @@
 [package]
 name = "solana-copy-trader"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2021"
 description = "High-performance Solana copy-trading bot in Rust"
 
@@ -53,6 +53,9 @@ borsh = "1"
 
 # Async trait for processor interface
 async-trait = "0.1"
+
+# Embedded KV store for dev profile index (2ev strategy condition 3/4/5)
+sled = "0.34"
 
 [profile.release]
 opt-level = 3

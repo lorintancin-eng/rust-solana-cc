@@ -1,6 +1,7 @@
 mod autosell;
 mod config;
 mod consensus;
+mod dev_index;
 mod filter;
 mod group_stats;
 mod groups;
@@ -26,6 +27,8 @@ use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellReason, SellS
 use config::AppConfig;
 use consensus::engine::{BuySignal, ConsensusTrigger};
 use consensus::ConsensusEngine;
+use dev_index::{backfill as dev_backfill, DevIndex};
+use filter::dev_profile::DevProvider;
 use filter::{EntryFilters, FilterOutcome};
 use groups::{CopyGroup, GroupManager, ENTRY_MODE_SMART_BUY};
 use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache, GrpcSubscriber};
@@ -355,9 +358,31 @@ async fn main() -> Result<()> {
     let bc_fetches: BondingCurveFetches = Arc::new(DashMap::new());
 
     // 2ev 反向跟单：进场过滤器（仅 SMART_SELL 路径生效，对 SMART_BUY 透明）
-    // dev_provider 当前为 stub（永远 Pass）；接入真实数据源时改这一行的 .with_dev_provider(...)
-    let entry_filters =
-        EntryFilters::new(bc_cache.clone(), sol_usd.clone(), rpc_client.clone());
+    // 本地 dev 索引：sled 路径 ./dev_index/，启动后自动 spawn 48h 历史回扫。
+    let dev_index = match DevIndex::open("./dev_index") {
+        Ok(idx) => Some(Arc::new(idx)),
+        Err(err) => {
+            warn!("DevIndex open failed: {}; dev filter will be disabled", err);
+            None
+        }
+    };
+    let entry_filters = {
+        let base = EntryFilters::new(bc_cache.clone(), sol_usd.clone(), rpc_client.clone());
+        match dev_index.as_ref() {
+            Some(idx) => base.with_dev_provider(DevProvider::local_index(idx.clone())),
+            None => base,
+        }
+    };
+
+    if let Some(idx) = dev_index.as_ref() {
+        // 48h 历史回扫：异步、不阻塞启动；标记 `_meta:backfill_done` 防重复
+        dev_backfill::spawn_backfill(idx.clone(), rpc_client.clone());
+        info!(
+            "DevIndex active: total_devs={} | backfill_done={}",
+            idx.total_devs(),
+            idx.is_backfill_done()
+        );
+    }
 
     let tx_sender = Arc::new(TxSender::new(
         config.rpc_url.clone(),
@@ -373,12 +398,18 @@ async fn main() -> Result<()> {
     let consensus_engine = Arc::new(ConsensusEngine::new());
     let _cleanup_task = consensus_engine.start_cleanup_task();
 
-    let auto_sell_manager = Arc::new(AutoSellManager::new(
-        config.clone(),
-        bc_cache.clone(),
-        rpc_client.clone(),
-        sol_usd.clone(),
-    ));
+    let auto_sell_manager = {
+        let mut mgr = AutoSellManager::new(
+            config.clone(),
+            bc_cache.clone(),
+            rpc_client.clone(),
+            sol_usd.clone(),
+        );
+        if let Some(idx) = dev_index.as_ref() {
+            mgr.set_dev_index(idx.clone());
+        }
+        Arc::new(mgr)
+    };
 
     let is_running = Arc::new(AtomicBool::new(false));
     let tg_stats = Arc::new(TgStats::new());

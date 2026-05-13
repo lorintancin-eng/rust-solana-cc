@@ -16,12 +16,15 @@
 //!
 //! 当前 stub 行为：永远 Pass（不阻塞实测）。接入真实 provider 后过滤才生效。
 
+use std::sync::Arc;
+
 use solana_sdk::pubkey::Pubkey;
 
 use super::FilterOutcome;
+use crate::dev_index::{DevIndex, DevStats as IndexDevStats};
 use crate::groups::CopyGroup;
 
-/// dev 钱包画像统计
+/// dev 钱包画像统计（filter 层使用，与 dev_index::DevStats 等价）
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DevStats {
     /// 已毕业的 token 数（migrated to PumpSwap/Raydium）
@@ -32,18 +35,24 @@ pub struct DevStats {
     pub twitter_bound: u32,
 }
 
+impl From<IndexDevStats> for DevStats {
+    fn from(s: IndexDevStats) -> Self {
+        Self {
+            open_count: s.open_count,
+            created_count: s.created_count,
+            twitter_bound: s.twitter_bound,
+        }
+    }
+}
+
 /// dev 数据源抽象。
-/// 内部用 enum 而不是 trait object，避免动态分发开销；后续接入真实数据源时
-/// 在此 enum 加新 variant 即可。
+/// 内部用 enum 而不是 trait object，避免动态分发开销。
 #[derive(Clone)]
 pub enum DevProvider {
     /// 无数据源 - `lookup` 永远返回 None，filter 永远 Pass
     Stub,
-    // 未来接入数据源时按需添加 variant：
-    // Gmgn(GmgnClient),
-    // BullX(BullxClient),
-    // LocalIndex(Arc<DevIndex>),
-    // Helius(HeliusClient),
+    /// 本地 sled 索引（pump.fun create 实时 + 48h 历史回扫）
+    LocalIndex(Arc<DevIndex>),
 }
 
 impl DevProvider {
@@ -52,10 +61,16 @@ impl DevProvider {
         Self::Stub
     }
 
+    /// 本地索引数据源
+    pub fn local_index(dev_index: Arc<DevIndex>) -> Self {
+        Self::LocalIndex(dev_index)
+    }
+
     /// 查询 dev 画像。返回 None 表示数据不可用（filter 应默认 Pass）。
-    pub fn lookup(&self, _dev: &Pubkey) -> Option<DevStats> {
+    pub fn lookup(&self, dev: &Pubkey) -> Option<DevStats> {
         match self {
             Self::Stub => None,
+            Self::LocalIndex(idx) => idx.lookup(dev).map(DevStats::from),
         }
     }
 }

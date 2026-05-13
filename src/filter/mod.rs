@@ -12,9 +12,9 @@
 //!
 //! 配置任意一项才会启用对应过滤；全 None/false 时整体相当于关闭，无开销。
 
-mod dev_profile;
+pub mod dev_profile;
 mod mcap;
-mod metadata;
+pub(crate) mod metadata;
 mod social;
 
 use std::sync::Arc;
