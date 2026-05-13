@@ -778,6 +778,25 @@ async fn main() -> Result<()> {
             };
 
             if wants_entry {
+                // WrapperCpi pre-exec 阶段无 inner_instructions（meta=None），
+                // 无法提取 16-slot SELL mirror。pump.fun 2026.05 升级后，没有
+                // mirror 就无法构造合法 BUY（缺 creator_authority）。直接跳过
+                // 该 trade 的 buy，让 landed phase 同 sig 重新触发（届时 meta
+                // 已就绪，inner CPI accounts 可用）。
+                if !trade.is_buy
+                    && group.buy_on_smart_sell()
+                    && trade.is_pre_execution
+                    && trade.trade_origin.is_wrapper_cpi()
+                    && trade.instruction_accounts.is_empty()
+                {
+                    debug!(
+                        "Skip pre-exec wrapper reverse buy [{}] {}: mirror empty, waiting for landed phase",
+                        group.name,
+                        &token_mint.to_string()[..12]
+                    );
+                    continue;
+                }
+
                 // 反向跟单（SMART_SELL）路径：执行 2ev 策略 5 条进场过滤
                 // SMART_BUY 路径保持原行为不过滤，避免影响现有跟单组
                 let filter_pass = if !trade.is_buy && group.buy_on_smart_sell() {
