@@ -355,7 +355,9 @@ async fn main() -> Result<()> {
     let bc_fetches: BondingCurveFetches = Arc::new(DashMap::new());
 
     // 2ev 反向跟单：进场过滤器（仅 SMART_SELL 路径生效，对 SMART_BUY 透明）
-    let entry_filters = EntryFilters::new(bc_cache.clone(), sol_usd.clone());
+    // dev_provider 当前为 stub（永远 Pass）；接入真实数据源时改这一行的 .with_dev_provider(...)
+    let entry_filters =
+        EntryFilters::new(bc_cache.clone(), sol_usd.clone(), rpc_client.clone());
 
     let tx_sender = Arc::new(TxSender::new(
         config.rpc_url.clone(),
@@ -784,7 +786,7 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        for group in entry_groups {
+        for mut group in entry_groups {
             let target_instruction_data = if group.entry_mode == ENTRY_MODE_SMART_BUY {
                 trade.instruction_data.clone()
             } else {
@@ -795,6 +797,24 @@ async fn main() -> Result<()> {
                 && trade.sol_amount_lamports < group.min_target_buy_lamports()
             {
                 continue;
+            }
+
+            // USD 计价覆写：buy_usd_amount = Some(X) 时按实时 SOL/USD 折算
+            // SOL 计价（buy_usd_amount = None）保持原行为
+            if let Some(_usd) = group.buy_usd_amount {
+                let sol_price = sol_usd.get();
+                let effective_sol = group.effective_buy_sol_amount(sol_price);
+                if effective_sol > 0.0 && (effective_sol - group.buy_sol_amount).abs() > 1e-9 {
+                    debug!(
+                        "USD->SOL convert [{}]: ${} / ${:.2} = {:.4} SOL (was {:.4})",
+                        group.name,
+                        group.buy_usd_amount.unwrap_or(0.0),
+                        sol_price,
+                        effective_sol,
+                        group.buy_sol_amount,
+                    );
+                    group.buy_sol_amount = effective_sol;
+                }
             }
 
             if group.consensus_min_wallets <= 1 {

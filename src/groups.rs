@@ -63,6 +63,9 @@ pub struct CopyGroup {
     pub take_profit_partial_ratio: f64,
     /// 出场扩展：migration 触发时卖出占比 (0.0, 1.0]。1.0 = 全卖（默认）。
     pub migration_exit_partial_ratio: f64,
+    /// USD 计价单笔仓位。Some 时**覆盖** `buy_sol_amount`，按 SolUsdPrice 实时折算。
+    /// None = 仍用 SOL 计价（旧组保持原行为）。
+    pub buy_usd_amount: Option<f64>,
 }
 
 impl CopyGroup {
@@ -98,11 +101,34 @@ impl CopyGroup {
             trailing_partial_sell_ratio: 1.0,
             take_profit_partial_ratio: 1.0,
             migration_exit_partial_ratio: 1.0,
+            buy_usd_amount: None,
         }
     }
 
     pub fn buy_lamports(&self) -> u64 {
         (self.buy_sol_amount * 1_000_000_000.0) as u64
+    }
+
+    /// 根据当前 SOL/USD 价格计算实际下单的 SOL 数（lamports）：
+    /// - `buy_usd_amount = Some(x)` 且 sol_usd_price > 0 → `x / sol_usd_price * 1e9`
+    /// - 否则回退到 `buy_lamports()`
+    pub fn effective_buy_lamports(&self, sol_usd_price: f64) -> u64 {
+        if let Some(usd) = self.buy_usd_amount {
+            if usd > 0.0 && sol_usd_price > 0.0 {
+                return ((usd / sol_usd_price) * 1_000_000_000.0) as u64;
+            }
+        }
+        self.buy_lamports()
+    }
+
+    /// 根据当前 SOL/USD 价格反推 `buy_sol_amount` 等价值（SOL）
+    pub fn effective_buy_sol_amount(&self, sol_usd_price: f64) -> f64 {
+        if let Some(usd) = self.buy_usd_amount {
+            if usd > 0.0 && sol_usd_price > 0.0 {
+                return usd / sol_usd_price;
+            }
+        }
+        self.buy_sol_amount
     }
 
     pub fn min_target_buy_lamports(&self) -> u64 {
@@ -224,6 +250,8 @@ struct PersistedGroup {
     take_profit_partial_ratio: f64,
     #[serde(default = "default_partial_ratio")]
     migration_exit_partial_ratio: f64,
+    #[serde(default)]
+    buy_usd_amount: Option<f64>,
 }
 
 fn default_partial_ratio() -> f64 {
@@ -271,6 +299,7 @@ impl PersistedGroup {
             trailing_partial_sell_ratio: group.trailing_partial_sell_ratio,
             take_profit_partial_ratio: group.take_profit_partial_ratio,
             migration_exit_partial_ratio: group.migration_exit_partial_ratio,
+            buy_usd_amount: group.buy_usd_amount,
         }
     }
 
@@ -315,6 +344,7 @@ impl PersistedGroup {
             trailing_partial_sell_ratio: self.trailing_partial_sell_ratio,
             take_profit_partial_ratio: self.take_profit_partial_ratio,
             migration_exit_partial_ratio: self.migration_exit_partial_ratio,
+            buy_usd_amount: self.buy_usd_amount,
         })
     }
 }

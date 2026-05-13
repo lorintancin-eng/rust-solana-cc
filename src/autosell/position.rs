@@ -88,6 +88,16 @@ pub struct Position {
     // 重试计数
     pub sell_attempts: u32,
     pub zero_balance_sell_skips: u32,
+
+    // ============================================
+    // 部分卖 / migration 跟踪（2ev 反向跟单策略）
+    // ============================================
+    /// 已发生的部分卖次数（用于上限保护）
+    pub partial_sell_count: u32,
+    /// 上次部分卖时间戳（用于 trailing/TP 冷却）
+    pub last_partial_sell_at: Option<Instant>,
+    /// 上次 migration_exit 触发时间戳（用于 migration 信号去重）
+    pub last_migration_signal_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -126,6 +136,9 @@ impl Position {
             pre_buy_ata_balance,
             sell_attempts: 0,
             zero_balance_sell_skips: 0,
+            partial_sell_count: 0,
+            last_partial_sell_at: None,
+            last_migration_signal_at: None,
         }
     }
 
@@ -297,6 +310,13 @@ impl Position {
             return false;
         }
         self.token_amount = self.token_amount.saturating_sub(sold_amount);
+        self.partial_sell_count = self.partial_sell_count.saturating_add(1);
+        self.last_partial_sell_at = Some(Instant::now());
+        // 重置 ATH 锚点到当前价：
+        // 避免 trailing/TP 触发部分卖后，下一个 tick 因为 drawdown 还在阈值上
+        // 立即再次触发，等同于"分多次全卖"，与文档"卖 1/2~2/3 留剩余博更高 ATH"
+        // 语义不符。重置后 drawdown 回到 0，等价格创新高后再重新计算回撤。
+        self.highest_price = self.current_price;
         self.state = PositionState::Active;
         true
     }

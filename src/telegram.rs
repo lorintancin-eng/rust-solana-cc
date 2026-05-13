@@ -1419,6 +1419,14 @@ fn apply_group_setting_value(
                     None => "入场市值上限 = 关闭".to_string(),
                 }
             }),
+        "buy_usd" | "buy_dollar" | "usd" => parse_optional_f64(value)
+            .map(|v| {
+                group.buy_usd_amount = v;
+                match v {
+                    Some(usd) => format!("单笔仓位 = ${}（按实时 SOL 价折算）", usd),
+                    None => "单笔仓位回到 SOL 计价（buy_sol_amount）".to_string(),
+                }
+            }),
         "require_social" | "social" => parse_bool_flag(value).map(|enabled| {
             group.require_social_link = enabled;
             format!("要求社交链接 = {}", if enabled { "开" } else { "关" })
@@ -1585,6 +1593,7 @@ fn setting_label(key: &str) -> &'static str {
         "mode" => "卖出模式",
         // 2ev 策略字段
         "max_mc" | "max_mcap" | "mcap_limit" => "入场市值上限(USD)",
+        "buy_usd" | "buy_dollar" | "usd" => "单笔仓位(USD)",
         "require_social" | "social" => "要求社交链接",
         "dev_open" | "dev_max_open" => "dev 历史毕业上限",
         "dev_created" | "dev_max_created" => "dev 总创建上限",
@@ -2154,6 +2163,73 @@ fn format_group_detail_v2(group: &CopyGroup, selected: bool) -> String {
         group.tip_sell_lamports,
         group.zero_slot_tip_lamports,
     );
+
+    // 2ev 反向跟单策略字段（仅在启用任一项时显示，避免常规组冗长）
+    let has_strategy_config = group.max_entry_mcap_usd.is_some()
+        || group.require_social_link
+        || group.dev_max_open_count.is_some()
+        || group.dev_max_created_count.is_some()
+        || group.dev_max_twitter_bound.is_some()
+        || group.disable_floor_sell
+        || group.migration_exit_enabled
+        || group.trailing_partial_sell_ratio < 1.0
+        || group.take_profit_partial_ratio < 1.0
+        || group.migration_exit_partial_ratio < 1.0
+        || group.buy_usd_amount.is_some();
+    if has_strategy_config {
+        text.push_str("\n\n<b>2ev 策略配置</b>");
+        if let Some(usd) = group.buy_usd_amount {
+            text.push_str(&format!("\n单笔仓位(USD)：${}", usd));
+        }
+        if let Some(mc) = group.max_entry_mcap_usd {
+            text.push_str(&format!("\n入场市值上限：${}", mc));
+        }
+        if group.require_social_link {
+            text.push_str("\n要求社交链接：开 ⚠️(底层 TODO，未生效)");
+        }
+        if let Some(n) = group.dev_max_open_count {
+            text.push_str(&format!(
+                "\ndev 历史毕业上限：{} ⚠️(底层 TODO，未生效)",
+                n
+            ));
+        }
+        if let Some(n) = group.dev_max_created_count {
+            text.push_str(&format!(
+                "\ndev 总创建上限：{} ⚠️(底层 TODO，未生效)",
+                n
+            ));
+        }
+        if let Some(n) = group.dev_max_twitter_bound {
+            text.push_str(&format!(
+                "\ndev 推特绑币上限：{} ⚠️(底层 TODO，未生效)",
+                n
+            ));
+        }
+        if group.disable_floor_sell {
+            text.push_str("\n禁用价格强卖：开（非迁移永不卖）");
+        }
+        if group.migration_exit_enabled {
+            text.push_str("\n迁移完成卖出：开");
+        }
+        if group.trailing_partial_sell_ratio < 1.0 {
+            text.push_str(&format!(
+                "\ntrailing 卖出比例：{:.2}",
+                group.trailing_partial_sell_ratio
+            ));
+        }
+        if group.take_profit_partial_ratio < 1.0 {
+            text.push_str(&format!(
+                "\n止盈卖出比例：{:.2}",
+                group.take_profit_partial_ratio
+            ));
+        }
+        if group.migration_exit_partial_ratio < 1.0 {
+            text.push_str(&format!(
+                "\n迁移卖出比例：{:.2}",
+                group.migration_exit_partial_ratio
+            ));
+        }
+    }
 
     if group.wallets.is_empty() {
         text.push_str("\n监听钱包：暂无");

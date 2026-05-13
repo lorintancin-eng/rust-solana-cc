@@ -14,13 +14,19 @@
 
 mod dev_profile;
 mod mcap;
+mod metadata;
 mod social;
 
+use std::sync::Arc;
+
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::groups::CopyGroup;
 use crate::grpc::BondingCurveCache;
 use crate::utils::sol_price::SolUsdPrice;
+
+pub use social::SocialCache;
 
 /// 单个 trade 是否通过 5 条进场过滤
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,16 +48,37 @@ impl FilterOutcome {
 pub struct EntryFilters {
     bc_cache: BondingCurveCache,
     sol_usd: SolUsdPrice,
+    rpc_client: Arc<RpcClient>,
+    social_cache: SocialCache,
+    dev_provider: Arc<dev_profile::DevProvider>,
 }
 
 impl EntryFilters {
-    pub fn new(bc_cache: BondingCurveCache, sol_usd: SolUsdPrice) -> Self {
-        Self { bc_cache, sol_usd }
+    pub fn new(
+        bc_cache: BondingCurveCache,
+        sol_usd: SolUsdPrice,
+        rpc_client: Arc<RpcClient>,
+    ) -> Self {
+        Self {
+            bc_cache,
+            sol_usd,
+            rpc_client,
+            social_cache: SocialCache::new(),
+            // 默认 stub 实现（永远 Pass）；通过 with_dev_provider 替换为真实数据源
+            dev_provider: Arc::new(dev_profile::DevProvider::stub()),
+        }
+    }
+
+    /// 注入真实的 dev 数据源（GMGN / BullX / 自建索引等）。
+    /// 替换后 dev_profile::check 会用注入的 provider 评估。
+    pub fn with_dev_provider(mut self, provider: dev_profile::DevProvider) -> Self {
+        self.dev_provider = Arc::new(provider);
+        self
     }
 
     /// 评估单个 trade 是否通过 group 配置的全部过滤项。
     /// 任何一项拒绝即整体拒绝。
-    /// 数据缺失（如 BondingCurveCache 还没填充）时该项默认通过 —— 抢入路径优先。
+    /// 数据缺失时该项默认通过 —— 抢入路径优先。
     pub fn evaluate(
         &self,
         group: &CopyGroup,
@@ -67,13 +94,19 @@ impl EntryFilters {
         }
 
         if group.require_social_link {
-            if let FilterOutcome::Reject(reason) = social::check(group, mint) {
+            // 触发异步预热（已缓存则空操作）
+            social::spawn_prefetch(*mint, self.rpc_client.clone(), self.social_cache.clone());
+            if let FilterOutcome::Reject(reason) =
+                social::check(group, mint, &self.social_cache)
+            {
                 return FilterOutcome::Reject(reason);
             }
         }
 
         if group.has_dev_filter() {
-            if let FilterOutcome::Reject(reason) = dev_profile::check(group, source_wallet) {
+            if let FilterOutcome::Reject(reason) =
+                dev_profile::check(group, source_wallet, &self.dev_provider)
+            {
                 return FilterOutcome::Reject(reason);
             }
         }

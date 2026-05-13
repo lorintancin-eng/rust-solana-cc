@@ -5,7 +5,7 @@ use spl_associated_token_account::get_associated_token_address;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -283,6 +283,7 @@ impl AutoSellManager {
                                 if let Some(signal) =
                                     Self::check_migration_exit(&pos, &bc_update.state)
                                 {
+                                    pos.last_migration_signal_at = Some(Instant::now());
                                     Some(signal)
                                 } else if current_price > 0.0 {
                                     Self::check_exit_conditions(&pos)
@@ -477,6 +478,7 @@ impl AutoSellManager {
                             }
                             // Migration 优先于其他出场条件
                             if let Some(signal) = Self::check_migration_exit(&pos, &bc_state) {
+                                pos.last_migration_signal_at = Some(Instant::now());
                                 Some(signal)
                             } else {
                                 Self::check_exit_conditions(&pos)
@@ -588,6 +590,7 @@ impl AutoSellManager {
 
     /// Migration 出场检测：bonding curve `complete` 字段为 true 且组启用了 migration_exit
     /// 与 check_exit_conditions 平级，由调用方在拥有 BondingCurveState 时调用
+    /// 冷却 30 秒避免 complete=true 后被持续刷新的账户事件反复触发
     fn check_migration_exit(pos: &Position, bc_state: &BondingCurveState) -> Option<SellSignal> {
         if !pos.group.migration_exit_enabled || !bc_state.complete {
             return None;
@@ -597,6 +600,12 @@ impl AutoSellManager {
         }
         if pos.max_sell_attempts_reached(MAX_AUTO_SELL_SIGNAL_ATTEMPTS) {
             return None;
+        }
+        // 冷却：同一仓位 30 秒内不重复发 migration 信号
+        if let Some(last) = pos.last_migration_signal_at {
+            if last.elapsed() < std::time::Duration::from_secs(30) {
+                return None;
+            }
         }
         Some(SellSignal {
             position_key: pos.key(),
