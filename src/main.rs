@@ -411,7 +411,17 @@ async fn main() -> Result<()> {
         Arc::new(mgr)
     };
 
-    let is_running = Arc::new(AtomicBool::new(false));
+    // AUTO_START=true 时跳过 /start 等待，bot 启动后立即接收 trade。
+    // 默认 false（保留 /start 安全门）；远程运维场景可设 true 让 systemd/nohup
+    // 重启后自动恢复 running 状态。
+    let auto_start = std::env::var("AUTO_START")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let is_running = Arc::new(AtomicBool::new(auto_start));
+    if auto_start {
+        info!("AUTO_START=true → 主循环已自动激活（无需 /start）");
+    }
     let tg_stats = Arc::new(TgStats::new());
 
     let account_subscriber = Arc::new(AccountSubscriber::new(
