@@ -165,9 +165,11 @@ impl DevIndex {
 
     fn bump_dev<F>(&self, dev: &Pubkey, mutator: F) -> Result<()>
     where
-        F: FnOnce(&mut DevStats),
+        F: Fn(&mut DevStats),
     {
         let key = dev_key(dev);
+        // sled `update_and_fetch` closure is FnMut and may be called multiple times
+        // under contention, so `mutator` must be Fn (callable repeatedly).
         let updated = self.db.update_and_fetch(&key, |old| {
             let mut stats: DevStats = old
                 .and_then(|b| serde_json::from_slice(b).ok())

@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient;
-use solana_client::rpc_config::{RpcTransactionConfig, GetConfirmedSignaturesForAddress2Config};
+use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+use solana_client::rpc_config::RpcTransactionConfig;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
