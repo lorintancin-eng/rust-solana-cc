@@ -719,16 +719,44 @@ impl GrpcSubscriber {
             spl_associated_token_account::get_associated_token_address(&source_wallet, &wsol_mint);
         let is_buy = account_keys.contains(&wsol_ata);
 
-        // 构建 instruction_accounts（从 account_keys 中提取 Pump.fun 相关账户）
-        // CPI 场景下无法精确还原 instruction 的 account 顺序
-        // 用完整 account_keys 传递给后续处理器
+        // 从 meta.inner_instructions 提取 Pump.fun CPI 指令的 accounts。
+        // 反向跟单需要这些 mirror accounts 才能正确组装我们的 BUY 指令
+        // （pump.fun 2026.05 升级后，creator_authority 等新字段必须从 mirror 透传）。
+        let mut instruction_accounts: Vec<Pubkey> = Vec::new();
+        let mut instruction_data: Vec<u8> = Vec::new();
+        if let Some(m) = meta {
+            'outer: for inner_group in &m.inner_instructions {
+                for ix in &inner_group.instructions {
+                    let prog_idx = ix.program_id_index as usize;
+                    let Some(prog) = account_keys.get(prog_idx) else {
+                        continue;
+                    };
+                    if *prog != pumpfun_pubkey {
+                        continue;
+                    }
+                    // 找到 Pump.fun CPI 指令，提取其 accounts
+                    let accs: Vec<Pubkey> = ix
+                        .accounts
+                        .iter()
+                        .filter_map(|&idx| account_keys.get(idx as usize).copied())
+                        .collect();
+                    if accs.len() == ix.accounts.len() && !accs.is_empty() {
+                        instruction_accounts = accs;
+                        instruction_data = ix.data.clone();
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
         info!(
-            "CPI DETECTED: Pump.fun {} via wrapper | wallet: {}..{} | mint: {} | tp: {} | sig: {}..{}",
+            "CPI DETECTED: Pump.fun {} via wrapper | wallet: {}..{} | mint: {} | tp: {} | accs: {} | sig: {}..{}",
             if is_buy { "BUY" } else { "SELL" },
             &source_wallet.to_string()[..4],
             &source_wallet.to_string()[source_wallet.to_string().len() - 4..],
             mint,
             &detected_token_program.to_string()[..12],
+            instruction_accounts.len(),
             &signature[..8],
             &signature[signature.len() - 4..],
         );
@@ -740,8 +768,8 @@ impl GrpcSubscriber {
             trade_origin: TradeOrigin::WrapperCpi,
             is_buy,
             program_id: pumpfun_pubkey,
-            instruction_data: Vec::new(), // CPI 场景无法提取 Pump.fun 指令数据
-            instruction_accounts: Vec::new(),
+            instruction_data, // 现在从 inner CPI 提取
+            instruction_accounts,
             all_account_keys: account_keys.to_vec(),
             detected_at: recv_time,
             sol_amount_lamports: 0, // CPI 场景无法提取 SOL 金额

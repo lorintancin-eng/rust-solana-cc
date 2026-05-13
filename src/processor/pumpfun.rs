@@ -322,16 +322,24 @@ impl PumpfunProcessor {
         curve_state: Option<&BondingCurveState>,
         config: &AppConfig,
     ) -> Result<()> {
-        if mirror_accounts.len() != PUMPFUN_BUY_ACCOUNT_LABELS.len() {
+        // build_buy_instruction_from_mirror 已支持 16/17/18 slot 多种 layout
+        // （SELL mirror=16, 旧 BUY=17, 新 BUY=18）。校验只要≥16 就放行。
+        if mirror_accounts.len() < 16 {
             anyhow::bail!(
-                "unexpected direct mirror account count: expected {}, got {}",
-                PUMPFUN_BUY_ACCOUNT_LABELS.len(),
+                "mirror account count too small: got {} (need >=16)",
                 mirror_accounts.len()
             );
         }
 
         let replaced =
             Self::replace_user_pdas(mirror_accounts, source_wallet, &config.pubkey, user_ata);
+
+        // expected layout（18-slot 新 BUY）对比只在 mirror 也是 18-slot 时有意义。
+        // 16-slot SELL mirror 和 17-slot 旧 BUY mirror 的 slot 顺序与 expected 不同，
+        // 直接放行交给 build_buy_instruction_from_mirror 转换。
+        if mirror_accounts.len() != 18 {
+            return Ok(());
+        }
 
         if let Some(curve_state) = curve_state {
             let expected = self.build_buy_account_keys_standard(

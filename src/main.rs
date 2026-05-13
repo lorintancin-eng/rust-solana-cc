@@ -1082,7 +1082,10 @@ async fn execute_buy(
         if let Some(ref pf) = prefetched {
             if let Some(bc_state) = bc_state.clone() {
                 let token_amount = bc_state.sol_to_token_quote(buy_lamports);
-                if pf.mirror_accounts.is_empty() || !trade_origin.uses_mirror_accounts() {
+                // pump.fun 2026.05 升级后，native standard path 输出 17-slot 旧 layout
+                // 会被链上拒绝（缺 creator_authority）。只要有 mirror_accounts 就走
+                // mirror path（build_buy_instruction_from_mirror 已支持 16/17/18 slot）。
+                if pf.mirror_accounts.is_empty() {
                     pumpfun
                         .buy_standard_from_cached_state(
                             mint,
