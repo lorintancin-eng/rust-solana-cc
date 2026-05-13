@@ -27,6 +27,10 @@ const PUMP_FEE_PROGRAM: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 // 已验证正确地址: 8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt
 const PUMP_FEE_CONFIG_PDA: &str = "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt";
 
+/// Pump.fun 2026.05 协议升级新增的 buyback fee recipient（写入 slot 16）
+/// 替换了旧版的 bonding_curve_v2 PDA 位置。
+const PUMP_BUYBACK_FEE_RECIPIENT: &str = "8RskugtjeMFSPoSQjQcBt3eafaJ1o29EP23E9vMx6et9";
+
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
 const MAYHEM_FEE_RECIPIENTS: [&str; 8] = [
@@ -56,7 +60,11 @@ const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 const INIT_UVA_DISCRIMINATOR: [u8; 8] = [94, 6, 202, 115, 255, 96, 232, 183];
 // extend discriminator (扩展旧格式 bonding curve)
 const EXTEND_DISCRIMINATOR: [u8; 8] = [234, 102, 194, 203, 150, 72, 62, 229];
-const PUMPFUN_BUY_ACCOUNT_LABELS: [&str; 17] = [
+/// Pump.fun 2026.05 协议升级后的 BUY 指令账户列表（18 个）。
+///   slot 16 由 bonding_curve_v2 改为 buyback_fee_recipient（常量）。
+///   slot 17 新增 creator_authority（per-token dev wallet，bonding curve
+///   data 中不存放，必须从 target 的 mirror_accounts 透传）。
+const PUMPFUN_BUY_ACCOUNT_LABELS: [&str; 18] = [
     "global",
     "fee_recipient",
     "mint",
@@ -73,8 +81,18 @@ const PUMPFUN_BUY_ACCOUNT_LABELS: [&str; 17] = [
     "user_volume_accumulator",
     "fee_config",
     "fee_program",
-    "bonding_curve_v2",
+    "buyback_fee_recipient",
+    "creator_authority",
 ];
+
+/// 校验时跳过的 slot：这些字段不能从 cached_state 自构建，必须信任 mirror。
+///   slot 9 (creator_vault)     —— pump.fun 2026.05 协议升级后，creator_vault PDA
+///                                 的 seed 不再是 bonding_curve.creator，而是新的
+///                                 dev wallet（slot 17 提供）。我们没有独立数据源
+///                                 推导这个 PDA，所以直接信任 mirror。
+///   slot 17 (creator_authority) —— per-token dev wallet，bonding curve data 中
+///                                 不存放，必须信任 mirror。
+const PUMPFUN_BUY_MIRROR_TRUSTED_SLOTS: &[usize] = &[9, 17];
 
 /// Pump.fun 标准总供应量: 10 亿 tokens
 pub const PUMP_TOTAL_SUPPLY: f64 = 1_000_000_000.0;
@@ -197,11 +215,22 @@ fn first_pubkey_mismatch(
     actual: &[Pubkey],
     expected: &[Pubkey],
 ) -> Option<(usize, Pubkey, Pubkey)> {
+    first_pubkey_mismatch_skipping(actual, expected, &[])
+}
+
+fn first_pubkey_mismatch_skipping(
+    actual: &[Pubkey],
+    expected: &[Pubkey],
+    skip: &[usize],
+) -> Option<(usize, Pubkey, Pubkey)> {
     actual
         .iter()
         .zip(expected.iter())
         .enumerate()
         .find_map(|(index, (actual_key, expected_key))| {
+            if skip.contains(&index) {
+                return None;
+            }
             if actual_key != expected_key {
                 Some((index, *actual_key, *expected_key))
             } else {
@@ -236,7 +265,7 @@ impl PumpfunProcessor {
         user_ata: &Pubkey,
         token_program_id: &Pubkey,
         curve_state: &BondingCurveState,
-    ) -> Result<[Pubkey; 17]> {
+    ) -> Result<[Pubkey; 18]> {
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
         let fee_recipient = self.select_fee_recipient(curve_state)?;
         let creator = curve_state
@@ -250,6 +279,9 @@ impl PumpfunProcessor {
                 mint,
                 token_program_id,
             );
+        // creator_vault: 2026.05 协议升级后，PDA seed 不再是 bonding_curve.creator，
+        // 而是 slot 17 的 dev wallet（mirror 提供）。这里用旧 seed 推导只为占位，
+        // 校验时通过 PUMPFUN_BUY_MIRROR_TRUSTED_SLOTS 跳过该 slot 的对比。
         let creator_vault =
             Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &program_id).0;
         let global_volume_accumulator =
@@ -257,8 +289,6 @@ impl PumpfunProcessor {
         let user_volume_accumulator =
             Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &program_id)
                 .0;
-        let bonding_curve_v2 =
-            Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &program_id).0;
 
         Ok([
             Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(),
@@ -277,7 +307,8 @@ impl PumpfunProcessor {
             user_volume_accumulator,
             Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(),
             Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(),
-            bonding_curve_v2,
+            Pubkey::from_str(PUMP_BUYBACK_FEE_RECIPIENT).unwrap(),
+            Pubkey::default(), // slot 17 = creator_authority；mirror 透传，校验时跳过
         ])
     }
 
@@ -311,8 +342,10 @@ impl PumpfunProcessor {
                 curve_state,
             )?;
 
+            // slot 9 (creator_vault) 和 slot 17 (creator_authority) 在 2026.05 协议
+            // 升级后无法从 bonding curve 自行推导，必须信任 mirror。
             if let Some((index, actual, expected_key)) =
-                first_pubkey_mismatch(&replaced, &expected)
+                first_pubkey_mismatch_skipping(&replaced, &expected, PUMPFUN_BUY_MIRROR_TRUSTED_SLOTS)
             {
                 anyhow::bail!(
                     "{} mismatch at [{}]: expected {}, got {}",
@@ -342,9 +375,10 @@ impl PumpfunProcessor {
             &program_id,
         )
         .0;
-        let bonding_curve_v2 =
-            Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &program_id).0;
 
+        // 2026.05 协议升级：slot 16 改为 buyback_fee_recipient 常量；
+        // slot 17 (creator_authority) 无法从链上 BC 自构建，跳过校验。
+        // slot 9 (creator_vault) 同样信任 mirror。
         let partial_expectations = [
             (0usize, Pubkey::from_str(PUMPFUN_GLOBAL).unwrap()),
             (2usize, *mint),
@@ -360,7 +394,7 @@ impl PumpfunProcessor {
             (13usize, user_volume_accumulator),
             (14usize, Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap()),
             (15usize, Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap()),
-            (16usize, bonding_curve_v2),
+            (16usize, Pubkey::from_str(PUMP_BUYBACK_FEE_RECIPIENT).unwrap()),
         ];
 
         for (index, expected_key) in partial_expectations {
@@ -641,8 +675,9 @@ impl PumpfunProcessor {
             .map(|(i, acct)| {
                 match i {
                     6 => AccountMeta::new(*acct, true), // signer
-                    // writable: fee(1), bc(3), abc(4), ata(5), user(6), creator_vault(9), accumulator(13)
-                    1 | 3 | 4 | 5 | 9 | 13 => AccountMeta::new(*acct, false),
+                    // writable: fee(1), bc(3), abc(4), ata(5), user(6), creator_vault(9),
+                    // user_volume_acc(13), buyback_fee_recipient(16), creator_authority(17)
+                    1 | 3 | 4 | 5 | 9 | 13 | 16 | 17 => AccountMeta::new(*acct, false),
                     _ => AccountMeta::new_readonly(*acct, false),
                 }
             })
