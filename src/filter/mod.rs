@@ -98,12 +98,28 @@ impl EntryFilters {
         }
 
         if group.require_social_link {
-            // 触发异步预热（已缓存则空操作）
-            social::spawn_prefetch(*mint, self.rpc_client.clone(), self.social_cache.clone());
-            if let FilterOutcome::Reject(reason) =
-                social::check(group, mint, &self.social_cache)
-            {
-                return FilterOutcome::Reject(reason);
+            // 优先 GMGN（pre-exec / 新 BC mint 上 Metaplex 还没落地的场景下唯一可用源）
+            match self.dev_provider.lookup_social_by_mint(mint) {
+                Some(true) => {
+                    // GMGN 确认有 social link → 通过
+                }
+                Some(false) => {
+                    return FilterOutcome::Reject("no social link (GMGN)".to_string());
+                }
+                None => {
+                    // GMGN 未命中（cache miss / 非 GMGN provider）→ 退到 RPC 路径
+                    // RPC 路径在抢入场景常常拿不到（mint 未落地），只作长期 fallback
+                    social::spawn_prefetch(
+                        *mint,
+                        self.rpc_client.clone(),
+                        self.social_cache.clone(),
+                    );
+                    if let FilterOutcome::Reject(reason) =
+                        social::check(group, mint, &self.social_cache)
+                    {
+                        return FilterOutcome::Reject(reason);
+                    }
+                }
             }
         }
 

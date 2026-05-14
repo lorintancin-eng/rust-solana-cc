@@ -87,6 +87,16 @@ impl DevProvider {
             Self::Gmgn(gmgn) => gmgn.lookup_by_mint(mint),
         }
     }
+
+    /// 按 mint 查是否有社交链接（条件 ②）。
+    /// 仅 GMGN provider 支持（沿用同一次 token/info 调用的 link 段）。
+    /// 其它 provider 返回 None → 调用方继续走 RPC 兜底路径。
+    pub fn lookup_social_by_mint(&self, mint: &Pubkey) -> Option<bool> {
+        match self {
+            Self::Stub | Self::LocalIndex(_) => None,
+            Self::Gmgn(gmgn) => gmgn.lookup_social_by_mint(mint),
+        }
+    }
 }
 
 /// 主入口：按 `mint` 评估 dev 过滤条件 ③④⑤。

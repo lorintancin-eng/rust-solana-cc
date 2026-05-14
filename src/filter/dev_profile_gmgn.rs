@@ -61,16 +61,18 @@ const MIN_INTERVAL_MS: u64 = 1500;
 #[derive(Debug, Clone, Copy)]
 struct Cached {
     stats: Option<DevStats>,
+    /// 同一次 token/info 调用顺带得到的 social link 状态（条件 ②）。
+    /// None 表示这次抓取没拿到任何 social 数据（也作为「无社交」处理 —— 与
+    /// `has_social=false` 区分仅为日志诊断）。
+    has_social: Option<bool>,
     inserted_at: Instant,
 }
 
 impl Cached {
     fn expired(&self) -> bool {
-        let ttl = if self.stats.is_some() {
-            CACHE_TTL
-        } else {
-            NEG_TTL
-        };
+        // 任一字段有数据就算正向缓存（TTL 长），全 None 才走短 TTL
+        let any_data = self.stats.is_some() || self.has_social.is_some();
+        let ttl = if any_data { CACHE_TTL } else { NEG_TTL };
         self.inserted_at.elapsed() >= ttl
     }
 }
@@ -105,7 +107,7 @@ impl GmgnProvider {
         })
     }
 
-    /// **Sync, non-blocking** lookup.
+    /// **Sync, non-blocking** lookup for dev profile (conditions ③④⑤).
     /// Returns cached stats if available; otherwise schedules background fetch
     /// and returns `None` (filter falls through to Pass for this trade).
     pub fn lookup_by_mint(&self, mint: &Pubkey) -> Option<DevStats> {
@@ -116,6 +118,19 @@ impl GmgnProvider {
         }
 
         // Cache miss / expired → schedule async fetch, return None now.
+        self.spawn_fetch(*mint);
+        None
+    }
+
+    /// **Sync, non-blocking** lookup for social link presence (condition ②).
+    /// Same cache as dev profile — one token/info call serves both filters.
+    /// Returns None on cache miss (filter Pass; fetch scheduled).
+    pub fn lookup_social_by_mint(&self, mint: &Pubkey) -> Option<bool> {
+        if let Some(entry) = self.mint_cache.get(mint) {
+            if !entry.expired() {
+                return entry.has_social;
+            }
+        }
         self.spawn_fetch(*mint);
         None
     }
@@ -132,11 +147,12 @@ impl GmgnProvider {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let stats = this.fetch(&mint).await;
+                    let (stats, has_social) = this.fetch(&mint).await;
                     this.mint_cache.insert(
                         mint,
                         Cached {
                             stats,
+                            has_social,
                             inserted_at: Instant::now(),
                         },
                     );
@@ -151,12 +167,34 @@ impl GmgnProvider {
         }
     }
 
-    async fn fetch(&self, mint: &Pubkey) -> Option<DevStats> {
-        // Step 1: token/info → creator_address (+ creator_open_count hint, twitter_create_count)
-        let token_info = self.call_token_info(mint).await?;
-        let dev_obj = token_info.get("data")?.get("dev")?;
-        let creator_str = dev_obj.get("creator_address")?.as_str()?;
-        let creator = Pubkey::from_str(creator_str).ok()?;
+    /// Returns (dev_stats, has_social) — one token/info call powers both.
+    /// dev_stats may need a follow-up created_tokens call for condition ④.
+    async fn fetch(&self, mint: &Pubkey) -> (Option<DevStats>, Option<bool>) {
+        // Step 1: token/info → creator_address + dev hints + link section
+        let token_info = match self.call_token_info(mint).await {
+            Some(v) => v,
+            None => return (None, None),
+        };
+        let data = match token_info.get("data") {
+            Some(d) => d,
+            None => return (None, None),
+        };
+
+        // 解析 link 段计算 has_social（条件 ②）
+        let has_social = compute_has_social(data.get("link"));
+
+        let dev_obj = match data.get("dev") {
+            Some(d) => d,
+            None => return (None, has_social),
+        };
+        let creator_str = match dev_obj.get("creator_address").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => return (None, has_social),
+        };
+        let creator = match Pubkey::from_str(creator_str) {
+            Ok(p) => p,
+            Err(_) => return (None, has_social),
+        };
 
         let creator_open_hint = dev_obj
             .get("creator_open_count")
@@ -172,18 +210,16 @@ impl GmgnProvider {
         if let Some(entry) = self.dev_cache.get(&creator) {
             if !entry.expired() {
                 if let Some(mut stats) = entry.stats {
-                    // Override twitter from fresh token/info call (latest)
                     stats.twitter_bound = twitter_create_count;
-                    return Some(stats);
+                    return (Some(stats), has_social);
                 }
             }
         }
 
         // Step 3: created_tokens for the dev
         let created = self.call_created_tokens(&creator).await;
-        let stats = match created {
-            Some(json) => {
-                let data = json.get("data")?;
+        let stats = match created.as_ref().and_then(|j| j.get("data")) {
+            Some(data) => {
                 let inner = data.get("inner_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let open = data.get("open_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let open_effective = open.max(creator_open_hint.unwrap_or(0));
@@ -204,19 +240,21 @@ impl GmgnProvider {
             creator,
             Cached {
                 stats: Some(stats),
+                has_social: None, // dev_cache 不存 social；按 mint 维度查
                 inserted_at: Instant::now(),
             },
         );
 
         debug!(
-            "GMGN dev profile: mint={} creator={} open={} created={} tw={}",
+            "GMGN dev profile: mint={} creator={} open={} created={} tw={} has_social={:?}",
             &mint.to_string()[..12],
             &creator.to_string()[..12],
             stats.open_count,
             stats.created_count,
             stats.twitter_bound,
+            has_social,
         );
-        Some(stats)
+        (Some(stats), has_social)
     }
 
     async fn call_token_info(&self, mint: &Pubkey) -> Option<Value> {
@@ -311,4 +349,28 @@ impl GmgnProvider {
 
         Some(json)
     }
+}
+
+/// 从 GMGN `/v1/token/info` 响应的 `link` 字段判断是否至少有一个非空社交链接。
+/// 字段命名按 GMGN OpenAPI（`twitter_username`、`website`、`telegram`、`discord`）。
+/// 注：`twitter_username` 偶尔会是 tweet URL（如 "user/status/123"）—— 仍视为
+/// 有效社交（用户挂了引用推文也是宣传痕迹）。返回：
+///   - Some(true)  至少一个非空
+///   - Some(false) link 对象存在但全部空
+///   - None        link 字段缺失（不算"无社交"，留给上层默认 Pass）
+fn compute_has_social(link: Option<&Value>) -> Option<bool> {
+    let link = link?;
+    let keys = [
+        "twitter_username",
+        "website",
+        "telegram",
+        "discord",
+    ];
+    let any = keys.iter().any(|k| {
+        link.get(*k)
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    });
+    Some(any)
 }
