@@ -33,7 +33,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --locked --release --bin ${{ env.BINARY_NAME }}
+        # Note: --locked omitted intentionally — local Windows dev box cannot
+        # regenerate Cargo.lock (protobuf-src build script fails on Windows).
+        # Cargo.lock is still committed and respected when present; only new
+        # deps added via Cargo.toml will trigger a lockfile update in CI.
+        run: cargo build --release --bin ${{ env.BINARY_NAME }}
 
       - name: Prepare Linux binary artifact
         run: |
