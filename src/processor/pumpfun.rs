@@ -857,10 +857,21 @@ impl PumpfunProcessor {
         }
     }
 
-    /// 构建 Pump.fun sell 指令
-    /// mirror_accounts 只取 [2]mint, [3]bc, [4]assoc_bc
-    /// token_program 和 creator 从 prefetch/bc_cache 动态获取
-    /// is_cashback 控制是否追加 user_volume_accumulator
+    /// 构建 Pump.fun SELL 指令（pump.fun 2026.05 协议升级后的 16-slot layout）
+    ///
+    /// 新增 slot 14 = buyback_fee_recipient, slot 15 = creator_authority。
+    /// 二者必须从 mirror_accounts 透传（链上 BUY 已验证过的真实值），不能从 bc
+    /// state 推导。
+    ///
+    /// `mirror_accounts` 通常来自 BUY 时存的 sell_snapshot.mirror_accounts，
+    /// 长度 = 18 (新 BUY layout):
+    ///   slot 9 = creator_vault, slot 16 = buyback, slot 17 = creator_authority
+    /// 若是 16-slot SELL layout:
+    ///   slot 8 = creator_vault, slot 14 = buyback, slot 15 = creator_authority
+    ///
+    /// `is_cashback` 和 `creator` 参数保留兼容旧调用方但**忽略** —— 新 layout
+    /// 不再有 cashback path / bonding_curve_v2 remaining account；creator_vault
+    /// 直接从 mirror 取（chain-verified PDA）。
     pub fn build_sell_instruction_from_mirror(
         &self,
         user: &Pubkey,
@@ -869,8 +880,8 @@ impl PumpfunProcessor {
         token_amount: u64,
         min_sol_output: u64,
         token_program_id: &Pubkey,
-        creator: &Pubkey,
-        is_cashback: bool,
+        _creator: &Pubkey,
+        _is_cashback: bool,
     ) -> Instruction {
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
 
@@ -879,46 +890,66 @@ impl PumpfunProcessor {
         data.extend_from_slice(&token_amount.to_le_bytes());
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 
-        // PDA 派生
-        let creator_vault =
-            Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &program_id).0;
+        // 共享字段
+        let global = mirror_accounts
+            .first()
+            .copied()
+            .unwrap_or_else(|| Pubkey::from_str(PUMPFUN_GLOBAL).unwrap());
+        let fee_recipient = mirror_accounts
+            .get(1)
+            .copied()
+            .unwrap_or_else(|| Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap());
+        let mint = mirror_accounts.get(2).copied().unwrap_or_default();
+        let bonding_curve = mirror_accounts.get(3).copied().unwrap_or_default();
+        let assoc_bc = mirror_accounts.get(4).copied().unwrap_or_default();
 
-        // 从 mirror_accounts 只取代币相关地址（位置 [2-4] 跨所有 buy 变体稳定）
-        let mint = mirror_accounts[2];
-        let bonding_curve = mirror_accounts[3];
-        let assoc_bc = mirror_accounts[4];
+        // 按 mirror.len() 抽取 layout-specific 字段
+        let (creator_vault, buyback, creator_authority) = match mirror_accounts.len() {
+            n if n >= 18 => (
+                mirror_accounts[9],   // BUY: creator_vault @ 9
+                mirror_accounts[16],  // BUY: buyback @ 16
+                mirror_accounts[17],  // BUY: creator_authority @ 17
+            ),
+            16 => (
+                mirror_accounts[8],   // SELL: creator_vault @ 8
+                mirror_accounts[14],  // SELL: buyback @ 14
+                mirror_accounts[15],  // SELL: creator_authority @ 15
+            ),
+            _ => (
+                Pubkey::default(),
+                Pubkey::from_str(PUMP_BUYBACK_FEE_RECIPIENT).unwrap(),
+                Pubkey::default(),
+            ),
+        };
 
-        // bonding_curve_v2 = PDA 派生（必需的 remaining account）
-        let bonding_curve_v2 =
-            Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &program_id).0;
-
-        // 14 固定账户（2026 Pump.fun sell IDL）
-        let mut accounts = vec![
-            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false), // 0  global
-            AccountMeta::new(Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap(), false), // 1  fee_recipient
-            AccountMeta::new_readonly(mint, false),                                    // 2  mint
-            AccountMeta::new(bonding_curve, false), // 3  bonding_curve
-            AccountMeta::new(assoc_bc, false),      // 4  assoc_bonding_curve
-            AccountMeta::new(*user_ata, false),     // 5  user_ata
-            AccountMeta::new(*user, true),          // 6  user (signer)
-            AccountMeta::new_readonly(system_program::id(), false), // 7  system_program
-            AccountMeta::new(creator_vault, false), // 8  creator_vault (PDA)
-            AccountMeta::new_readonly(*token_program_id, false), // 9  token_program
-            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(), false), // 10 event_authority
-            AccountMeta::new_readonly(program_id, false), // 11 program
-            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(), false), // 12 fee_config
-            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(), false), // 13 fee_program
+        // 标准 16-slot SELL layout (2026.05)
+        let accounts = vec![
+            AccountMeta::new_readonly(global, false),                                          // 0
+            AccountMeta::new(fee_recipient, false),                                            // 1
+            AccountMeta::new_readonly(mint, false),                                            // 2
+            AccountMeta::new(bonding_curve, false),                                            // 3
+            AccountMeta::new(assoc_bc, false),                                                 // 4
+            AccountMeta::new(*user_ata, false),                                                // 5
+            AccountMeta::new(*user, true),                                                     // 6 signer
+            AccountMeta::new_readonly(system_program::id(), false),                            // 7
+            AccountMeta::new(creator_vault, false),                                            // 8
+            AccountMeta::new_readonly(*token_program_id, false),                               // 9
+            AccountMeta::new_readonly(
+                Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(),
+                false,
+            ),                                                                                 // 10
+            AccountMeta::new_readonly(program_id, false),                                      // 11
+            AccountMeta::new_readonly(
+                Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(),
+                false,
+            ),                                                                                 // 12
+            AccountMeta::new_readonly(
+                Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(),
+                false,
+            ),                                                                                 // 13
+            AccountMeta::new(buyback, false),                                                  // 14
+            AccountMeta::new(creator_authority, false),                                        // 15
         ];
-
-        // remaining accounts（和 sell_standard 一致）
-        if is_cashback {
-            let (user_vol_acc, _) = Pubkey::find_program_address(
-                &[b"user_volume_accumulator", user.as_ref()],
-                &program_id,
-            );
-            accounts.push(AccountMeta::new(user_vol_acc, false));
-        }
-        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false));
 
         Instruction {
             program_id,
