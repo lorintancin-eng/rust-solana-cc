@@ -153,7 +153,12 @@ pub fn synth_sell_mirror_for_buy(
 ///                                 链上接受其中任意一个。常量比较过严，拒绝合法 mirror。
 ///   slot 9  (creator_vault)    —— 2026.05 升级后 PDA seed 规则未公开，无法自推。
 ///   slot 17 (creator_authority) —— per-token dev wallet，链下无法获取。
-const PUMPFUN_BUY_MIRROR_TRUSTED_SLOTS: &[usize] = &[1, 9, 17];
+/// 校验时信任 mirror 的 slot（不与 build_buy_account_keys_standard 对比）：
+///   slot 1  = fee_recipient（pump.fun 轮换收款人）
+///   slot 9  = creator_vault（PDA seed 不再是 bc.creator，规则未公开）
+///   slot 16 = buyback_fee_recipient（pump.fun 同样轮换，**不是固定常量**）
+///   slot 17 = creator_authority（per-token，未存于 bc state）
+const PUMPFUN_BUY_MIRROR_TRUSTED_SLOTS: &[usize] = &[1, 9, 16, 17];
 
 /// Pump.fun 标准总供应量: 10 亿 tokens
 pub const PUMP_TOTAL_SUPPLY: f64 = 1_000_000_000.0;
@@ -392,8 +397,16 @@ impl PumpfunProcessor {
             );
         }
 
+        // 反向跟单 + 缓存复用：cached mirror 来自 wallet A 的 BUY，反向触发
+        // 时 trade.source_wallet 是 wallet B（不同人），用外部 source_wallet 推
+        // PDA 找不到 mirror 里 A 的 user_volume_accumulator 等。mirror[6] 才是
+        // 该 mirror 真正的 user/signer，用它推 PDA 才能正确替换。
+        let effective_source = mirror_accounts
+            .get(6)
+            .copied()
+            .unwrap_or(*source_wallet);
         let replaced =
-            Self::replace_user_pdas(mirror_accounts, source_wallet, &config.pubkey, user_ata);
+            Self::replace_user_pdas(mirror_accounts, &effective_source, &config.pubkey, user_ata);
 
         // expected layout（18-slot 新 BUY）对比只在 mirror 也是 18-slot 时有意义。
         // 16-slot SELL mirror 和 17-slot 旧 BUY mirror 的 slot 顺序与 expected 不同，
@@ -747,8 +760,15 @@ impl PumpfunProcessor {
         data.extend_from_slice(&token_amount.to_le_bytes());
         data.extend_from_slice(&max_sol_cost.to_le_bytes());
 
+        // 反向跟单 + 缓存复用：mirror[6] 才是该 mirror 真正的 user/signer。
+        // 当 cached mirror 来自 wallet A 的 BUY、反向触发是 wallet B 的 SELL 时，
+        // 外部 source_wallet（B）推不出 mirror 里 A 的 user_volume_accumulator。
+        let effective_source = mirror_accounts
+            .get(6)
+            .copied()
+            .unwrap_or(*source_wallet);
         // 替换用户特定的 PDA（user_volume_accumulator 等）+ slot 5/6 user/ata
-        let replaced = Self::replace_user_pdas(mirror_accounts, source_wallet, user, user_ata);
+        let replaced = Self::replace_user_pdas(mirror_accounts, &effective_source, user, user_ata);
         let n = replaced.len();
 
         // 共享字段（SELL / BUY layout slot 0..=4 一致）
