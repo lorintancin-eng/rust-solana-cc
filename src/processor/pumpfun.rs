@@ -148,14 +148,12 @@ pub fn synth_sell_mirror_for_buy(
     ]
 }
 
-/// 校验时跳过的 slot：这些字段不能从 cached_state 自构建，必须信任 mirror。
-///   slot 9 (creator_vault)     —— pump.fun 2026.05 协议升级后，creator_vault PDA
-///                                 的 seed 不再是 bonding_curve.creator，而是新的
-///                                 dev wallet（slot 17 提供）。我们没有独立数据源
-///                                 推导这个 PDA，所以直接信任 mirror。
-///   slot 17 (creator_authority) —— per-token dev wallet，bonding curve data 中
-///                                 不存放，必须信任 mirror。
-const PUMPFUN_BUY_MIRROR_TRUSTED_SLOTS: &[usize] = &[9, 17];
+/// 校验时跳过的 slot：这些字段必须信任 mirror，原因不一：
+///   slot 1  (fee_recipient)    —— pump.fun 有多个 valid fee recipient（rotation），
+///                                 链上接受其中任意一个。常量比较过严，拒绝合法 mirror。
+///   slot 9  (creator_vault)    —— 2026.05 升级后 PDA seed 规则未公开，无法自推。
+///   slot 17 (creator_authority) —— per-token dev wallet，链下无法获取。
+const PUMPFUN_BUY_MIRROR_TRUSTED_SLOTS: &[usize] = &[1, 9, 17];
 
 /// Pump.fun 标准总供应量: 10 亿 tokens
 pub const PUMP_TOTAL_SUPPLY: f64 = 1_000_000_000.0;
