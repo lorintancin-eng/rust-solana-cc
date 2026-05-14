@@ -878,13 +878,19 @@ impl PumpfunProcessor {
         user_ata: &Pubkey,
         mirror_accounts: &[Pubkey],
         token_amount: u64,
-        min_sol_output: u64,
+        _min_sol_output: u64,
         token_program_id: &Pubkey,
         _creator: &Pubkey,
         _is_cashback: bool,
     ) -> Instruction {
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
 
+        // pump.fun 2026.05 升级后，SELL 指令传非零 min_sol_output 会触发
+        // Custom(6024) Overflow（fee 计算公式 `(sol_out - min) * fee_bps` 当
+        // sol_out < min 时下溢）。所有链上成功 SELL（含 wrapper bot）都传
+        // min_sol_output = 0。我们也强制 0：滑点保护改为客户端在 _min_sol_output
+        // 与 expected_sol 大幅偏离时直接 abort（caller 责任，未来再加）。
+        let min_sol_output: u64 = 0;
         let mut data = Vec::with_capacity(24);
         data.extend_from_slice(&SELL_DISCRIMINATOR);
         data.extend_from_slice(&token_amount.to_le_bytes());
