@@ -48,11 +48,13 @@ use utils::sol_price::SolUsdPrice;
 type SignatureCache = Arc<DashMap<String, SignatureSeen>>;
 type GroupMintDedup = Arc<DashMap<String, GroupMintClaim>>;
 type BondingCurveFetches = Arc<DashMap<Pubkey, Arc<Notify>>>;
-/// pump.fun 2026.05 升级关键缓存：mint → creator_authority (slot 17)。
-/// 当任何 wallet 做 Direct BUY 时（mirror=18 slot），我们记录 mirror[17]。
-/// 反向跟单遇到 WrapperCpi pre-exec 阶段 mirror 为空时，从此处查 creator_authority，
-/// 合成 16-slot SELL mirror 让 build_buy_instruction_from_mirror 转换出可上链 BUY。
-type CreatorAuthorityCache = Arc<DashMap<Pubkey, Pubkey>>;
+/// pump.fun 2026.05 升级关键缓存：mint → 完整 18-slot BUY mirror。
+/// 当任何 wallet 做 Direct BUY 18-slot 时，记录整个 mirror_accounts。
+/// 反向跟单遇到 WrapperCpi pre-exec 阶段 mirror 为空时，直接复用缓存的 mirror，
+/// 让 build_buy_instruction_from_mirror + replace_user_pdas 处理 user 字段替换。
+/// 这样 creator_vault (slot 9) 和 creator_authority (slot 17) 都是链上真实值，
+/// 无需自推任何 PDA seed（之前推导 creator_vault 用 creator_authority 是错的）。
+type MirrorCache = Arc<DashMap<Pubkey, Vec<Pubkey>>>;
 
 const BLOCKHASH_REFRESH_MS: u64 = 120;
 const PREFETCH_WAIT_MS: u64 = 8;
@@ -438,7 +440,7 @@ async fn main() -> Result<()> {
 
     let sig_cache: SignatureCache = Arc::new(DashMap::new());
     let mint_dedup: GroupMintDedup = Arc::new(DashMap::new());
-    let creator_authority_cache: CreatorAuthorityCache = Arc::new(DashMap::new());
+    let mirror_cache: MirrorCache = Arc::new(DashMap::new());
 
     let (trade_tx, mut trade_rx) = mpsc::unbounded_channel::<DetectedTrade>();
     let (consensus_tx, mut consensus_rx) = mpsc::unbounded_channel::<ConsensusTrigger>();
@@ -733,26 +735,24 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        // 关键缓存：任何钱包的 Direct BUY 都可能给我们提供该 mint 的 slot[17]
-        // creator_authority。立即记录，后续反向跟单 (SELL trigger) 时查询。
-        // 2ev 是 pump.fun 狙击 bot，开盘 BUY 几秒后 SELL → 我们在 BUY 时拿到
-        // creator_authority，SELL 时用它合成 BUY 的 18-slot 指令。
+        // 关键缓存：任何 Direct BUY 18-slot 都给我们提供完整 mirror（含真实
+        // creator_vault 和 creator_authority）。立即缓存，后续反向跟单遇到
+        // WrapperCpi pre-exec mirror 为空时直接复用，replace_user_pdas 自动
+        // 替换 user/user_ata 字段。比自推 PDA 稳得多（pump.fun 程序对
+        // creator_vault 的 PDA seed 推导规则我们不知道）。
         if trade.is_buy
             && trade.trade_origin == processor::TradeOrigin::Direct
             && trade.instruction_accounts.len() >= 18
         {
             if let Some(mint) = trade.token_mint {
-                let ca = trade.instruction_accounts[17];
-                if ca != Pubkey::default() {
-                    let prev = creator_authority_cache.insert(mint, ca);
-                    if prev.is_none() {
-                        debug!(
-                            "Cached creator_authority: mint={} ca={} (from wallet {})",
-                            &mint.to_string()[..12],
-                            &ca.to_string()[..12],
-                            &trade.source_wallet.to_string()[..8],
-                        );
-                    }
+                let prev = mirror_cache.insert(mint, trade.instruction_accounts.clone());
+                if prev.is_none() {
+                    info!(
+                        "Cached mirror: mint={} ({} accs from wallet {})",
+                        &mint.to_string()[..12],
+                        trade.instruction_accounts.len(),
+                        &trade.source_wallet.to_string()[..8],
+                    );
                 }
             }
         }
@@ -782,30 +782,27 @@ async fn main() -> Result<()> {
         });
 
         // pump.fun 2026.05 关键修复：WrapperCpi pre-exec 阶段 trade.instruction_accounts
-        // 为空（meta=None 没有 inner_instructions）。从 creator_authority_cache 查 mint
-        // 对应的 dev wallet（来自此前 2ev 自己 BUY 留下的 mirror[17]），合成 16-slot SELL
-        // layout 的 mirror，下游 build_buy_instruction_from_mirror 已支持 16→18 转换。
-        let synthesized_mirror: Option<Vec<Pubkey>> = if trade.instruction_accounts.is_empty()
+        // 为空（meta=None 没有 inner_instructions）。直接复用此前 Direct BUY 缓存的
+        // 完整 18-slot mirror，下游 build_buy_instruction_from_mirror 走 18-slot
+        // path + replace_user_pdas 替换我们的 user_ata/user/user_volume_acc，
+        // 真实的 creator_vault (slot 9) 和 creator_authority (slot 17) 直接来自链上。
+        let cached_mirror: Option<Vec<Pubkey>> = if trade.instruction_accounts.is_empty()
             && trade.trade_origin.is_wrapper_cpi()
         {
-            creator_authority_cache.get(&token_mint).map(|entry| {
-                let ca = *entry.value();
+            mirror_cache.get(&token_mint).map(|entry| {
+                let m = entry.value().clone();
                 info!(
-                    "Synth mirror from cached creator_authority: mint={} ca={} (wallet={})",
+                    "Reuse cached mirror: mint={} ({} accs, wallet={})",
                     &token_mint.to_string()[..12],
-                    &ca.to_string()[..12],
+                    m.len(),
                     &trade.source_wallet.to_string()[..8],
                 );
-                processor::pumpfun::synth_sell_mirror_for_buy(
-                    &token_mint,
-                    &ca,
-                    &token_program,
-                )
+                m
             })
         } else {
             None
         };
-        let effective_mirror: &[Pubkey] = synthesized_mirror
+        let effective_mirror: &[Pubkey] = cached_mirror
             .as_deref()
             .unwrap_or(trade.instruction_accounts.as_slice());
 
