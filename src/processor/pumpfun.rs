@@ -881,15 +881,14 @@ impl PumpfunProcessor {
         _min_sol_output: u64,
         token_program_id: &Pubkey,
         _creator: &Pubkey,
-        _is_cashback: bool,
+        is_cashback: bool,
     ) -> Instruction {
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
 
-        // pump.fun 2026.05 升级后，SELL 指令传非零 min_sol_output 会触发
-        // Custom(6024) Overflow（fee 计算公式 `(sol_out - min) * fee_bps` 当
-        // sol_out < min 时下溢）。所有链上成功 SELL（含 wrapper bot）都传
-        // min_sol_output = 0。我们也强制 0：滑点保护改为客户端在 _min_sol_output
-        // 与 expected_sol 大幅偏离时直接 abort（caller 责任，未来再加）。
+        // pump.fun 2026.05 SELL ix data 结构（参考官方 IDL + chainstacklabs 实现）：
+        //   discriminator(8) + amount u64(8) + min_sol_output u64(8) = 24 bytes
+        // 强制 min_sol_output=0：所有链上成功 SELL（含 wrapper bot）都传 0；
+        // 客户端层面已检查 expected_sol 是否合理，无需 on-chain 滑点保护。
         let min_sol_output: u64 = 0;
         let mut data = Vec::with_capacity(24);
         data.extend_from_slice(&SELL_DISCRIMINATOR);
@@ -909,27 +908,42 @@ impl PumpfunProcessor {
         let bonding_curve = mirror_accounts.get(3).copied().unwrap_or_default();
         let assoc_bc = mirror_accounts.get(4).copied().unwrap_or_default();
 
-        // 按 mirror.len() 抽取 layout-specific 字段
-        let (creator_vault, buyback, creator_authority) = match mirror_accounts.len() {
+        // 关键修复（chainstacklabs/pumpfun-bonkfun-bot 文档）：
+        // BUY mirror layout: [16]=bonding_curve_v2, [17]=breaking_fee_recipient
+        // 我之前命名 "buyback" 和 "creator_authority" 是错的 —— 实际是 bc_v2 和
+        // breaking_fee_recipient（2026-04-28 cashback upgrade 后必传）。
+        let (creator_vault, bc_v2, breaking_fee) = match mirror_accounts.len() {
             n if n >= 18 => (
                 mirror_accounts[9],   // BUY: creator_vault @ 9
-                mirror_accounts[16],  // BUY: buyback @ 16
-                mirror_accounts[17],  // BUY: creator_authority @ 17
+                mirror_accounts[16],  // BUY: bonding_curve_v2 @ 16
+                mirror_accounts[17],  // BUY: breaking_fee_recipient @ 17
             ),
-            16 => (
-                mirror_accounts[8],   // SELL: creator_vault @ 8
-                mirror_accounts[14],  // SELL: buyback @ 14
-                mirror_accounts[15],  // SELL: creator_authority @ 15
+            n if n >= 16 => (
+                mirror_accounts[8],   // SELL non-cashback: creator_vault @ 8
+                mirror_accounts[14],  // SELL non-cashback: bc_v2 @ 14
+                mirror_accounts[15],  // SELL non-cashback: break_fee @ 15
             ),
-            _ => (
-                Pubkey::default(),
-                Pubkey::from_str(PUMP_BUYBACK_FEE_RECIPIENT).unwrap(),
-                Pubkey::default(),
-            ),
+            _ => {
+                // Fallback: 自推 bc_v2，break_fee 用常量
+                let cv = Pubkey::default();
+                let v2 = Pubkey::find_program_address(
+                    &[b"bonding-curve-v2", mint.as_ref()],
+                    &program_id,
+                )
+                .0;
+                let bf = Pubkey::from_str(PUMP_BUYBACK_FEE_RECIPIENT).unwrap();
+                (cv, v2, bf)
+            }
         };
 
-        // 标准 16-slot SELL layout (2026.05)
-        let accounts = vec![
+        // SELL ix layout（chainstacklabs/pumpfun-bonkfun-bot 文档）：
+        //   [0..13] base 14 accounts（同所有 SELL）
+        //   [14] user_volume_accumulator —— 仅当 token is_cashback_coin = true
+        //   [15] bonding_curve_v2 —— 总是
+        //   [16] breaking_fee_recipient —— 总是（2026-04-28+）
+        // Non-cashback: 16 accounts (skip user_vol)
+        // Cashback: 17 accounts
+        let mut accounts = vec![
             AccountMeta::new_readonly(global, false),                                          // 0
             AccountMeta::new(fee_recipient, false),                                            // 1
             AccountMeta::new_readonly(mint, false),                                            // 2
@@ -953,9 +967,18 @@ impl PumpfunProcessor {
                 Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(),
                 false,
             ),                                                                                 // 13
-            AccountMeta::new(buyback, false),                                                  // 14
-            AccountMeta::new(creator_authority, false),                                        // 15
         ];
+        if is_cashback {
+            // [14] user_volume_accumulator (OUR PDA, 不是 mirror 的)
+            let user_vol = Pubkey::find_program_address(
+                &[b"user_volume_accumulator", user.as_ref()],
+                &program_id,
+            )
+            .0;
+            accounts.push(AccountMeta::new(user_vol, false));
+        }
+        accounts.push(AccountMeta::new_readonly(bc_v2, false));      // [14] non-cashback / [15] cashback
+        accounts.push(AccountMeta::new(breaking_fee, false));        // [15] / [16]
 
         Instruction {
             program_id,
