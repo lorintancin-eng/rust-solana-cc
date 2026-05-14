@@ -428,8 +428,9 @@ impl SellExecutor {
             return;
         };
         let previous_state = position_before_sell.state;
-        let aggressive_follow = position_before_sell.group.follow_sell_mode()
-            && signal.reason == SellReason::FollowSell;
+        // P1 移除：之前 aggressive_follow = follow_sell_mode && reason==FollowSell 会跳过
+        // Jupiter fallback，导致 tip rent 等 transient 失败时仓位无救。现在 Jupiter
+        // fallback 永远跑（见 Pumpfun 失败分支）。
 
         let snapshot = match self.resolve_sell_snapshot(&position_before_sell).await {
             Ok(snapshot) => snapshot,
@@ -607,51 +608,53 @@ impl SellExecutor {
                     }
 
                     if confirm_trace.source == "signature_error" {
-                        if !aggressive_follow {
-                            match self
-                                .try_jupiter_sell_with_confirm(
-                                    &position_before_sell,
-                                    token_amount,
-                                    confirm_timeout_ms,
-                                    expected_after_balance,
-                                )
-                                .await
-                            {
-                                Ok((fallback_sig, fallback_trace)) => {
-                                    if fallback_trace.confirmed {
-                                        info!(
-                                            "Jupiter sell confirmed after Pumpfun failure: [{}] {} | source={} | sig_seen={} | rpc_ata_target={} | cache_ata_target={} | total={}",
-                                            signal.group_name,
-                                            &position_before_sell.token_mint.to_string()[..12],
-                                            fallback_trace.source,
-                                            render_optional_latency(fallback_trace.signature_seen),
-                                            render_optional_latency(fallback_trace.rpc_ata_target),
-                                            render_optional_latency(fallback_trace.cache_ata_target),
-                                            format_latency(fallback_trace.total),
-                                        );
-                                        success = true;
-                                        last_sig = fallback_sig;
-                                        break;
-                                    }
-
-                                    if fallback_trace.source == "signature_error" {
-                                        saw_signature_error = true;
-                                        failure_reason = "jupiter sell failed on-chain".to_string();
-                                        warn!(
-                                            "Jupiter sell aborted after Pumpfun on-chain failure: [{}] {} | sig: {}",
-                                            signal.group_name,
-                                            &position_before_sell.token_mint.to_string()[..12],
-                                            fallback_sig,
-                                        );
-                                        break;
-                                    }
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        "Jupiter sell fallback failed [{}]: {}",
-                                        signal.group_name, err,
+                        // P1 修复：FollowSell 路径过去会跳过 Jupiter fallback（aggressive_follow=true），
+                        // 但 tip rent / blockhash 过期等 transient 失败靠 Jupiter 才能救回（已实测
+                        // [2eb跟单] Brrm9mA + AT4z 两次靠 fallback 成功）。永远跑 fallback，
+                        // 让短暂的 Pumpfun 链上失败有第二次机会。
+                        match self
+                            .try_jupiter_sell_with_confirm(
+                                &position_before_sell,
+                                token_amount,
+                                confirm_timeout_ms,
+                                expected_after_balance,
+                            )
+                            .await
+                        {
+                            Ok((fallback_sig, fallback_trace)) => {
+                                if fallback_trace.confirmed {
+                                    info!(
+                                        "Jupiter sell confirmed after Pumpfun failure: [{}] {} | source={} | sig_seen={} | rpc_ata_target={} | cache_ata_target={} | total={}",
+                                        signal.group_name,
+                                        &position_before_sell.token_mint.to_string()[..12],
+                                        fallback_trace.source,
+                                        render_optional_latency(fallback_trace.signature_seen),
+                                        render_optional_latency(fallback_trace.rpc_ata_target),
+                                        render_optional_latency(fallback_trace.cache_ata_target),
+                                        format_latency(fallback_trace.total),
                                     );
+                                    success = true;
+                                    last_sig = fallback_sig;
+                                    break;
                                 }
+
+                                if fallback_trace.source == "signature_error" {
+                                    saw_signature_error = true;
+                                    failure_reason = "jupiter sell failed on-chain".to_string();
+                                    warn!(
+                                        "Jupiter sell aborted after Pumpfun on-chain failure: [{}] {} | sig: {}",
+                                        signal.group_name,
+                                        &position_before_sell.token_mint.to_string()[..12],
+                                        fallback_sig,
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Jupiter sell fallback failed [{}]: {}",
+                                    signal.group_name, err,
+                                );
                             }
                         }
 
@@ -668,41 +671,40 @@ impl SellExecutor {
                 }
                 Err(err) => {
                     warn!("Pumpfun sell failed [{}]: {}", signal.group_name, err);
-                    if !aggressive_follow {
-                        match self
-                            .try_jupiter_sell_with_confirm(
-                                &position_before_sell,
-                                token_amount,
-                                confirm_timeout_ms,
-                                expected_after_balance,
-                            )
-                            .await
-                        {
-                            Ok((sig, confirm_trace)) => {
-                                if confirm_trace.confirmed {
-                                    success = true;
-                                    last_sig = sig;
-                                    break;
-                                }
+                    // P1 修复：同上 —— Jupiter fallback 不再受 aggressive_follow gate 限制
+                    match self
+                        .try_jupiter_sell_with_confirm(
+                            &position_before_sell,
+                            token_amount,
+                            confirm_timeout_ms,
+                            expected_after_balance,
+                        )
+                        .await
+                    {
+                        Ok((sig, confirm_trace)) => {
+                            if confirm_trace.confirmed {
+                                success = true;
+                                last_sig = sig;
+                                break;
+                            }
 
-                                if confirm_trace.source == "signature_error" {
-                                    saw_signature_error = true;
-                                    failure_reason = "jupiter sell failed on-chain".to_string();
-                                    warn!(
-                                        "Jupiter sell aborted after on-chain failure: [{}] {} | sig: {}",
-                                        signal.group_name,
-                                        &position_before_sell.token_mint.to_string()[..12],
-                                        sig,
-                                    );
-                                    break;
-                                }
-                            }
-                            Err(jupiter_err) => {
+                            if confirm_trace.source == "signature_error" {
+                                saw_signature_error = true;
+                                failure_reason = "jupiter sell failed on-chain".to_string();
                                 warn!(
-                                    "Jupiter sell fallback failed [{}]: {}",
-                                    signal.group_name, jupiter_err,
+                                    "Jupiter sell aborted after on-chain failure: [{}] {} | sig: {}",
+                                    signal.group_name,
+                                    &position_before_sell.token_mint.to_string()[..12],
+                                    sig,
                                 );
+                                break;
                             }
+                        }
+                        Err(jupiter_err) => {
+                            warn!(
+                                "Jupiter sell fallback failed [{}]: {}",
+                                signal.group_name, jupiter_err,
+                            );
                         }
                     }
                 }
@@ -746,16 +748,18 @@ impl SellExecutor {
                 .get_position(&signal.position_key)
                 .map(|pos| pos.max_sell_attempts_reached(MAX_AUTO_SELL_SIGNAL_ATTEMPTS))
                 .unwrap_or(false);
-            let suspend_auto_sell = signal.reason != SellReason::Manual
-                && (saw_signature_error || auto_attempt_cap_reached);
+            // P2 修复：之前 saw_signature_error 单次链上失败立即 suspend，把 sell_attempts
+            // 跳到上限 5 永久停售。但 tip rent 轮选 / blockhash 过期是 transient ——
+            // 实测 [单9yxm] 8pFB 第一次 Pumpfun 链上失败就被永久停售。改成只有自然攻
+            // 击 sell_attempts >= 5 时才 suspend，否则 restore 让下次 signal 触发重试。
+            let suspend_auto_sell =
+                signal.reason != SellReason::Manual && auto_attempt_cap_reached;
 
             if suspend_auto_sell {
-                if auto_attempt_cap_reached && !saw_signature_error {
-                    failure_reason = format!(
-                        "auto-sell suspended after {} failed cycles",
-                        MAX_AUTO_SELL_SIGNAL_ATTEMPTS
-                    );
-                }
+                failure_reason = format!(
+                    "auto-sell suspended after {} failed cycles",
+                    MAX_AUTO_SELL_SIGNAL_ATTEMPTS
+                );
                 self.auto_sell.suspend_auto_sell(
                     &signal.position_key,
                     previous_state,
@@ -768,6 +772,13 @@ impl SellExecutor {
                     failure_reason,
                 );
             } else {
+                if saw_signature_error {
+                    warn!(
+                        "Sell retry pending: [{}] {} | will retry on next signal",
+                        signal.group_name,
+                        &position_before_sell.token_mint.to_string()[..12],
+                    );
+                }
                 self.auto_sell
                     .restore_after_sell_attempt(&signal.position_key, previous_state);
             }
