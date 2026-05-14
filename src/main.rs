@@ -48,6 +48,11 @@ use utils::sol_price::SolUsdPrice;
 type SignatureCache = Arc<DashMap<String, SignatureSeen>>;
 type GroupMintDedup = Arc<DashMap<String, GroupMintClaim>>;
 type BondingCurveFetches = Arc<DashMap<Pubkey, Arc<Notify>>>;
+/// pump.fun 2026.05 升级关键缓存：mint → creator_authority (slot 17)。
+/// 当任何 wallet 做 Direct BUY 时（mirror=18 slot），我们记录 mirror[17]。
+/// 反向跟单遇到 WrapperCpi pre-exec 阶段 mirror 为空时，从此处查 creator_authority，
+/// 合成 16-slot SELL mirror 让 build_buy_instruction_from_mirror 转换出可上链 BUY。
+type CreatorAuthorityCache = Arc<DashMap<Pubkey, Pubkey>>;
 
 const BLOCKHASH_REFRESH_MS: u64 = 120;
 const PREFETCH_WAIT_MS: u64 = 8;
@@ -433,6 +438,7 @@ async fn main() -> Result<()> {
 
     let sig_cache: SignatureCache = Arc::new(DashMap::new());
     let mint_dedup: GroupMintDedup = Arc::new(DashMap::new());
+    let creator_authority_cache: CreatorAuthorityCache = Arc::new(DashMap::new());
 
     let (trade_tx, mut trade_rx) = mpsc::unbounded_channel::<DetectedTrade>();
     let (consensus_tx, mut consensus_rx) = mpsc::unbounded_channel::<ConsensusTrigger>();
@@ -727,6 +733,30 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        // 关键缓存：任何钱包的 Direct BUY 都可能给我们提供该 mint 的 slot[17]
+        // creator_authority。立即记录，后续反向跟单 (SELL trigger) 时查询。
+        // 2ev 是 pump.fun 狙击 bot，开盘 BUY 几秒后 SELL → 我们在 BUY 时拿到
+        // creator_authority，SELL 时用它合成 BUY 的 18-slot 指令。
+        if trade.is_buy
+            && trade.trade_origin == processor::TradeOrigin::Direct
+            && trade.instruction_accounts.len() >= 18
+        {
+            if let Some(mint) = trade.token_mint {
+                let ca = trade.instruction_accounts[17];
+                if ca != Pubkey::default() {
+                    let prev = creator_authority_cache.insert(mint, ca);
+                    if prev.is_none() {
+                        debug!(
+                            "Cached creator_authority: mint={} ca={} (from wallet {})",
+                            &mint.to_string()[..12],
+                            &ca.to_string()[..12],
+                            &trade.source_wallet.to_string()[..8],
+                        );
+                    }
+                }
+            }
+        }
+
         let matching_groups = group_manager.groups_for_wallet(&trade.source_wallet);
         if matching_groups.is_empty() {
             continue;
@@ -751,6 +781,34 @@ async fn main() -> Result<()> {
             }
         });
 
+        // pump.fun 2026.05 关键修复：WrapperCpi pre-exec 阶段 trade.instruction_accounts
+        // 为空（meta=None 没有 inner_instructions）。从 creator_authority_cache 查 mint
+        // 对应的 dev wallet（来自此前 2ev 自己 BUY 留下的 mirror[17]），合成 16-slot SELL
+        // layout 的 mirror，下游 build_buy_instruction_from_mirror 已支持 16→18 转换。
+        let synthesized_mirror: Option<Vec<Pubkey>> = if trade.instruction_accounts.is_empty()
+            && trade.trade_origin.is_wrapper_cpi()
+        {
+            creator_authority_cache.get(&token_mint).map(|entry| {
+                let ca = *entry.value();
+                info!(
+                    "Synth mirror from cached creator_authority: mint={} ca={} (wallet={})",
+                    &token_mint.to_string()[..12],
+                    &ca.to_string()[..12],
+                    &trade.source_wallet.to_string()[..8],
+                );
+                processor::pumpfun::synth_sell_mirror_for_buy(
+                    &token_mint,
+                    &ca,
+                    &token_program,
+                )
+            })
+        } else {
+            None
+        };
+        let effective_mirror: &[Pubkey] = synthesized_mirror
+            .as_deref()
+            .unwrap_or(trade.instruction_accounts.as_slice());
+
         if wants_entry_any {
             warm_buy_caches(
                 &prefetch_cache,
@@ -761,7 +819,7 @@ async fn main() -> Result<()> {
                 &config,
                 &token_mint,
                 &token_program,
-                &trade.instruction_accounts,
+                effective_mirror,
                 &trade.source_wallet,
                 &trade.signature,
                 trade_signal_quality(&trade),
@@ -778,19 +836,17 @@ async fn main() -> Result<()> {
             };
 
             if wants_entry {
-                // WrapperCpi pre-exec 阶段无 inner_instructions（meta=None），
-                // 无法提取 16-slot SELL mirror。pump.fun 2026.05 升级后，没有
-                // mirror 就无法构造合法 BUY（缺 creator_authority）。直接跳过
-                // 该 trade 的 buy，让 landed phase 同 sig 重新触发（届时 meta
-                // 已就绪，inner CPI accounts 可用）。
+                // 反向跟单 WrapperCpi pre-exec 阶段：mirror 已通过
+                // creator_authority_cache 合成（见上方 synthesized_mirror 逻辑）。
+                // 若 cache 未命中且原始 mirror 也空 → 没有 creator_authority 数据
+                // → 当前 mint 是"冷启动"（我们未曾观察其 Direct BUY）→ 跳过该 trade，
+                // 等待这个 mint 的某次 Direct BUY 将 ca 写入缓存后再触发。
                 if !trade.is_buy
                     && group.buy_on_smart_sell()
-                    && trade.is_pre_execution
-                    && trade.trade_origin.is_wrapper_cpi()
-                    && trade.instruction_accounts.is_empty()
+                    && effective_mirror.is_empty()
                 {
                     debug!(
-                        "Skip pre-exec wrapper reverse buy [{}] {}: mirror empty, waiting for landed phase",
+                        "Skip reverse buy [{}] {}: no creator_authority cached (cold mint)",
                         group.name,
                         &token_mint.to_string()[..12]
                     );

@@ -85,6 +85,69 @@ const PUMPFUN_BUY_ACCOUNT_LABELS: [&str; 18] = [
     "creator_authority",
 ];
 
+/// 同区块抢入辅助：给定一个已知的 `creator_authority`（mint 的 dev wallet，
+/// 通常从目标钱包之前的 BUY trade 的 mirror[17] 缓存），合成一个 16-slot SELL
+/// layout 的 mirror_accounts。下游 `build_buy_instruction_from_mirror` 已经
+/// 支持 16-slot SELL layout → 18-slot BUY 的转换，所以合成完直接传进去即可。
+///
+/// 为什么不直接合成 18-slot BUY：18-slot 还包含 user_volume_accumulator 等
+/// per-user PDA，让 build_buy_instruction_from_mirror 自己推导更稳。
+///
+/// SELL layout (16 slots, 2026.05):
+///   0  global
+///   1  fee_recipient
+///   2  mint
+///   3  bonding_curve
+///   4  associated_bonding_curve
+///   5  user_ata        (placeholder, replace_user_pdas 会换成我们的)
+///   6  user            (placeholder)
+///   7  system_program
+///   8  creator_vault   = find_program_address([b"creator-vault", creator_authority], pump)
+///   9  token_program
+///   10 event_authority
+///   11 program
+///   12 fee_config
+///   13 fee_program
+///   14 buyback_fee_recipient (常量)
+///   15 creator_authority     (来自缓存)
+pub fn synth_sell_mirror_for_buy(
+    mint: &Pubkey,
+    creator_authority: &Pubkey,
+    token_program_id: &Pubkey,
+) -> Vec<Pubkey> {
+    let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
+    let (bonding_curve, _) =
+        Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &program_id);
+    let associated_bonding_curve =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &bonding_curve,
+            mint,
+            token_program_id,
+        );
+    let creator_vault =
+        Pubkey::find_program_address(&[b"creator-vault", creator_authority.as_ref()], &program_id)
+            .0;
+
+    vec![
+        Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(),              // 0
+        Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap(),       // 1
+        *mint,                                                   // 2
+        bonding_curve,                                           // 3
+        associated_bonding_curve,                                // 4
+        Pubkey::default(),                                       // 5 placeholder
+        Pubkey::default(),                                       // 6 placeholder
+        system_program::id(),                                    // 7
+        creator_vault,                                           // 8 SELL layout
+        *token_program_id,                                       // 9 SELL layout
+        Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(),     // 10
+        program_id,                                              // 11
+        Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(),         // 12
+        Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(),            // 13
+        Pubkey::from_str(PUMP_BUYBACK_FEE_RECIPIENT).unwrap(),  // 14
+        *creator_authority,                                      // 15
+    ]
+}
+
 /// 校验时跳过的 slot：这些字段不能从 cached_state 自构建，必须信任 mirror。
 ///   slot 9 (creator_vault)     —— pump.fun 2026.05 协议升级后，creator_vault PDA
 ///                                 的 seed 不再是 bonding_curve.creator，而是新的
