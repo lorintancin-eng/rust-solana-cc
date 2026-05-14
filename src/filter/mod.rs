@@ -13,6 +13,7 @@
 //! 配置任意一项才会启用对应过滤；全 None/false 时整体相当于关闭，无开销。
 
 pub mod dev_profile;
+pub mod dev_profile_gmgn;
 mod mcap;
 pub(crate) mod metadata;
 mod social;
@@ -79,11 +80,14 @@ impl EntryFilters {
     /// 评估单个 trade 是否通过 group 配置的全部过滤项。
     /// 任何一项拒绝即整体拒绝。
     /// 数据缺失时该项默认通过 —— 抢入路径优先。
+    ///
+    /// `source_wallet` 当前仅给 social/mcap 用；dev 过滤改用 `mint` 内部反查
+    /// creator（修复了之前误把 source_wallet 当 dev 的 bug）。
     pub fn evaluate(
         &self,
         group: &CopyGroup,
         mint: &Pubkey,
-        source_wallet: &Pubkey,
+        _source_wallet: &Pubkey,
     ) -> FilterOutcome {
         if group.has_mcap_filter() {
             if let FilterOutcome::Reject(reason) =
@@ -105,7 +109,7 @@ impl EntryFilters {
 
         if group.has_dev_filter() {
             if let FilterOutcome::Reject(reason) =
-                dev_profile::check(group, source_wallet, &self.dev_provider)
+                dev_profile::check(group, mint, &self.dev_provider)
             {
                 return FilterOutcome::Reject(reason);
             }

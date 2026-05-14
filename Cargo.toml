@@ -57,6 +57,9 @@ async-trait = "0.1"
 # Embedded KV store for dev profile index (2ev strategy condition 3/4/5)
 sled = "0.34"
 
+# UUID for GMGN OpenAPI client_id (replay-protection nonce)
+uuid = { version = "1", features = ["v4"] }
+
 [profile.release]
 opt-level = 3
 lto = true

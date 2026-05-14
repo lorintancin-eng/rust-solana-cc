@@ -68,6 +68,16 @@ impl DevIndex {
         }
     }
 
+    /// `mint` 反查 creator 的原始 32 字节。返回 None 表示未见过该 mint 的 create。
+    /// 上层调用方负责 `Pubkey::try_from(bytes.as_slice())`。
+    pub fn lookup_creator_for_mint(&self, mint: &Pubkey) -> Option<Vec<u8>> {
+        let key = mint_key(mint);
+        match self.db.get(&key).ok()? {
+            Some(bytes) => Some(bytes.to_vec()),
+            None => None,
+        }
+    }
+
     /// 记录 dev 创建一个 token；同时建立 mint → creator 反查。
     /// `twitter` 可选，由 metadata 抓取异步填回（见 `link_twitter`）。
     pub fn record_creation(&self, dev: Pubkey, mint: Pubkey) -> Result<()> {

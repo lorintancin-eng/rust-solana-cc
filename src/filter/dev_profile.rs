@@ -4,22 +4,21 @@
 //!   ④ dev_max_created_count —— dev 总创建 token 数 ≤ N
 //!   ⑤ dev_max_twitter_bound —— dev Twitter 绑定 token 数 ≤ N
 //!
-//! 架构：`DevProvider` 是数据源抽象。当前只有 `stub()` 实现（永远返回"无数据"）。
-//! 后续接入 GMGN / BullX / 自建索引 时新增一个 `DevProvider::xxx()` 工厂方法
-//! 并把内部实现指向真实数据源，**filter::mod / main.rs 无需任何修改**。
+//! 架构：`DevProvider` 是数据源抽象，三种实现：
+//!   - `Stub`        永远返回"无数据"（filter Pass）
+//!   - `LocalIndex`  本地 sled 索引（mint→creator + dev stats）
+//!   - `Gmgn`        GMGN OpenAPI（推荐 —— 实时、数据全）
 //!
-//! 数据源选项（D2 待用户拍板）：
-//!   - A. GMGN 私有 API：需 reverse engineering endpoint + auth；风险中
-//!   - B. BullX 私有 API：同 A
-//!   - C. 自建索引：YellowStone 历史回扫 + 实时增量，1-2 周开发
-//!   - D. Helius DAS：需调研 creator 维度查询能力
+//! main.rs 启动时：env `GMGN_API_KEY` 存在 → 优先 Gmgn；否则退回 LocalIndex；
+//! 都不可用退回 Stub。
 //!
-//! 当前 stub 行为：永远 Pass（不阻塞实测）。接入真实 provider 后过滤才生效。
+//! 数据缺失（Stub 或网络失败）时整体 Pass —— 抢入路径优先，宁错过过滤也不阻塞买入。
 
 use std::sync::Arc;
 
 use solana_sdk::pubkey::Pubkey;
 
+use super::dev_profile_gmgn::GmgnProvider;
 use super::FilterOutcome;
 use crate::dev_index::{DevIndex, DevStats as IndexDevStats};
 use crate::groups::CopyGroup;
@@ -49,10 +48,13 @@ impl From<IndexDevStats> for DevStats {
 /// 内部用 enum 而不是 trait object，避免动态分发开销。
 #[derive(Clone)]
 pub enum DevProvider {
-    /// 无数据源 - `lookup` 永远返回 None，filter 永远 Pass
+    /// 无数据源 - `lookup_by_mint` 永远返回 None，filter 永远 Pass
     Stub,
     /// 本地 sled 索引（pump.fun create 实时 + 48h 历史回扫）
+    /// 索引按 `mint → creator → DevStats` 链路查询。
     LocalIndex(Arc<DevIndex>),
+    /// GMGN OpenAPI（推荐 —— 数据全面、无需自建索引）
+    Gmgn(Arc<GmgnProvider>),
 }
 
 impl DevProvider {
@@ -66,17 +68,32 @@ impl DevProvider {
         Self::LocalIndex(dev_index)
     }
 
-    /// 查询 dev 画像。返回 None 表示数据不可用（filter 应默认 Pass）。
-    pub fn lookup(&self, dev: &Pubkey) -> Option<DevStats> {
+    /// GMGN 数据源
+    pub fn gmgn(provider: Arc<GmgnProvider>) -> Self {
+        Self::Gmgn(provider)
+    }
+
+    /// 按 mint 查 dev 画像（mint 上的 dev = token creator）。
+    /// 返回 None 表示数据不可用（filter 默认 Pass，保留抢入路径）。
+    pub fn lookup_by_mint(&self, mint: &Pubkey) -> Option<DevStats> {
         match self {
             Self::Stub => None,
-            Self::LocalIndex(idx) => idx.lookup(dev).map(DevStats::from),
+            Self::LocalIndex(idx) => {
+                // sled: mint_key → creator bytes → dev stats
+                let creator_bytes = idx.lookup_creator_for_mint(mint)?;
+                let creator = Pubkey::try_from(creator_bytes.as_slice()).ok()?;
+                idx.lookup(&creator).map(DevStats::from)
+            }
+            Self::Gmgn(gmgn) => gmgn.lookup_by_mint(mint),
         }
     }
 }
 
-pub fn check(group: &CopyGroup, source_wallet: &Pubkey, provider: &DevProvider) -> FilterOutcome {
-    let Some(stats) = provider.lookup(source_wallet) else {
+/// 主入口：按 `mint` 评估 dev 过滤条件 ③④⑤。
+/// 注意：`source_wallet` 不一定是 dev（2ev 反向跟单时 source_wallet = 2ev 本人，
+/// 而 dev = mint 的 creator）。所以这里**只用 mint** 查 dev 画像。
+pub fn check(group: &CopyGroup, mint: &Pubkey, provider: &DevProvider) -> FilterOutcome {
+    let Some(stats) = provider.lookup_by_mint(mint) else {
         // 数据不可用 → 默认 Pass（避免误锁；等接入真实数据源）
         return FilterOutcome::Pass;
     };

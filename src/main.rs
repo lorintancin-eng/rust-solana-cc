@@ -373,11 +373,31 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    // GMGN OpenAPI 优先：env GMGN_API_KEY 配置 → 走 GMGN（数据全、无需自建索引）
+    // 否则退回到本地 sled 索引（数据可能不全，filter 倾向 Pass）
+    let gmgn_provider = std::env::var("GMGN_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .and_then(|key| match filter::dev_profile_gmgn::GmgnProvider::new(key) {
+            Ok(p) => {
+                info!("GMGN dev provider enabled");
+                Some(Arc::new(p))
+            }
+            Err(e) => {
+                warn!("GMGN provider init failed: {}; falling back to local index", e);
+                None
+            }
+        });
+
     let entry_filters = {
         let base = EntryFilters::new(bc_cache.clone(), sol_usd.clone(), rpc_client.clone());
-        match dev_index.as_ref() {
-            Some(idx) => base.with_dev_provider(DevProvider::local_index(idx.clone())),
-            None => base,
+        if let Some(gmgn) = gmgn_provider.as_ref() {
+            base.with_dev_provider(DevProvider::gmgn(gmgn.clone()))
+        } else if let Some(idx) = dev_index.as_ref() {
+            base.with_dev_provider(DevProvider::local_index(idx.clone()))
+        } else {
+            base
         }
     };
 
