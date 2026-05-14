@@ -1395,11 +1395,11 @@ fn apply_group_setting_value(
                 format!("0slot 小费 = {} lamports", v)
             })
             .map_err(|err| err.to_string()),
-        "buy_mode" | "entry_mode" => parse_entry_mode(value).map(|mode| {
+        "entry" | "buy_mode" | "entry_mode" => parse_entry_mode(value).map(|mode| {
             group.entry_mode = mode;
             format!("跟单买入模式 = {}", entry_mode_label(mode))
         }),
-        "mode" | "sell_mode" => parse_sell_mode(value).map(|mode| {
+        "exit" | "mode" | "sell_mode" => parse_sell_mode(value).map(|mode| {
             group.sell_mode = mode;
             format!("卖出模式 = {}", sell_mode_label(mode))
         }),
