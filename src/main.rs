@@ -323,6 +323,9 @@ fn spawn_buy_execution(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 先加载 .env 让 RUST_LOG 等环境变量在 init_logging 前生效。
+    // AppConfig::from_env() 内部也会再调一次 dotenv()，幂等无副作用。
+    dotenvy::dotenv().ok();
     init_logging();
 
     info!("==============================================");
@@ -1553,10 +1556,14 @@ fn extract_token_info(trade: &DetectedTrade) -> Option<(Pubkey, Pubkey)> {
 }
 
 fn init_logging() {
+    // [[bin]] name = "copy-trader" 让 binary crate 模块路径前缀变成 `copy_trader`，
+    // 不是 [package] name "solana-copy-trader" 推导出的 `solana_copy_trader`。
+    // 同时保留 `solana_copy_trader` 以防未来抽出 lib crate。
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,solana_copy_trader=debug".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,copy_trader=debug,solana_copy_trader=debug".into()
+            }),
         )
         .with_target(false)
         .with_thread_ids(false)
